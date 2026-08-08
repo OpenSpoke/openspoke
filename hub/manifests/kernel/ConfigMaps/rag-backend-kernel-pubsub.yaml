@@ -1,0 +1,213 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-backend-kernel-pubsub
+  namespace: rag-company1
+data:
+  pubsub.py: |
+    """汎用 Pub/Sub HTTP エンドポイント (Valkey/Redis ベース)。
+
+    main.py からは ``app.include_router(router)`` で取り込まれる。
+
+    提供するエンドポイント:
+      - POST /core/kv/publish    : 1 メッセージを channel に publish
+      - GET  /core/kv/subscribe  : channel を subscribe し SSE で受信
+        (1 リクエスト = 1 SSE ストリーム、クライアントが切断するまで継続)
+
+    アプリケーション中立な薄いラッパー。 channel 名と message の意味は
+    呼び出し側 (chat-backend 等) が決める。 kernel は中継のみで業務ロジックは
+    持たない (KV/get/set と同じ思想)。
+
+    Valkey 接続情報は main.py の KV_VALKEY_HOST / KV_VALKEY_PORT と同じ
+    環境変数を共有する (KV ストアと物理的には同じ Valkey インスタンス)。
+    pub/sub は db を持たず常に db=0 を使用する (Valkey の仕様)。
+    """
+    import os
+    import json
+    import asyncio
+    import logging
+    from typing import Any, Dict, List, Optional
+
+    from fastapi import APIRouter, Query, Request
+    from fastapi.responses import StreamingResponse
+
+    logger = logging.getLogger(__name__)
+
+    router = APIRouter()
+
+    VALKEY_HOST = os.environ.get("KV_VALKEY_HOST", "valkey.valkey.svc.cluster.local")
+    VALKEY_PORT = int(os.environ.get("KV_VALKEY_PORT", "6379"))
+
+    _publish_client = None  # publish 用の単一クライアント
+
+
+    def _get_publish_client():
+        """publish 用の Valkey クライアントを返す (キャッシュ)。"""
+        global _publish_client
+        if _publish_client is not None:
+            return _publish_client
+        try:
+            import redis as _redis_mod
+        except ImportError:
+            raise RuntimeError("redis-py is not installed in kernel image")
+        _publish_client = _redis_mod.Redis(
+            host=VALKEY_HOST,
+            port=VALKEY_PORT,
+            db=0,
+            decode_responses=True,
+            socket_connect_timeout=3,
+            socket_timeout=5,
+        )
+        return _publish_client
+
+
+    def _new_subscribe_client():
+        """subscribe 用に新規 Valkey クライアントを作る (SSE 接続ごとに 1 つ)。
+
+        subscribe は blocking かつコネクション専有なので、共有しない。
+        """
+        try:
+            import redis as _redis_mod
+        except ImportError:
+            raise RuntimeError("redis-py is not installed in kernel image")
+        return _redis_mod.Redis(
+            host=VALKEY_HOST,
+            port=VALKEY_PORT,
+            db=0,
+            decode_responses=True,
+            socket_connect_timeout=3,
+            socket_timeout=None,  # subscribe は永続接続
+        )
+
+
+    @router.post("/core/kv/publish")
+    async def core_kv_publish(request: dict):
+        """指定 channel に 1 メッセージを publish する。
+
+        Body:
+            {
+              "channel": "chat:channel:abc",   # 必須
+              "message": "..."                 # 必須 (文字列 or JSON シリアライズ可能な値)
+            }
+        Returns:
+            {"ok": bool, "receivers": int, "error": str | null}
+            receivers は publish 時に subscriber がいたコネクション数 (Valkey が返す値)。
+        """
+        channel = (request.get("channel") or "").strip()
+        if not channel:
+            return {"ok": False, "receivers": 0, "error": "channel is required"}
+        if "message" not in request:
+            return {"ok": False, "receivers": 0, "error": "message is required"}
+
+        msg = request.get("message")
+        if not isinstance(msg, str):
+            msg = json.dumps(msg, ensure_ascii=False)
+
+        try:
+            client = _get_publish_client()
+            receivers = int(client.publish(channel, msg))
+            return {"ok": True, "receivers": receivers, "error": None}
+        except Exception as e:
+            logger.warning("[PUBSUB] publish failed: channel=" + channel[:60] + ": " + str(e))
+            return {"ok": False, "receivers": 0,
+                    "error": type(e).__name__ + ": " + str(e)[:200]}
+
+
+    @router.get("/core/kv/subscribe")
+    async def core_kv_subscribe(
+        request: Request,
+        channel: List[str] = Query(..., description="購読する channel 名 (複数可)"),
+    ):
+        """指定 channel(s) を subscribe し、メッセージを SSE で stream する。
+
+        クエリ:
+            ?channel=foo&channel=bar  (複数指定可)
+
+        レスポンス: text/event-stream
+            各イベントは次の形式:
+              event: message
+              data: {"channel": "foo", "message": "..."}
+              \n
+
+            heartbeat は 15 秒ごとに送る (proxy のアイドルタイムアウト対策):
+              : heartbeat\n\n
+
+            購読開始時に 1 度だけ:
+              event: ready
+              data: {"channels": ["foo","bar"]}
+
+        クライアントが切断するか、Valkey 接続が切れたらストリームを終了する。
+        """
+        channels = [c.strip() for c in (channel or []) if c and c.strip()]
+        if not channels:
+            async def _err():
+                yield 'event: error\ndata: {"error":"channel is required"}\n\n'
+            return StreamingResponse(_err(), media_type="text/event-stream")
+
+        async def event_stream():
+            sub_client = None
+            pubsub = None
+            try:
+                sub_client = _new_subscribe_client()
+                pubsub = sub_client.pubsub(ignore_subscribe_messages=True)
+                pubsub.subscribe(*channels)
+
+                # ready
+                ready_payload = json.dumps({"channels": channels}, ensure_ascii=False)
+                yield "event: ready\ndata: " + ready_payload + "\n\n"
+
+                loop = asyncio.get_event_loop()
+                last_heartbeat = loop.time()
+
+                while True:
+                    # クライアントが切断したら抜ける
+                    if await request.is_disconnected():
+                        break
+
+                    # 非ブロッキングに get_message で 0.5 秒待つ
+                    msg = await loop.run_in_executor(
+                        None,
+                        lambda: pubsub.get_message(timeout=0.5),
+                    )
+                    if msg is not None and msg.get("type") == "message":
+                        ch = msg.get("channel") or ""
+                        data = msg.get("data") or ""
+                        payload = json.dumps(
+                            {"channel": ch, "message": data},
+                            ensure_ascii=False,
+                        )
+                        yield "event: message\ndata: " + payload + "\n\n"
+                        last_heartbeat = loop.time()
+                        continue
+
+                    # heartbeat (15s 間隔)
+                    now = loop.time()
+                    if now - last_heartbeat >= 15.0:
+                        yield ": heartbeat\n\n"
+                        last_heartbeat = now
+
+            except Exception as e:
+                logger.warning("[PUBSUB] subscribe stream error: " + str(e))
+                err = json.dumps({"error": type(e).__name__ + ": " + str(e)[:200]},
+                                 ensure_ascii=False)
+                yield "event: error\ndata: " + err + "\n\n"
+            finally:
+                try:
+                    if pubsub is not None:
+                        pubsub.close()
+                except Exception:
+                    pass
+                try:
+                    if sub_client is not None:
+                        sub_client.close()
+                except Exception:
+                    pass
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",  # nginx バッファ無効化
+            },
+        )

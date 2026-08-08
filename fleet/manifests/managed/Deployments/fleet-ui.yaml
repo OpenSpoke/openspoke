@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fleet-ui
+  namespace: fleet-ui
+  labels:
+    app: fleet-ui
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fleet-ui
+  template:
+    metadata:
+      labels:
+        app: fleet-ui
+      annotations:
+        restarted-at: "2026-05-23T03:35:00Z"
+    spec:
+      serviceAccountName: fleet-ui
+      containers:
+        - name: fleet-ui
+          # Build the fleet-ui image from fleet/ui/ (see fleet/ui/README.md)
+          # and push it to your container registry, then reference it here.
+          image: fleet-ui:0.2.0
+          # 同じバージョン番号でイメージを差し替える運用のため Always。
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: FLEET_UI_CONFIG
+              value: /etc/fleet-ui/config.yaml
+            # 認証は前段の oauth2-proxy (Keycloak OIDC) で処理する。
+            # fleet-ui コンテナ自身は basic auth を要求しない:
+            # BASIC_AUTH_USERNAME / BASIC_AUTH_PASSWORD を渡さなければ
+            # main.go の requireAuth は default の admin/changeme で動くので、
+            # 認証を完全に無効化するために空文字を明示的に渡す。
+            - name: BASIC_AUTH_USERNAME
+              value: ""
+            - name: BASIC_AUTH_PASSWORD
+              value: ""
+          volumeMounts:
+            - name: config
+              mountPath: /etc/fleet-ui
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 30
+      volumes:
+        - name: config
+          configMap:
+            name: fleet-ui

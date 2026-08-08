@@ -1,0 +1,10 @@
+# ignore frontend dev files (none currently; SPA is single HTML)
+*.log
+
+# ignore git
+.git/
+.gitignore
+
+# ignore docs
+README.md
+LICENSE

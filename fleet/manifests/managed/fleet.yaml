@@ -1,0 +1,16 @@
+# Fleet bundle options for the self-managed-fleet control-plane manifests.
+#
+# Pin the Helm release name so that repointing this GitRepo's path
+# (which changes the auto-generated bundle name, and therefore the
+# default Helm release name) does NOT change the release name.
+#
+# Without this pin, moving the path from fleet/manifests/managed to
+# OpenSpoke/Core/fleet/manifests/managed renamed the release and Helm
+# refused to adopt the already-existing resources (e.g. ServiceAccount
+# fleet-ui), failing with "invalid ownership metadata".
+#
+# The value below is the original auto-generated release name that the
+# live resources are already annotated with (meta.helm.sh/release-name),
+# so the new bundle adopts them cleanly.
+helm:
+  releaseName: self-managed-fleet-fleet-manifests-managed

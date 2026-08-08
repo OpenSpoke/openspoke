@@ -1,0 +1,28 @@
+FROM python:3.11-slim
+
+# システムパッケージのインストール（必要に応じて）
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
+
+# pip を最新版にアップグレード
+RUN pip install --no-cache-dir --upgrade pip
+
+# Streamlit とその他の依存パッケージをインストール
+# requirements.txt の内容を直接記述（実際の内容に応じて調整）
+RUN pip install --no-cache-dir \
+    streamlit \
+    requests \
+    pandas
+
+# 作業ディレクトリ
+WORKDIR /app
+
+# アプリケーションコードは ConfigMap から /app にマウントされる想定
+# COPY app.py /app/
+# COPY requirements.txt /app/
+
+# Streamlit の設定ディレクトリを作成
+RUN mkdir -p /root/.streamlit
+
+# 起動コマンド（Deploymentで上書きされる）
+CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]

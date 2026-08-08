@@ -1,0 +1,1733 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-backend-kernel-client
+  namespace: rag-spoke
+data:
+  kernel_client.py: |
+    """rag-backend-kernel への HTTP リクエストを送るラッパーモジュール。
+
+    rag-backend Pod (アプリケーション backend) から、コア機能 (LLM 呼び出し、embedding、
+    OpenSearch 書き込み等) を rag-backend-kernel Pod に委譲する際の薄い層。
+
+    使い方:
+        import kernel_client
+        kernel_client.record_claude_usage(...)  # 個別の関数は順次追加
+
+    設計方針:
+        - 各関数のシグネチャは main.py の元関数と一致させる (置換しやすくするため)
+        - HTTP 通信の例外は呼び出し側で握りつぶせる/拾えるよう raise する
+        - タイムアウトとリトライは関数ごとに調整
+    """
+    import os
+    import json
+    import logging
+    import re
+    import time
+    import base64
+    import urllib.request
+    import urllib.error
+    from typing import Any, Dict, Optional
+
+    import requests
+
+    logger = logging.getLogger(__name__)
+
+    # 接続先 (Service 名経由のクラスタ内 DNS)
+    KERNEL_URL = os.environ.get(
+        "KERNEL_URL",
+        "http://rag-backend-kernel.rag-company1.svc.cluster.local:8000"
+    )
+
+    # デフォルトタイムアウト (秒)
+    DEFAULT_TIMEOUT = 30
+
+
+    def _post_json(path: str, body: Dict[str, Any], timeout: float = DEFAULT_TIMEOUT) -> Dict[str, Any]:
+        """kernel Pod に POST /{path} で JSON ボディを送り、JSON レスポンスを返す。
+
+        Raises:
+            urllib.error.HTTPError: HTTP ステータスエラー時
+            urllib.error.URLError: 接続失敗時
+            json.JSONDecodeError: レスポンスが JSON でない場合
+        """
+        url = KERNEL_URL.rstrip("/") + "/" + path.lstrip("/")
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+        return json.loads(raw.decode("utf-8"))
+
+
+    def _get_json(path: str, params: Optional[Dict[str, Any]] = None, timeout: float = DEFAULT_TIMEOUT) -> Dict[str, Any]:
+        """kernel Pod に GET /{path} を送り、JSON レスポンスを返す。"""
+        url = KERNEL_URL.rstrip("/") + "/" + path.lstrip("/")
+        if params:
+            from urllib.parse import urlencode
+            url = url + "?" + urlencode(params)
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+        return json.loads(raw.decode("utf-8"))
+
+
+    def health() -> Dict[str, Any]:
+        """kernel Pod の /health を呼ぶ動作確認用関数。"""
+        return _get_json("/health", timeout=10)
+
+
+    # ----------------------------------------------------------------------
+    # グラフコンテキスト
+    # ----------------------------------------------------------------------
+
+    def format_graph_context(graph_results) -> str:
+        """グラフ検索結果のリストをコンテキスト文字列に変換する。
+
+        main.py の元関数 (純粋関数) を kernel Pod に委譲した HTTP ラッパー。
+        失敗時は空文字を返す (元関数も graph_results が空ならば空文字を返す仕様)。
+        """
+        try:
+            resp = _post_json(
+                "/core/graph/format-context",
+                {"graph_results": graph_results or []},
+                timeout=10,
+            )
+            return resp.get("context", "") or ""
+        except Exception as e:
+            logger.warning("[KERNEL_CLIENT] format_graph_context failed: " + str(e))
+            return ""
+
+
+    # ----------------------------------------------------------------------
+    # オーケストレーター (Swallow triage → Claude 3 モデル自動選択)
+    # ----------------------------------------------------------------------
+
+    # /orchestrate は triage + (complex 時) Swallow/Claude 並列 + 審判まで
+    # 行うため長くかかりうる。 kernel 側の処理時間に対して HTTP を十分長く取る。
+    ORCHESTRATE_HTTP_TIMEOUT = float(os.environ.get("KERNEL_ORCHESTRATE_HTTP_TIMEOUT", "660"))
+
+    def orchestrate(question: str, user_id: str,
+                    top_k: int = 5, use_graph: bool = True,
+                    search_mode: str = "vector_first",
+                    force_mode: str = "auto",
+                    claude_model: str = "",
+                    max_claude_tier: str = "",
+                    use_tools: bool = True,
+                    timeout: float = None) -> Dict[str, Any]:
+        """kernel の POST /orchestrate を呼ぶ。
+
+        Swallow の triage が質問の難易度を判定し、 simple なら Swallow 単独、
+        complex なら Swallow+Claude 並列 + 審判。 Claude のモデル (Haiku/
+        Sonnet/Opus) は triage が自動選択する。 claude_model を明示指定
+        するとその tier を強制する (例: 重要な相談で Opus 固定)。
+        max_claude_tier を指定すると、 triage や claude_model が選んだ
+        モデルが上限を超える場合に上限モデルへ下げる (例: "claude-haiku-4-5"
+        を渡すと、 簡単なら Swallow、 それ以上でも最大 Haiku に制限。 Opus
+        には決して上がらない)。 値はティア名 ("light"/"standard"/"advanced")
+        または実モデル名。 空なら上限なし。
+
+        戻り値: kernel /orchestrate のレスポンス dict。
+            主に "answer" と "orchestration" を含む。
+            失敗時は {"answer": "", "error": "..."} を返す (例外は投げない)。
+        """
+        body = {
+            "question": question,
+            "user_id": user_id,
+            "top_k": top_k,
+            "use_graph": use_graph,
+            "search_mode": search_mode,
+            "force_mode": force_mode,
+            "claude_model": claude_model or "",
+            "max_claude_tier": max_claude_tier or "",
+            "use_tools": use_tools,
+        }
+        try:
+            return _post_json(
+                "/orchestrate",
+                body,
+                timeout=timeout if timeout is not None else ORCHESTRATE_HTTP_TIMEOUT,
+            )
+        except Exception as e:
+            logger.error("[KERNEL_CLIENT] orchestrate failed: " + str(e))
+            return {"answer": "", "error": str(e)[:300]}
+
+
+    # ----------------------------------------------------------------------
+    # Claude API テキスト生成
+    # ----------------------------------------------------------------------
+
+    # generate_claude_text は max_tokens=16000 で 30 秒以上かかるケースが多い (起案ドラフト)。
+    # kernel 側の Claude タイムアウトは CLAUDE_TIMEOUT (デフォルト 600 秒) なので、
+    # HTTP レイヤーはそれ以上に取らないと kernel 内処理途中で HTTP が切れる。
+    # マージン込みで 660 秒。timeout 引数で個別調整可能。
+    CLAUDE_HTTP_TIMEOUT = float(os.environ.get("KERNEL_CLAUDE_HTTP_TIMEOUT", "660"))
+
+
+    def generate_claude_text(prompt, max_tokens: int = 1024, temperature: float = 0.3,
+                             timeout: float = None, max_retries: int = None,
+                             system=None, response_schema: dict = None,
+                             use_streaming: bool = None, op: str = "text",
+                             session_id: str = None, user_id: str = None,
+                             model: str = None) -> str:
+        """Claude にテキスト生成を依頼する。kernel Pod の /core/claude/generate-text に委譲。
+
+        シグネチャ・戻り値の意味は main.py の元関数と完全に一致する。
+        prompt は文字列 or content blocks のリスト (Prompt Caching 対応)。
+        system も同様に文字列 or blocks リスト。
+        エラー時はエラーメッセージ文字列を返す (元関数と同じ)。
+
+        HTTP タイムアウトは Claude API timeout + マージンで設定する。
+        timeout 引数が大きい場合はそれに応じて HTTP タイムアウトも引き上げる。
+
+        model: 使用する Claude モデル名 (例: "claude-opus-4-6")。 None / 空文字なら kernel デフォルト。
+            アプリ (contract_app 等) が op に応じて opus/sonnet を切り替える用途で使用。
+        """
+        # HTTP タイムアウト = Claude タイムアウト + 60秒マージン (LLM 呼び出し + ネットワーク往復)
+        # timeout=None の場合は kernel 側の CLAUDE_TIMEOUT が使われるので、デフォルトの CLAUDE_HTTP_TIMEOUT を使う
+        if timeout is not None:
+            http_timeout = float(timeout) + 60.0
+        else:
+            http_timeout = CLAUDE_HTTP_TIMEOUT
+
+        body = {
+            "prompt": prompt,
+            "max_tokens": int(max_tokens),
+            "temperature": float(temperature),
+            "timeout": timeout,
+            "max_retries": max_retries,
+            "system": system,
+            "response_schema": response_schema,
+            "use_streaming": use_streaming,
+            "op": op,
+            "session_id": session_id,
+            "user_id": user_id,
+            "model": model,
+        }
+        try:
+            resp = _post_json("/core/claude/generate-text", body, timeout=http_timeout)
+            return resp.get("text", "") or ""
+        except Exception as e:
+            # 元関数と同じくエラーメッセージ文字列を返す (例外を投げない)
+            err_msg = f"エラー: KernelClientError: {type(e).__name__}: {str(e)[:100]}"
+            logger.error("[KERNEL_CLIENT] generate_claude_text failed: " + str(e))
+            _alert_claude_error(error_type=type(e).__name__, detail=f"generate_claude_text op={op}: {e}")
+            return err_msg
+
+
+    # ----------------------------------------------------------------------
+    # Swallow (vLLM, OpenAI互換)
+    # ----------------------------------------------------------------------
+
+    # Swallow は短い triage 用途が多いが、 長文応答もありうるので 120秒
+    SWALLOW_HTTP_TIMEOUT = float(os.environ.get("KERNEL_SWALLOW_HTTP_TIMEOUT", "120"))
+
+
+    def generate_swallow_text(messages: list,
+                             max_tokens: int = 256,
+                             temperature: float = 0.1,
+                             seed: int = None,
+                             top_p: float = None,
+                             stop: list = None,
+                             timeout: float = 60) -> Dict[str, Any]:
+        """Swallow にテキスト生成を依頼する。 kernel Pod の /core/swallow/generate-text に委譲。
+
+        messages は OpenAI 互換の完全形:
+            [{"role": "system|user|assistant", "content": "..."}, ...]
+        seed と temperature を併用することで、 同じ messages でも異なる応答を得られる。
+
+        戻り値:
+            {"ok": bool, "text": str, "model": str, "elapsed_sec": float, "error": str | None}
+        エラー時も例外は投げず、 ok=False で返す (呼び出し側がチェック)。
+        """
+        body = {
+            "messages": messages,
+            "max_tokens": int(max_tokens),
+            "temperature": float(temperature),
+            "timeout": float(timeout),
+        }
+        if seed is not None:
+            body["seed"] = int(seed)
+        if top_p is not None:
+            body["top_p"] = float(top_p)
+        if stop is not None:
+            body["stop"] = stop
+
+        http_timeout = max(SWALLOW_HTTP_TIMEOUT, float(timeout) + 30.0)
+        try:
+            resp = _post_json("/core/swallow/generate-text", body, timeout=http_timeout)
+            return {
+                "ok": bool(resp.get("ok", False)),
+                "text": resp.get("text", "") or "",
+                "model": resp.get("model", ""),
+                "elapsed_sec": float(resp.get("elapsed_sec", 0.0)),
+                "error": resp.get("error"),
+            }
+        except Exception as e:
+            logger.error("[KERNEL_CLIENT] generate_swallow_text failed: " + str(e))
+            return {
+                "ok": False,
+                "text": "",
+                "model": "",
+                "elapsed_sec": 0.0,
+                "error": f"{type(e).__name__}: {str(e)[:200]}",
+            }
+
+
+    # Swallow ストリーミング HTTP タイムアウト (連続トークン間の上限秒数)
+    SWALLOW_STREAM_HTTP_TIMEOUT = float(os.environ.get("KERNEL_SWALLOW_STREAM_HTTP_TIMEOUT", "300"))
+
+
+    def generate_swallow_text_stream(messages: list,
+                                     max_tokens: int = 1024,
+                                     temperature: float = 0.3,
+                                     seed: int = None,
+                                     top_p: float = None,
+                                     stop: list = None,
+                                     timeout: float = None):
+        """Swallow にストリーミングテキスト生成を依頼する。 kernel Pod の
+        /core/swallow/generate-text-stream に委譲し、 NDJSON を行ごとにパースして yield。
+
+        ジェネレータとして使う:
+            for msg in kernel_client.generate_swallow_text_stream(messages, ...):
+                if msg["type"] == "token":
+                    print(msg["content"], end="", flush=True)
+                elif msg["type"] == "done":
+                    print(f"\\ndone in {msg['elapsed_sec']}s")
+                elif msg["type"] == "error":
+                    print(f"ERROR: {msg['error']}")
+
+        各メッセージは下記のいずれかの形式の dict:
+            {"type":"token","content":"..."}      トークン1つ
+            {"type":"done","elapsed_sec":F}        完了
+            {"type":"error","error":"..."}         エラー
+
+        HTTP/プロトコルレベルのエラーが発生した場合も、{"type":"error",...} を1個 yield して終了する
+        (例外を投げない)。
+        """
+        url = KERNEL_URL.rstrip("/") + "/core/swallow/generate-text-stream"
+        body = {
+            "messages": messages,
+            "max_tokens": int(max_tokens),
+            "temperature": float(temperature),
+        }
+        if seed is not None:
+            body["seed"] = int(seed)
+        if top_p is not None:
+            body["top_p"] = float(top_p)
+        if stop is not None:
+            body["stop"] = stop
+        if timeout is not None:
+            body["timeout"] = float(timeout)
+
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/x-ndjson",
+            },
+        )
+
+        http_timeout = SWALLOW_STREAM_HTTP_TIMEOUT
+        try:
+            resp = urllib.request.urlopen(req, timeout=http_timeout)
+        except Exception as e:
+            logger.error("[KERNEL_CLIENT] generate_swallow_text_stream connect failed: " + str(e))
+            yield {"type": "error", "error": f"KernelClientError: {type(e).__name__}: {str(e)[:200]}"}
+            return
+
+        try:
+            for raw_line in resp:
+                if not raw_line:
+                    continue
+                line = raw_line.decode("utf-8", errors="replace").rstrip("\n").rstrip("\r")
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError as je:
+                    logger.warning(f"[KERNEL_CLIENT] NDJSON parse error: {je}; line={line[:120]}")
+                    continue
+                yield msg
+        except Exception as e:
+            logger.error("[KERNEL_CLIENT] generate_swallow_text_stream read failed: " + str(e))
+            yield {"type": "error", "error": f"KernelClientError: {type(e).__name__}: {str(e)[:200]}"}
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+
+    # ----------------------------------------------------------------------
+    # Embedding (sentence-transformers)
+    # ----------------------------------------------------------------------
+
+    # 単一 embedding は数十ms で済むので 10秒で十分
+    EMBEDDING_SINGLE_TIMEOUT = float(os.environ.get("KERNEL_EMBEDDING_SINGLE_TIMEOUT", "10"))
+    # バッチは件数とテキスト長次第。チャンク数百件のバッチでも数十秒で完了するはずだが、
+    # GPU 不在環境では1分以上かかる可能性があるので余裕を持って 600 秒。
+    EMBEDDING_BATCH_TIMEOUT = float(os.environ.get("KERNEL_EMBEDDING_BATCH_TIMEOUT", "600"))
+
+
+    def get_embedding(text: str):
+        """単一テキストの embedding を取得する。kernel Pod の /core/embedding/single に委譲。
+
+        戻り値は List[float] (384次元、normalize 済み)。
+        失敗時は例外を投げる (元関数と同じ挙動)。
+        embedding 失敗を握りつぶすとゼロベクトル等が検索に混入してしまうため、
+        呼び出し側で try/except する設計を尊重する。
+        """
+        try:
+            resp = _post_json(
+                "/core/embedding/single",
+                {"text": text},
+                timeout=EMBEDDING_SINGLE_TIMEOUT,
+            )
+            embedding = resp.get("embedding")
+            if not isinstance(embedding, list):
+                raise RuntimeError("kernel returned invalid embedding format")
+            return embedding
+        except Exception as e:
+            logger.error("[KERNEL_CLIENT] get_embedding failed: " + str(e))
+            raise
+
+
+    def get_embeddings_parallel(texts, max_workers: int = None):
+        """複数テキストの embedding をバッチ取得する。kernel Pod の /core/embedding/batch に委譲。
+
+        戻り値は List[List[float]]。順序は入力 texts と一致する。
+        失敗時は例外を投げる (元関数は内部で sentence-transformers を呼ぶため例外を投げる仕様)。
+        max_workers は元関数のシグネチャ互換のため受け取るが、kernel 側のバッチ処理に
+        相当するため、呼び出し側で気にする必要はほぼない。
+        """
+        if not texts:
+            return []
+        body: Dict[str, Any] = {"texts": list(texts)}
+        if max_workers is not None:
+            body["max_workers"] = int(max_workers)
+        try:
+            resp = _post_json(
+                "/core/embedding/batch",
+                body,
+                timeout=EMBEDDING_BATCH_TIMEOUT,
+            )
+            embeddings = resp.get("embeddings")
+            if not isinstance(embeddings, list):
+                raise RuntimeError("kernel returned invalid embeddings format")
+            if len(embeddings) != len(texts):
+                raise RuntimeError(
+                    f"kernel returned {len(embeddings)} embeddings for {len(texts)} texts"
+                )
+            return embeddings
+        except Exception as e:
+            logger.error("[KERNEL_CLIENT] get_embeddings_parallel failed: " + str(e))
+            raise
+
+
+    # ----------------------------------------------------------------------
+    # Claude JSON 判定 (judge_with_claude_json)
+    # ----------------------------------------------------------------------
+
+    def judge_with_claude_json(prompt: str, max_tokens: int = 256):
+        """Claude に JSON 判定を依頼し、パース済み辞書を返す。失敗時は None。
+
+        kernel_client.generate_claude_text を内部利用する。
+        トークン記録は kernel 側の generate_claude_text 経由で op="judge_json" として記録される。
+
+        失敗時 None を返す挙動は元関数と完全互換 (呼び出し側のフォールバック処理を尊重)。
+        """
+        start_time = time.time()
+        # generate_claude_text に op="judge_json" で委譲
+        # temperature は元関数と同じ 0.3、system は不要 (元関数も system 未使用)
+        text = generate_claude_text(
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=0.3,
+            op="judge_json",
+        )
+        elapsed = time.time() - start_time
+
+        # generate_claude_text のエラーは "エラー: ..." 文字列で返ってくる
+        # 元関数は失敗時 None を返す仕様なので、ここで None に変換する
+        if not text or text.startswith("エラー:"):
+            logger.warning(
+                f"[CLAUDE_JUDGE] generate_claude_text returned empty/error in {elapsed:.2f}s: {text[:100] if text else '(empty)'}"
+            )
+            return None
+
+        # JSON 抽出 (元関数のロジックをそのまま再現: 最初の { から最初の } まで非貪欲)
+        m = re.search(r"\{[\s\S]*?\}", text)
+        if not m:
+            logger.warning(f"[CLAUDE_JUDGE] No JSON found in response ({elapsed:.2f}s)")
+            return None
+
+        try:
+            parsed = json.loads(m.group())
+            logger.info(f"[CLAUDE_JUDGE] OK in {elapsed:.2f}s")
+            return parsed
+        except json.JSONDecodeError as je:
+            logger.warning(f"[CLAUDE_JUDGE] JSON parse error ({elapsed:.2f}s): {je}")
+            return None
+
+
+    # ----------------------------------------------------------------------
+    # Claude API ストリーミングテキスト生成
+    # ----------------------------------------------------------------------
+
+    # ストリーミングのHTTPタイムアウト。レポート生成は数十秒かかるが、トークンは継続的に流れて
+    # くるので接続自体はタイムアウトしない (urllib のタイムアウトは「次のデータが来るまでの時間」)。
+    # 余裕を持って 660 秒。
+    CLAUDE_STREAM_HTTP_TIMEOUT = float(os.environ.get("KERNEL_CLAUDE_STREAM_HTTP_TIMEOUT", "660"))
+
+
+    def generate_claude_text_stream(prompt, max_tokens: int = 4096, temperature: float = 0.3,
+                                    timeout: float = None, system=None,
+                                    op: str = "text_stream",
+                                    session_id: str = None, user_id: str = None,
+                                    model: str = None):
+        """Claude にストリーミングテキスト生成を依頼する。kernel Pod の
+        /core/claude/generate-text-stream に委譲し、NDJSON を行ごとにパースして yield。
+
+        ジェネレータとして使う:
+            for msg in kernel_client.generate_claude_text_stream(prompt, ...):
+                if msg["type"] == "token":
+                    print(msg["content"], end="", flush=True)
+                elif msg["type"] == "done":
+                    print(f"\\ntotal tokens: {msg['input_tokens']}+{msg['output_tokens']}")
+                elif msg["type"] == "error":
+                    print(f"ERROR: {msg['error']}")
+
+        各メッセージは下記のいずれかの形式の dict:
+            {"type":"token","content":"..."}                 トークン1つ
+            {"type":"done","input_tokens":N,"output_tokens":M,
+             "cache_w":N,"cache_r":N,"cost_usd":F}            完了
+            {"type":"error","error":"..."}                    エラー
+
+        HTTP/プロトコルレベルのエラーが発生した場合も、{"type":"error",...} を1個 yield して終了する
+        (例外を投げない)。これにより呼び出し側のループはシンプルなまま済む。
+
+        model: 使用する Claude モデル名。 None / 空文字なら kernel デフォルト。
+        """
+        url = KERNEL_URL.rstrip("/") + "/core/claude/generate-text-stream"
+        body = {
+            "prompt": prompt,
+            "max_tokens": int(max_tokens),
+            "temperature": float(temperature),
+            "timeout": timeout,
+            "system": system,
+            "op": op,
+            "session_id": session_id,
+            "user_id": user_id,
+            "model": model,
+        }
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/x-ndjson",
+            },
+        )
+
+        http_timeout = CLAUDE_STREAM_HTTP_TIMEOUT
+        try:
+            resp = urllib.request.urlopen(req, timeout=http_timeout)
+        except Exception as e:
+            logger.error("[KERNEL_CLIENT] generate_claude_text_stream connect failed: " + str(e))
+            _alert_claude_error(error_type=type(e).__name__, detail=f"generate_claude_text_stream connect: {e}")
+            yield {"type": "error", "error": f"KernelClientError: {type(e).__name__}: {str(e)[:200]}"}
+            return
+
+        try:
+            # NDJSON: 1行 1 JSON オブジェクト
+            for raw_line in resp:
+                if not raw_line:
+                    continue
+                # raw_line は bytes、改行文字込み
+                line = raw_line.decode("utf-8", errors="replace").rstrip("\n").rstrip("\r")
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError as je:
+                    logger.warning(f"[KERNEL_CLIENT] NDJSON parse error: {je}; line={line[:120]}")
+                    continue
+                yield msg
+        except Exception as e:
+            logger.error("[KERNEL_CLIENT] generate_claude_text_stream read failed: " + str(e))
+            _alert_claude_error(error_type=type(e).__name__, detail=f"generate_claude_text_stream read: {e}")
+            yield {"type": "error", "error": f"KernelClientError: {type(e).__name__}: {str(e)[:200]}"}
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+
+    # Claude + MCP tool ループのストリーミング HTTP タイムアウト
+    # MCP tool 呼び出しを複数回挟むので長めに取る
+    CLAUDE_MCP_STREAM_HTTP_TIMEOUT = float(os.environ.get("KERNEL_CLAUDE_MCP_STREAM_HTTP_TIMEOUT", "600"))
+
+
+    def generate_claude_stream_with_mcp(messages: list,
+                                        system: str = "",
+                                        max_tokens: int = 2048,
+                                        temperature: float = 0.5,
+                                        max_tool_iterations: int = 5,
+                                        op: str = "claude_stream_with_mcp",
+                                        user_id: str = ""):
+        """Claude を stream + MCP tool ループで呼び出すジェネレータ。 kernel Pod の
+        /core/claude/stream-with-mcp に委譲し、 NDJSON を行ごとにパースして yield する。
+
+        kernel 側は SimpleMCPClient + Anthropic SDK を使い、 Claude の tool_use を
+        受け取ったら MCP に転送して結果を得て、 stream を継続する。 上位アプリは Anthropic
+        SDK や MCP プロトコルに直接依存せず、 kernel_client 経由で完結する。
+
+        ジェネレータとして使う:
+            for msg in kernel_client.generate_claude_stream_with_mcp(messages, ...):
+                if msg["type"] == "token":
+                    print(msg["content"], end="")
+                elif msg["type"] == "tool_use":
+                    print(f"<<{msg['name']} called>>")
+                elif msg["type"] == "tool_result":
+                    print(f"<<{msg['name']} ok={msg['ok']}>>")
+                elif msg["type"] == "done":
+                    ...
+                elif msg["type"] == "error":
+                    ...
+
+        各メッセージは以下のいずれか:
+            {"type":"token","content":"..."}                              text
+            {"type":"tool_use","name":"...","input":{...}}                tool 呼び出し開始
+            {"type":"tool_result","name":"...","ok":bool,"error":"..."}   tool 完了通知
+            {"type":"done","elapsed_sec":F,"input_tokens":N,"output_tokens":N,"tool_calls":N}
+            {"type":"error","error":"..."}
+
+        HTTP/プロトコルレベルのエラーが発生した場合も、 {"type":"error",...} を1個 yield
+        して終了する (例外を投げない)。
+        """
+        url = KERNEL_URL.rstrip("/") + "/core/claude/stream-with-mcp"
+        body = {
+            "messages": messages,
+            "max_tokens": int(max_tokens),
+            "temperature": float(temperature),
+            "max_tool_iterations": int(max_tool_iterations),
+            "op": op,
+        }
+        if system:
+            body["system"] = system
+        if user_id:
+            body["user_id"] = user_id
+
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/x-ndjson",
+            },
+        )
+
+        try:
+            resp = urllib.request.urlopen(req, timeout=CLAUDE_MCP_STREAM_HTTP_TIMEOUT)
+        except Exception as e:
+            logger.error("[KERNEL_CLIENT] generate_claude_stream_with_mcp connect failed: " + str(e))
+            _alert_claude_error(error_type=type(e).__name__, detail=f"generate_claude_stream_with_mcp connect: {e}")
+            yield {"type": "error", "error": f"KernelClientError: {type(e).__name__}: {str(e)[:200]}"}
+            return
+
+        try:
+            for raw_line in resp:
+                if not raw_line:
+                    continue
+                line = raw_line.decode("utf-8", errors="replace").rstrip("\n").rstrip("\r")
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError as je:
+                    logger.warning(f"[KERNEL_CLIENT] NDJSON parse error: {je}; line={line[:120]}")
+                    continue
+                yield msg
+        except Exception as e:
+            logger.error("[KERNEL_CLIENT] generate_claude_stream_with_mcp read failed: " + str(e))
+            _alert_claude_error(error_type=type(e).__name__, detail=f"generate_claude_stream_with_mcp read: {e}")
+            yield {"type": "error", "error": f"KernelClientError: {type(e).__name__}: {str(e)[:200]}"}
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+
+    # ----------------------------------------------------------------------
+    # MinIO (オブジェクトストレージ) 経由のファイル保存
+    # ----------------------------------------------------------------------
+    # kernel /core/minio/{put|get|delete|exists} を中継する。
+    # - put は書き込み後に kernel 側で stat_object で検証済 (失敗時 5xx)
+    # - 失敗時はすべて例外を raise する (静かなスキップなし)。 呼び出し側は適切に HTTPException を投げ直す
+
+    MINIO_HTTP_TIMEOUT = float(os.environ.get("KERNEL_MINIO_HTTP_TIMEOUT", "60"))
+
+
+    def minio_put(object_name: str, data: bytes, content_type: str = "application/octet-stream", bucket: str = "") -> Dict[str, Any]:
+        """MinIO にオブジェクトをアップロードする。
+        書き込み失敗時・サイズ不一致時は例外を raise する。
+
+        Args:
+            object_name: バケット内パス (例: "feature_request_attachments/req_xxx/aid_yyy_name.docx")
+            data:        オブジェクト本体 (bytes)
+            content_type: MIME タイプ
+            bucket:       バケット名。 空なら kernel の MINIO_BUCKET (= contracts)
+        Returns:
+            {"bucket", "object_name", "size", "etag", "verified"}
+        """
+        import base64 as _b64
+        body = {
+            "object_name": object_name,
+            "data_base64": _b64.b64encode(data).decode("ascii"),
+            "content_type": content_type,
+        }
+        if bucket:
+            body["bucket"] = bucket
+        resp = requests.post(
+            f"{KERNEL_URL}/core/minio/put",
+            json=body,
+            timeout=MINIO_HTTP_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            raise Exception(f"minio_put failed: status={resp.status_code} body={resp.text[:300]}")
+        return resp.json()
+
+
+    def minio_get(object_name: str, bucket: str = "") -> bytes:
+        """MinIO からオブジェクトを取得する。
+        見つからない場合は FileNotFoundError、 その他失敗は Exception を raise する。
+        """
+        import base64 as _b64
+        params = {"object_name": object_name}
+        if bucket:
+            params["bucket"] = bucket
+        resp = requests.get(
+            f"{KERNEL_URL}/core/minio/get",
+            params=params,
+            timeout=MINIO_HTTP_TIMEOUT,
+        )
+        if resp.status_code == 404:
+            raise FileNotFoundError(f"minio object not found: {object_name}")
+        if resp.status_code != 200:
+            raise Exception(f"minio_get failed: status={resp.status_code} body={resp.text[:300]}")
+        data_b64 = resp.json().get("data_base64", "")
+        return _b64.b64decode(data_b64)
+
+
+    def minio_delete(object_name: str, bucket: str = "") -> Dict[str, Any]:
+        """MinIO からオブジェクトを削除する (idempotent、 存在しなくても成功)。"""
+        params = {"object_name": object_name}
+        if bucket:
+            params["bucket"] = bucket
+        resp = requests.delete(
+            f"{KERNEL_URL}/core/minio/delete",
+            params=params,
+            timeout=MINIO_HTTP_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            raise Exception(f"minio_delete failed: status={resp.status_code} body={resp.text[:300]}")
+        return resp.json()
+
+
+    def minio_exists(object_name: str, bucket: str = "") -> Dict[str, Any]:
+        """MinIO 上にオブジェクトが存在するかを軽量に確認する。
+        Returns: {"exists": bool, "size": int|None, "etag": str|None, ...}
+        """
+        params = {"object_name": object_name}
+        if bucket:
+            params["bucket"] = bucket
+        resp = requests.get(
+            f"{KERNEL_URL}/core/minio/exists",
+            params=params,
+            timeout=MINIO_HTTP_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            raise Exception(f"minio_exists failed: status={resp.status_code} body={resp.text[:300]}")
+        return resp.json()
+
+
+    # ----------------------------------------------------------------------
+    # 外部サービス中継: Slack
+    # ----------------------------------------------------------------------
+    # 認証情報 (Bot Token, Webhook URL) は呼び出し側で保持・指定する。kernel は中継のみ。
+
+    SLACK_HTTP_TIMEOUT = float(os.environ.get("KERNEL_SLACK_HTTP_TIMEOUT", "15"))
+
+
+    def slack_send_dm(bot_token: str, slack_user_id: str, text: str) -> bool:
+        """Slack Bot Token で指定ユーザーに DM を送る。
+
+        kernel Pod の /core/slack/send-dm に委譲。
+        失敗時はログ警告のみ、戻り値 False (元関数 _send_slack_dm の挙動と互換)。
+        """
+        if not bot_token:
+            logger.warning("[KERNEL_CLIENT] slack_send_dm: bot_token is empty")
+            return False
+        if not slack_user_id:
+            logger.warning("[KERNEL_CLIENT] slack_send_dm: slack_user_id is empty")
+            return False
+        try:
+            resp = _post_json(
+                "/core/slack/send-dm",
+                {"bot_token": bot_token, "slack_user_id": slack_user_id, "text": text},
+                timeout=SLACK_HTTP_TIMEOUT,
+            )
+            ok = bool(resp.get("ok"))
+            if not ok:
+                logger.warning(f"[KERNEL_CLIENT] slack_send_dm failed: {resp.get('error', '')}")
+            return ok
+        except Exception as e:
+            logger.warning("[KERNEL_CLIENT] slack_send_dm exception: " + str(e))
+            return False
+
+
+    def slack_post_webhook(webhook_url: str, payload: Dict[str, Any]) -> bool:
+        """Slack Incoming Webhook URL に整形済みペイロードを送る。
+
+        kernel Pod の /core/slack/post-webhook に委譲。
+        失敗時は False を返す (元関数 _send_slack_signature_notification の挙動と互換)。
+        """
+        if not webhook_url:
+            logger.warning("[KERNEL_CLIENT] slack_post_webhook: webhook_url is empty")
+            return False
+        if not isinstance(payload, dict):
+            logger.warning("[KERNEL_CLIENT] slack_post_webhook: payload must be a dict")
+            return False
+        try:
+            resp = _post_json(
+                "/core/slack/post-webhook",
+                {"webhook_url": webhook_url, "payload": payload},
+                timeout=SLACK_HTTP_TIMEOUT,
+            )
+            ok = bool(resp.get("ok"))
+            if not ok:
+                logger.warning(f"[KERNEL_CLIENT] slack_post_webhook failed: {resp.get('error', '')}")
+            return ok
+        except Exception as e:
+            logger.warning("[KERNEL_CLIENT] slack_post_webhook exception: " + str(e))
+            return False
+
+
+    # ----------------------------------------------------------------------
+    # 運用アラート (Claude API エラー等を管理者に Slack DM 通知)
+    # ----------------------------------------------------------------------
+    # 業務処理 (Claude 呼び出し等) で異常を検出したら管理者 Slack DM で通知する。
+    # 設計方針:
+    #   - 環境変数 SLACK_BOT_TOKEN と LEGAL_ADMIN_SLACK_ID が両方揃ったときのみ動く
+    #     (どちらか欠けていれば静かに無効化、 業務処理は通常通り継続)
+    #   - de-dup: 同じ error_type は 10 分に 1 回だけ通知する
+    #     (Valkey db=0、 key=ops_alert:claude:{error_type}、 TTL=600s)
+    #   - 通知処理の例外は元の業務処理に絶対に影響を出さない (全体 try/except)
+
+    OPS_ALERT_DEDUP_TTL_SEC = int(os.environ.get("OPS_ALERT_DEDUP_TTL_SEC", "600"))
+
+
+    def _alert_claude_error(error_type: str, detail: str) -> None:
+        """Claude API エラーを管理者に Slack DM で通知する (de-dup 付き)。
+
+        Args:
+            error_type: エラー種別 (例: "rate_limit"、 "overloaded"、 "kernel_connect"、
+                        "timeout"、 "unknown")。 de-dup キーに使われる。
+            detail:     詳細メッセージ (例外メッセージなど)。 通知本文に含まれる。
+
+        本関数は何が起きても呼び出し元に例外を投げない (logger.warning するのみ)。
+        """
+        try:
+            bot_token = os.environ.get("SLACK_BOT_TOKEN", "").strip()
+            admin_slack_id = os.environ.get("LEGAL_ADMIN_SLACK_ID", "").strip()
+            if not bot_token or not admin_slack_id:
+                # 通知設定がない環境 (Linode 等) では何もしない
+                return
+
+            # de-dup チェック (同じ error_type は OPS_ALERT_DEDUP_TTL_SEC 秒に 1 回)
+            dedup_key = f"ops_alert:claude:{error_type}"
+            try:
+                if kv_exists(dedup_key, db=0):
+                    return
+            except Exception:
+                # kv_exists 失敗時は通知を試みる方向に倒す (検知漏れより重複の方がマシ)
+                pass
+
+            text = (
+                f"【運用アラート】Claude API エラー検出\n"
+                f"- 種別: {error_type}\n"
+                f"- 詳細: {detail[:300]}\n"
+                f"- 次回同種通知まで {OPS_ALERT_DEDUP_TTL_SEC} 秒抑制"
+            )
+            ok = slack_send_dm(bot_token, admin_slack_id, text)
+            if ok:
+                try:
+                    kv_set(dedup_key, "1", db=0, ttl=OPS_ALERT_DEDUP_TTL_SEC)
+                except Exception:
+                    pass
+                logger.info(f"[OPS_ALERT] sent claude error alert: type={error_type}")
+            else:
+                logger.warning(f"[OPS_ALERT] slack_send_dm returned False for type={error_type}")
+        except Exception as e:
+            logger.warning(f"[OPS_ALERT] _alert_claude_error unexpected error: {e}")
+
+
+    # ----------------------------------------------------------------------
+    # PDF 変換 (Office/DOCX → PDF)
+    # ----------------------------------------------------------------------
+    # 「PDF が欲しい」という抽象機能。実装 (pdf-converter Pod 等) は kernel に隠蔽されており、
+    # 呼び出し元アプリは URL も実装方式も知る必要がない。
+
+    PDF_CONVERT_HTTP_TIMEOUT = float(os.environ.get("KERNEL_PDF_CONVERT_HTTP_TIMEOUT", "300"))
+
+
+    class PDFConvertError(Exception):
+        """PDF 変換失敗を表す例外。元関数 (_convert_docx_to_pdf 等) は HTTPException を
+        投げる仕様だったが、kernel_client は契約として「ライブラリ非依存」を保ちたいので、
+        FastAPI の HTTPException ではなくドメイン例外を投げる。
+        contract_app 側で HTTPException に変換して呼び出し元に返す。
+        """
+        def __init__(self, message: str, status_code: int = 500):
+            super().__init__(message)
+            self.status_code = status_code
+
+
+    def convert_to_pdf(content: bytes, filename: str, mime_type: str = None,
+                       timeout: float = 180) -> bytes:
+        """ファイルを PDF に変換する。kernel Pod の /core/pdf/convert に委譲。
+
+        引数:
+            content: 元ファイルのバイト列
+            filename: ファイル名 (例: "input.docx")
+            mime_type: MIME タイプ (省略可、kernel 側で application/octet-stream にフォールバック)
+            timeout: 変換側 HTTP のタイムアウト秒 (kernel→pdf-converter の timeout として渡す)
+
+        戻り値: PDF のバイト列
+
+        失敗時は PDFConvertError を投げる。元関数 (_convert_docx_to_pdf 等) は HTTPException
+        を投げていたが、kernel_client はフレームワーク非依存にするためドメイン例外にする。
+        contract_app 側で HTTPException に変換して FastAPI に返す。
+        """
+        if not content:
+            raise PDFConvertError("content is empty", status_code=400)
+        if not filename:
+            raise PDFConvertError("filename is empty", status_code=400)
+
+        body: Dict[str, Any] = {
+            "filename": filename,
+            "content_base64": base64.b64encode(content).decode("ascii"),
+            "timeout": float(timeout),
+        }
+        if mime_type:
+            body["mime_type"] = mime_type
+
+        # HTTP タイムアウトは pdf-converter 側 timeout + 余裕 60 秒、最低 PDF_CONVERT_HTTP_TIMEOUT を保証
+        http_timeout = max(float(timeout) + 60.0, PDF_CONVERT_HTTP_TIMEOUT)
+
+        try:
+            resp = _post_json("/core/pdf/convert", body, timeout=http_timeout)
+        except Exception as e:
+            logger.error("[KERNEL_CLIENT] convert_to_pdf network error: " + str(e))
+            raise PDFConvertError(f"PDF変換サービスに接続できません: {str(e)[:200]}", status_code=503)
+
+        if not resp.get("ok"):
+            err = resp.get("error", "unknown error")
+            status = int(resp.get("status_code", 0)) or 500
+            logger.warning(f"[KERNEL_CLIENT] convert_to_pdf failed: {err}")
+            raise PDFConvertError(f"PDF変換に失敗: {err[:300]}", status_code=500)
+
+        pdf_b64 = resp.get("pdf_base64") or ""
+        if not pdf_b64:
+            raise PDFConvertError("kernel returned empty pdf_base64", status_code=500)
+
+        try:
+            pdf_bytes = base64.b64decode(pdf_b64)
+        except Exception as e:
+            raise PDFConvertError(f"PDF base64 decode failed: {e}", status_code=500)
+
+        logger.info(f"[KERNEL_CLIENT] convert_to_pdf OK: {filename} {len(content)} -> {len(pdf_bytes)} bytes")
+        return pdf_bytes
+
+
+    # ----------------------------------------------------------------------
+    # ASR (Automatic Speech Recognition / 音声認識)
+    # ----------------------------------------------------------------------
+    # 「音声 → テキスト」 という抽象機能。 実装 (voice/asr-server Pod = faster-whisper +
+    # kotoba-whisper-v2.0) は kernel に隠蔽されており、 呼び出し元アプリは URL も実装方式も
+    # 知る必要がない。
+    #
+    # 失敗時は例外を投げず、 ok=False を含む dict を返す。 音声認識の失敗は致命的でないため、
+    # 呼び出し側でフォールバック (空文字や再試行) しやすくしている。
+
+    ASR_HTTP_TIMEOUT = float(os.environ.get("KERNEL_ASR_HTTP_TIMEOUT", "180"))
+
+
+    def transcribe_audio(content: bytes, filename: str = "audio.webm",
+                         mime_type: Optional[str] = None,
+                         timeout: float = 120) -> Dict[str, Any]:
+        """音声バイト列を文字起こしする。 kernel Pod の /core/asr/transcribe に委譲。
+
+        引数:
+            content: 音声ファイルのバイト列 (webm/opus, mp4/aac, wav, flac, mp3 等)
+            filename: ファイル名 (拡張子で format ヒント。 デフォルト "audio.webm")
+            mime_type: MIME タイプ (省略時 application/octet-stream)
+            timeout: ASR 側 HTTP のタイムアウト秒 (kernel→asr-server)
+
+        戻り値:
+            {
+              "ok": bool,
+              "text": str,                       # 文字起こし結果 (失敗時は空文字)
+              "language": str | None,            # 検出言語 (通常 "ja")
+              "duration": float,                 # 音声の秒数
+              "elapsed": float,                  # 処理時間 (秒)
+              "segments": list,                  # 区間ごとの結果 [{"start","end","text"}, ...]
+              "error": str | None
+            }
+        失敗時も例外は投げず、 ok=False で返す (呼び出し側で扱いやすい)。
+        """
+        if not content:
+            return {"ok": False, "text": "", "language": None, "duration": 0.0,
+                    "elapsed": 0.0, "segments": [], "error": "content is empty"}
+        if not filename:
+            filename = "audio.webm"
+
+        body: Dict[str, Any] = {
+            "filename": filename,
+            "content_base64": base64.b64encode(content).decode("ascii"),
+            "timeout": float(timeout),
+        }
+        if mime_type:
+            body["mime_type"] = mime_type
+
+        # HTTP タイムアウトは ASR 側 timeout + 余裕 60 秒、 最低 ASR_HTTP_TIMEOUT を保証
+        http_timeout = max(float(timeout) + 60.0, ASR_HTTP_TIMEOUT)
+
+        try:
+            resp = _post_json("/core/asr/transcribe", body, timeout=http_timeout)
+        except Exception as e:
+            logger.error("[KERNEL_CLIENT] transcribe_audio network error: " + str(e))
+            return {"ok": False, "text": "", "language": None, "duration": 0.0,
+                    "elapsed": 0.0, "segments": [],
+                    "error": f"network error: {str(e)[:200]}"}
+
+        if not resp.get("ok"):
+            err = resp.get("error", "unknown error")
+            logger.warning(f"[KERNEL_CLIENT] transcribe_audio failed: {err}")
+            return {"ok": False, "text": "", "language": None, "duration": 0.0,
+                    "elapsed": 0.0, "segments": [], "error": str(err)[:300]}
+
+        text = resp.get("text", "") or ""
+        duration = float(resp.get("duration") or 0.0)
+        elapsed = float(resp.get("elapsed") or 0.0)
+        logger.info(
+            f"[KERNEL_CLIENT] transcribe_audio OK: {filename} {len(content)} bytes "
+            f"dur={duration:.2f}s elapsed={elapsed:.2f}s chars={len(text)}"
+        )
+        return {
+            "ok": True,
+            "text": text,
+            "language": resp.get("language"),
+            "duration": duration,
+            "elapsed": elapsed,
+            "segments": resp.get("segments") or [],
+            "error": None,
+        }
+
+
+    # ----------------------------------------------------------------------
+    # OpenSearch (汎用 HTTP プロキシ)
+    # ----------------------------------------------------------------------
+    # 「データを保存・検索したい」という抽象機能。実装 (OpenSearch URL、HTTP 呼び出し) は
+    # kernel に隠蔽されており、呼び出し元アプリは URL を知る必要がない。
+    #
+    # 戻り値の形式は inventory_app の旧 _os_request と互換: (status_code, json_dict)
+    # これにより inventory_app の各関数 (_os_index_doc, _os_bulk_index 等) は中身を変えずに済む。
+
+    OPENSEARCH_HTTP_TIMEOUT = float(os.environ.get("KERNEL_OPENSEARCH_HTTP_TIMEOUT", "60"))
+
+
+    def os_request(method: str, path: str, body: Optional[Dict[str, Any]] = None,
+                   params: Optional[Dict[str, Any]] = None,
+                   body_ndjson: Optional[str] = None,
+                   timeout: float = 30) -> tuple:
+        """OpenSearch への汎用リクエストを kernel 経由で送る。
+
+        引数:
+            method: "GET" / "POST" / "PUT" / "DELETE"
+            path: "/index/_search" 等 (先頭スラッシュ付き)
+            body: JSON ボディ (任意)
+            params: URL クエリパラメータ (任意)
+            body_ndjson: _bulk 用 NDJSON 文字列 (任意、body と排他)
+            timeout: OpenSearch 側 HTTP タイムアウト秒 (kernel→OpenSearch)
+
+        戻り値:
+            (status_code, response_json)
+            - status_code: int (ネットワークエラー時は 0)
+            - response_json: dict (パース失敗時/エラー時は {})
+
+        旧 inventory_app._os_request と完全互換のシグネチャ・戻り値形式。
+        失敗時にも例外を投げず (status_code=0, {}) を返すので、呼び出し側の
+        既存の status_code 判定ロジックがそのまま動く。
+        """
+        if method not in ("GET", "POST", "PUT", "DELETE", "HEAD"):
+            logger.warning(f"[KERNEL_CLIENT] os_request invalid method: {method}")
+            return (0, {})
+
+        kernel_body: Dict[str, Any] = {
+            "method": method,
+            "path": path,
+            "timeout": float(timeout),
+        }
+        if body is not None:
+            kernel_body["body"] = body
+        if body_ndjson is not None:
+            kernel_body["body_ndjson"] = body_ndjson
+        if params is not None:
+            kernel_body["params"] = params
+
+        # HTTP タイムアウトは OpenSearch 側 timeout + 余裕、最低 OPENSEARCH_HTTP_TIMEOUT
+        http_timeout = max(float(timeout) + 30.0, OPENSEARCH_HTTP_TIMEOUT)
+
+        try:
+            resp = _post_json("/core/opensearch/request", kernel_body, timeout=http_timeout)
+        except Exception as e:
+            logger.warning(f"[KERNEL_CLIENT] os_request network error: {method} {path}: {e}")
+            return (0, {})
+
+        status_code = int(resp.get("status_code", 0) or 0)
+        json_data = resp.get("json")
+        if not isinstance(json_data, dict):
+            json_data = {}
+        # kernel 側でエラーが報告された場合は warning ログに残す
+        err = resp.get("error")
+        if err and status_code == 0:
+            logger.warning(f"[KERNEL_CLIENT] os_request error: {method} {path}: {err}")
+        return (status_code, json_data)
+
+
+    # ----------------------------------------------------------------------
+    # ベクトルストア (汎用ベクトル DB 抽象、実装は kernel 側で Milvus)
+    # ----------------------------------------------------------------------
+    # 「ベクトルとメタデータを保存して、類似検索したい」という抽象機能。
+    # 呼び出し元アプリは namespace (collection) 名・スキーマだけを意識する。
+    # 実装 (Milvus URL、pymilvus 操作) は kernel に隠蔽されている。
+
+    VECTORSTORE_HTTP_TIMEOUT = float(os.environ.get("KERNEL_VECTORSTORE_HTTP_TIMEOUT", "120"))
+
+
+    class VectorStoreError(Exception):
+        """ベクトルストア操作エラー (kernel_client が呼び出し元に投げるドメイン例外)。"""
+        pass
+
+
+    def vs_has_namespace(namespace: str) -> bool:
+        """namespace の存在確認。失敗時は False を返す (元の utility.has_collection と同じ挙動)。"""
+        try:
+            resp = _post_json(
+                "/core/vectorstore/has-namespace",
+                {"namespace": namespace},
+                timeout=VECTORSTORE_HTTP_TIMEOUT,
+            )
+            return bool(resp.get("exists"))
+        except Exception as e:
+            logger.warning(f"[KERNEL_CLIENT] vs_has_namespace failed: {e}")
+            return False
+
+
+    def vs_init_namespace(namespace: str, schema: Dict[str, Any],
+                          index: Optional[Dict[str, Any]] = None) -> bool:
+        """namespace を作成 (既存ならスキップ)。インデックスも合わせて作る場合は index を指定。
+
+        schema: {"fields": [...], "description": "..."}
+            fields の各要素: {"name", "dtype", "is_primary"?, "auto_id"?, "dim"?, "max_length"?, "description"?}
+            dtype は文字列 "INT64", "FLOAT_VECTOR", "VARCHAR" 等
+        index: {"field", "index_type", "metric_type", "params"} (任意)
+
+        失敗時は VectorStoreError を投げる。
+        """
+        body: Dict[str, Any] = {"namespace": namespace, "schema": schema}
+        if index:
+            body["index"] = index
+        try:
+            resp = _post_json(
+                "/core/vectorstore/init-namespace",
+                body,
+                timeout=VECTORSTORE_HTTP_TIMEOUT,
+            )
+        except Exception as e:
+            raise VectorStoreError(f"vs_init_namespace network error: {e}")
+        if not resp.get("ok"):
+            raise VectorStoreError(f"vs_init_namespace failed: {resp.get('error', 'unknown')}")
+        return bool(resp.get("created"))
+
+
+    def vs_drop_namespace(namespace: str) -> bool:
+        """namespace を削除 (存在しなくても ok)。失敗時は False を返す。"""
+        try:
+            resp = _post_json(
+                "/core/vectorstore/drop-namespace",
+                {"namespace": namespace},
+                timeout=VECTORSTORE_HTTP_TIMEOUT,
+            )
+            return bool(resp.get("ok"))
+        except Exception as e:
+            logger.warning(f"[KERNEL_CLIENT] vs_drop_namespace failed: {e}")
+            return False
+
+
+    def vs_upsert(namespace: str, data: list) -> int:
+        """namespace にデータを挿入する (flush + load 込み)。
+
+        data: [{"vector": [...], "doc_id": "...", "text": "...", ...}, ...]  行指向 dict のリスト。
+        戻り値: 挿入件数。失敗時は VectorStoreError を投げる。
+        """
+        try:
+            resp = _post_json(
+                "/core/vectorstore/upsert",
+                {"namespace": namespace, "data": data},
+                timeout=VECTORSTORE_HTTP_TIMEOUT,
+            )
+        except Exception as e:
+            raise VectorStoreError(f"vs_upsert network error: {e}")
+        if not resp.get("ok"):
+            raise VectorStoreError(f"vs_upsert failed: {resp.get('error', 'unknown')}")
+        return int(resp.get("inserted_count", 0))
+
+
+    def vs_search(namespace: str, query_vectors: list,
+                  anns_field: str = "vector",
+                  param: Optional[Dict[str, Any]] = None,
+                  limit: int = 10,
+                  expr: Optional[str] = None,
+                  output_fields: Optional[list] = None) -> list:
+        """ベクトル類似検索を実行する (kernel 側で collection.load() も行う)。
+
+        戻り値: 各クエリベクトルに対するヒット結果のリスト
+            [
+              [{"id": int, "distance": float, "entity": {...}}, ...],   # query_vectors[0] の結果
+              ...
+            ]
+        失敗時は VectorStoreError を投げる。
+        """
+        body: Dict[str, Any] = {
+            "namespace": namespace,
+            "query_vectors": query_vectors,
+            "anns_field": anns_field,
+            "limit": int(limit),
+        }
+        if param is not None:
+            body["param"] = param
+        if expr:
+            body["expr"] = expr
+        if output_fields:
+            body["output_fields"] = output_fields
+        try:
+            resp = _post_json(
+                "/core/vectorstore/search",
+                body,
+                timeout=VECTORSTORE_HTTP_TIMEOUT,
+            )
+        except Exception as e:
+            raise VectorStoreError(f"vs_search network error: {e}")
+        if not resp.get("ok"):
+            raise VectorStoreError(f"vs_search failed: {resp.get('error', 'unknown')}")
+        return resp.get("results", []) or []
+
+
+    def vs_query(namespace: str, expr: str,
+                 output_fields: Optional[list] = None,
+                 limit: Optional[int] = None) -> list:
+        """属性条件でレコード取得 (ベクトル検索ではない)。
+
+        戻り値: [{...}, ...] レコード dict のリスト。
+        失敗時は VectorStoreError を投げる。
+        """
+        body: Dict[str, Any] = {"namespace": namespace, "expr": expr}
+        if output_fields:
+            body["output_fields"] = output_fields
+        if limit is not None:
+            body["limit"] = int(limit)
+        try:
+            resp = _post_json(
+                "/core/vectorstore/query",
+                body,
+                timeout=VECTORSTORE_HTTP_TIMEOUT,
+            )
+        except Exception as e:
+            raise VectorStoreError(f"vs_query network error: {e}")
+        if not resp.get("ok"):
+            raise VectorStoreError(f"vs_query failed: {resp.get('error', 'unknown')}")
+        return resp.get("results", []) or []
+
+
+    def vs_delete(namespace: str, expr: str) -> bool:
+        """条件式で指定されたレコードを削除する。
+
+        失敗時は False を返す (元の collection.delete + 例外握りつぶしと同じ挙動)。
+        """
+        try:
+            resp = _post_json(
+                "/core/vectorstore/delete",
+                {"namespace": namespace, "expr": expr},
+                timeout=VECTORSTORE_HTTP_TIMEOUT,
+            )
+            return bool(resp.get("ok"))
+        except Exception as e:
+            logger.warning(f"[KERNEL_CLIENT] vs_delete failed: {e}")
+            return False
+
+
+    def vs_flush(namespace: str) -> bool:
+        """namespace に対して flush を実行する。失敗時 False。"""
+        try:
+            resp = _post_json(
+                "/core/vectorstore/flush",
+                {"namespace": namespace},
+                timeout=VECTORSTORE_HTTP_TIMEOUT,
+            )
+            return bool(resp.get("ok"))
+        except Exception as e:
+            logger.warning(f"[KERNEL_CLIENT] vs_flush failed: {e}")
+            return False
+
+
+    def vs_load(namespace: str) -> bool:
+        """namespace を検索可能な状態にロードする。失敗時 False。"""
+        try:
+            resp = _post_json(
+                "/core/vectorstore/load",
+                {"namespace": namespace},
+                timeout=VECTORSTORE_HTTP_TIMEOUT,
+            )
+            return bool(resp.get("ok"))
+        except Exception as e:
+            logger.warning(f"[KERNEL_CLIENT] vs_load failed: {e}")
+            return False
+
+
+    def vs_count(namespace: str) -> int:
+        """namespace のレコード数を返す (Milvus の num_entities 相当)。
+        存在しない namespace は 0、エラー時も 0。"""
+        try:
+            resp = _post_json(
+                "/core/vectorstore/count",
+                {"namespace": namespace},
+                timeout=VECTORSTORE_HTTP_TIMEOUT,
+            )
+            return int(resp.get("count", 0) or 0)
+        except Exception as e:
+            logger.warning(f"[KERNEL_CLIENT] vs_count failed: {e}")
+            return 0
+
+
+    # ----------------------------------------------------------------------
+    # グラフ DB (Memgraph/Neo4j 互換、Cypher プロキシ)
+    # ----------------------------------------------------------------------
+    # 「Cypher を実行して records を受け取る」という抽象機能。
+    # 実装 (Memgraph URL、neo4j ドライバ操作) は kernel に隠蔽されている。
+    # neo4j Node/Relationship オブジェクトは properties + メタ情報の dict として返る。
+
+    GRAPH_HTTP_TIMEOUT = float(os.environ.get("KERNEL_GRAPH_HTTP_TIMEOUT", "60"))
+
+
+    class GraphError(Exception):
+        """グラフ DB 操作エラー。"""
+        pass
+
+
+    def graph_run(cypher: str, params: Optional[Dict[str, Any]] = None, **kwargs) -> list:
+        """Cypher を実行し、records (dict のリスト) を返す。
+
+        params (dict) と **kwargs のどちらでもパラメータを渡せる。両方指定された場合は
+        kwargs が優先 (params の同名キーを上書き)。これにより既存の以下スタイルの
+        コードがそのまま動く:
+            # 旧
+            session.run(cypher, doc_id=doc_id, tenant=tenant)
+            # 新
+            kernel_client.graph_run(cypher, doc_id=doc_id, tenant=tenant)
+
+        戻り値: dict のリスト。各 dict のキーは Cypher の RETURN 句のラベル。
+                Node/Relationship は {"_type": "Node", "_labels": [...], ...properties} の dict。
+
+        グラフ DB 未接続の場合や Cypher エラーの場合は GraphError を投げる。
+        """
+        if not cypher:
+            raise GraphError("cypher is empty")
+
+        actual_params: Dict[str, Any] = {}
+        if params:
+            actual_params.update(params)
+        if kwargs:
+            actual_params.update(kwargs)
+
+        try:
+            resp = _post_json(
+                "/core/graph/run",
+                {"cypher": cypher, "params": actual_params},
+                timeout=GRAPH_HTTP_TIMEOUT,
+            )
+        except Exception as e:
+            raise GraphError(f"graph_run network error: {e}")
+
+        if not resp.get("ok"):
+            raise GraphError(f"graph_run failed: {resp.get('error', 'unknown')}")
+
+        records = resp.get("records", []) or []
+        return records
+
+
+    def graph_available() -> bool:
+        """グラフ DB が利用可能か確認する。kernel 側の neo4j_driver の状態を返す。
+        試しに軽量な Cypher を実行してみて成功するかで判定する。"""
+        try:
+            graph_run("RETURN 1 AS ok")
+            return True
+        except Exception:
+            return False
+
+
+    # ----------------------------------------------------------------------
+    # Reranker (Cross-Encoder スコアリング)
+    # ----------------------------------------------------------------------
+    # 「クエリと候補テキスト群の類似度を再評価し、上位 N 件を返す」抽象機能。
+    # 実装 (BAAI/bge-reranker-base、GPU/CPU 切り替え) は kernel に隠蔽されている。
+
+    RERANKER_HTTP_TIMEOUT = float(os.environ.get("KERNEL_RERANKER_HTTP_TIMEOUT", "120"))
+
+
+    def rerank_score(question: str, candidates: list, final_count: int = 10) -> tuple:
+        """候補テキスト群を Cross-Encoder で再評価し、上位 final_count 件を返す。
+
+        旧 rerank_with_cross_encoder と完全互換のシグネチャ:
+            戻り値 = (ranked_candidates, debug_info)
+        ranked_candidates は dict のリスト。各 dict は元の candidate に "rerank_score" を追加したもの。
+        失敗時も例外は投げず、(candidates[:final_count], {"reranked": False, ...}) を返す。
+
+        candidates が final_count 以下の場合は reranking せずにそのまま返す。
+        """
+        if not isinstance(candidates, list):
+            return [], {"reranked": False, "reason": "candidates must be a list"}
+        # 候補が少ない場合は reranking しない (kernel 側でも判定するが、ネットワーク呼び出しを節約)
+        if len(candidates) <= final_count:
+            return candidates, {"reranked": False, "reason": "candidates_too_few"}
+
+        try:
+            resp = _post_json(
+                "/core/reranker/score",
+                {"question": question, "candidates": candidates, "final_count": final_count},
+                timeout=RERANKER_HTTP_TIMEOUT,
+            )
+        except Exception as e:
+            logger.warning(f"[KERNEL_CLIENT] rerank_score network error: {e}")
+            return candidates[:final_count], {"reranked": False, "reason": f"network: {e}"}
+
+        if not resp.get("ok"):
+            err = resp.get("error", "unknown")
+            logger.warning(f"[KERNEL_CLIENT] rerank_score failed: {err}")
+            return candidates[:final_count], {"reranked": False, "reason": err}
+
+        results = resp.get("results", []) or []
+        debug_info = resp.get("debug_info", {}) or {}
+        return results, debug_info
+
+
+
+    # ----------------------------------------------------------------------
+    # KV Store (Valkey/Redis) - 汎用 Key-Value ストア
+    # ----------------------------------------------------------------------
+    # kernel の /core/kv/* エンドポイントへの薄いラッパー。
+    # アプリケーション中立で、key 名前空間 / db番号 / TTL ポリシーは呼び出し側が決める。
+    # 失敗時も例外を投げない流儀で、戻り値で成功/失敗を区別する。
+
+    KV_HTTP_TIMEOUT = float(os.environ.get("KERNEL_KV_HTTP_TIMEOUT", "10"))
+
+
+    def kv_get(key: str, db: int = 0) -> Optional[str]:
+        """KV ストアから1キーの値を取得。
+        
+        Returns:
+            値の文字列。キーが存在しない場合 None。エラー時も None。
+        """
+        if not key:
+            return None
+        try:
+            resp = _post_json("/core/kv/get", {"key": key, "db": int(db)}, timeout=KV_HTTP_TIMEOUT)
+        except Exception as e:
+            logger.warning(f"[KERNEL_CLIENT] kv_get network error: {e}")
+            return None
+        if not resp.get("ok"):
+            err = resp.get("error", "unknown")
+            logger.warning(f"[KERNEL_CLIENT] kv_get failed: {err}")
+            return None
+        return resp.get("value")
+
+
+    def kv_set(key: str, value: str, db: int = 0, ttl: int = 0) -> bool:
+        """KV ストアに1キーの値を保存。
+
+        Args:
+            key: キー
+            value: 値 (文字列。 dict/list を渡すと kernel 側で json.dumps される)
+            db: db番号 (省略時は 0)
+            ttl: TTL秒 (省略時 or 0 で TTL なし)
+
+        Returns:
+            成功時 True、 失敗時 False
+        """
+        if not key:
+            return False
+        try:
+            resp = _post_json(
+                "/core/kv/set",
+                {"key": key, "value": value, "db": int(db), "ttl": int(ttl)},
+                timeout=KV_HTTP_TIMEOUT,
+            )
+        except Exception as e:
+            logger.warning(f"[KERNEL_CLIENT] kv_set network error: {e}")
+            return False
+        if not resp.get("ok"):
+            err = resp.get("error", "unknown")
+            logger.warning(f"[KERNEL_CLIENT] kv_set failed: {err}")
+            return False
+        return True
+
+
+    def kv_delete(key: str, db: int = 0) -> bool:
+        """KV ストアから1キーを削除。
+
+        Returns:
+            実際に削除された場合 True (キーが存在しなかった or エラー時は False)
+        """
+        if not key:
+            return False
+        try:
+            resp = _post_json("/core/kv/delete", {"key": key, "db": int(db)}, timeout=KV_HTTP_TIMEOUT)
+        except Exception as e:
+            logger.warning(f"[KERNEL_CLIENT] kv_delete network error: {e}")
+            return False
+        if not resp.get("ok"):
+            err = resp.get("error", "unknown")
+            logger.warning(f"[KERNEL_CLIENT] kv_delete failed: {err}")
+            return False
+        return bool(resp.get("deleted", False))
+
+
+    def kv_exists(key: str, db: int = 0) -> bool:
+        """指定キーが存在するか確認。"""
+        if not key:
+            return False
+        try:
+            resp = _post_json("/core/kv/exists", {"key": key, "db": int(db)}, timeout=KV_HTTP_TIMEOUT)
+        except Exception as e:
+            logger.warning(f"[KERNEL_CLIENT] kv_exists network error: {e}")
+            return False
+        if not resp.get("ok"):
+            return False
+        return bool(resp.get("exists", False))
+
+
+    def kv_keys(pattern: str = "*", db: int = 0, limit: int = 1000) -> list:
+        """パターンに一致するキー一覧を返す (デバッグ・管理用)。
+
+        Returns:
+            キー文字列のリスト。 エラー時は空リスト。
+        """
+        try:
+            resp = _post_json(
+                "/core/kv/keys",
+                {"pattern": pattern, "db": int(db), "limit": int(limit)},
+                timeout=KV_HTTP_TIMEOUT,
+            )
+        except Exception as e:
+            logger.warning(f"[KERNEL_CLIENT] kv_keys network error: {e}")
+            return []
+        if not resp.get("ok"):
+            err = resp.get("error", "unknown")
+            logger.warning(f"[KERNEL_CLIENT] kv_keys failed: {err}")
+            return []
+        return resp.get("keys", []) or []
+
+
+    def kv_incr(key: str, db: int = 0, amount: int = 1) -> Optional[int]:
+        """整数値のカウンタをアトミックに増加させる。
+
+        Returns:
+            加算後の値。 エラー時は None。
+        """
+        if not key:
+            return None
+        try:
+            resp = _post_json(
+                "/core/kv/incr",
+                {"key": key, "db": int(db), "amount": int(amount)},
+                timeout=KV_HTTP_TIMEOUT,
+            )
+        except Exception as e:
+            logger.warning(f"[KERNEL_CLIENT] kv_incr network error: {e}")
+            return None
+        if not resp.get("ok"):
+            err = resp.get("error", "unknown")
+            logger.warning(f"[KERNEL_CLIENT] kv_incr failed: {err}")
+            return None
+        return int(resp.get("value", 0))
+
+
+    def kv_expire(key: str, ttl: int, db: int = 0) -> bool:
+        """既存キーに TTL秒を設定する (ttl=0 で TTL 解除)。
+
+        Returns:
+            TTL/PERSIST がキーに反映された場合 True (キーが存在しなかった場合 False)
+        """
+        if not key:
+            return False
+        try:
+            resp = _post_json(
+                "/core/kv/expire",
+                {"key": key, "ttl": int(ttl), "db": int(db)},
+                timeout=KV_HTTP_TIMEOUT,
+            )
+        except Exception as e:
+            logger.warning(f"[KERNEL_CLIENT] kv_expire network error: {e}")
+            return False
+        if not resp.get("ok"):
+            err = resp.get("error", "unknown")
+            logger.warning(f"[KERNEL_CLIENT] kv_expire failed: {err}")
+            return False
+        return bool(resp.get("applied", False))
+
+
+    # ----------------------------------------------------------------------
+    # Debug / Benchmark
+    # ----------------------------------------------------------------------
+    # 並行性ベンチマーク用の sleep ラッパー。 kernel /core/debug/sleep に委譲する。
+    # 本番有効、 cluster-internal Service 経由のみで叩く想定。
+
+    DEBUG_SLEEP_HTTP_TIMEOUT = float(os.environ.get("KERNEL_DEBUG_SLEEP_HTTP_TIMEOUT", "120"))
+
+
+    def debug_sleep(seconds: float, mode: str = "blocking", label: str = "") -> Dict[str, Any]:
+        """kernel に sleep させる (並行性ベンチマーク用)。
+
+        引数:
+            seconds: sleep 秒数 (kernel 側で 0 〜 60 にクランプ)
+            mode: "blocking" (time.sleep で event loop を握る) | "async" (await asyncio.sleep)
+            label: 任意ラベル (ログ用)
+
+        戻り値: kernel /core/debug/sleep の応答 dict
+            {
+              "slept": float, "mode": str, "label": str,
+              "started_at": ISO8601, "ended_at": ISO8601,
+              "wall_seconds": float,
+              "thread_id": int, "task_id": str,
+              "error"?: str
+            }
+        失敗時は {"ok": False, "error": "..."} を返す (例外は投げない)。
+        """
+        # HTTP タイムアウトは kernel 側 sleep + 余裕 60 秒、 最低 DEBUG_SLEEP_HTTP_TIMEOUT を保証
+        http_timeout = max(float(seconds) + 60.0, DEBUG_SLEEP_HTTP_TIMEOUT)
+        try:
+            return _post_json(
+                "/core/debug/sleep",
+                {"seconds": float(seconds), "mode": str(mode), "label": str(label)},
+                timeout=http_timeout,
+            )
+        except Exception as e:
+            logger.warning(f"[KERNEL_CLIENT] debug_sleep failed: {e}")
+            return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+
+
+    # ----------------------------------------------------------------------
+    # GitHub account management (per-user PAT)
+    # ----------------------------------------------------------------------
+    # kernel /core/github-account/* の薄いラッパー。
+    # the assistant backend が承認後 _execute_*_github_account から呼ぶ。
+    # list は読み取り専用 (MCP 側から直接 kernel を叩く) のでラッパーを設けない。
+
+    def github_account_add(user_id: str, account_id: str, token: str,
+                           account_label: str = "", default: bool = False) -> Dict[str, Any]:
+        """GitHub アカウントを登録する。
+
+        kernel 側で GitHub API /user を叩いて token を検証してから保存する。
+
+        Args:
+            user_id:       アカウント所有者
+            account_id:    アカウント識別子 (英数+_- のみ)
+            token:         GitHub Personal Access Token
+            account_label: 利用者向け表示名 (省略時は account_id)
+            default:       True なら既定アカウントとして登録
+
+        Returns:
+            kernel /core/github-account/add の応答 dict。
+            成功時: {"ok": True, "user_id": ..., "account_id": ..., "github_login": ..., ...}
+            失敗時は例外を raise (HTTPError)。
+        """
+        body: Dict[str, Any] = {
+            "user_id": user_id,
+            "account_id": account_id,
+            "token": token,
+            "default": bool(default),
+        }
+        if account_label:
+            body["account_label"] = account_label
+        return _post_json("/core/github-account/add", body, timeout=30)
+
+
+    def github_account_update(user_id: str, account_id: str,
+                              token: str = "", account_label: str = "",
+                              default: Optional[bool] = None) -> Dict[str, Any]:
+        """GitHub アカウントを部分更新する。
+
+        空文字 / None のフィールドは更新されない。
+        token を指定した場合は kernel 側で再検証してから差し替えられる。
+
+        Args:
+            user_id:       アカウント所有者
+            account_id:    更新対象のアカウント識別子
+            token:         新しい PAT (空文字なら変更しない)
+            account_label: 新しい表示名 (空文字なら変更しない)
+            default:       既定アカウントにするか (None なら変更しない)
+
+        Returns:
+            kernel /core/github-account/update の応答 dict。
+        """
+        body: Dict[str, Any] = {"user_id": user_id, "account_id": account_id}
+        if token:
+            body["token"] = token
+        if account_label:
+            body["account_label"] = account_label
+        if default is not None:
+            body["default"] = bool(default)
+        return _post_json("/core/github-account/update", body, timeout=30)
+
+
+    def github_account_delete(user_id: str, account_id: str) -> Dict[str, Any]:
+        """GitHub アカウントを削除する。
+
+        削除対象が default=True だった場合、 残ったアカウントのうち
+        最も古いものが自動的に default=True に昇格する (kernel 側で処理)。
+
+        Args:
+            user_id:    アカウント所有者
+            account_id: 削除対象のアカウント識別子
+
+        Returns:
+            kernel /core/github-account/delete の応答 dict。
+            {"ok": True, "deleted": True, "was_default": bool,
+             "promoted_account_id": str | None, ...}
+        """
+        body = {"user_id": user_id, "account_id": account_id}
+        return _post_json("/core/github-account/delete", body, timeout=15)

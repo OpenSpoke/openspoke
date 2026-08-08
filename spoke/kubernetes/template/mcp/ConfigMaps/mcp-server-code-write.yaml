@@ -1,0 +1,675 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcp-server-code-write
+  namespace: rag-spoke
+data:
+  mcp_server_write.py: |
+    """
+    スポーク MCP の書き込み系ツール群。
+    mcp_server.py の末尾で register_tools(mcp) を呼ぶことでツールが登録される。
+    """
+
+    import base64
+    import logging
+    import socket
+    import ssl
+
+    import yaml as _yaml
+    from kubernetes import client as _k8sclient, config as _k8sconfig
+    from kubernetes.client.rest import ApiException
+
+    log = logging.getLogger("mcp_server_write")
+
+
+    def _fetch_server_ca_bundle(api_server_url: str) -> str:
+        """apiServerURL のホスト:ポートに TLS 接続して、 サーバが提示する
+        証明書チェーン (中間 CA 含む) を PEM 形式の文字列として返す。
+
+        fleet-agent helm chart は values.apiServerCA を CA bundle として使う。
+        空のままだと fleet-agent コンテナ内の Go x509 が system cert pool
+        を読みに行くが、 イメージ構造の都合で /etc/ssl/certs が /dev/null
+        を指していて TLS verify に失敗する (note:tls-troubleshooting 参照)。
+
+        本関数で apiServerURL に対する TLS handshake を実行し、 ピアが
+        提示する証明書チェーン (leaf + 中間 CA) を PEM concat した文字列
+        を返す。 これを values.apiServerCA に埋め込めば fleet-agent は
+        自前の CA bundle で TLS 検証できる。
+
+        失敗時は空文字を返す (best-effort)。 呼び出し側は空でも従来動作。
+        """
+        try:
+            from urllib.parse import urlparse
+            u = urlparse(api_server_url)
+            host = u.hostname
+            port = u.port or (443 if u.scheme == "https" else 80)
+            if not host:
+                return ""
+            # CA 検証は無効化して handshake は通す (チェーンの抽出だけが目的)。
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            with socket.create_connection((host, port), timeout=10) as sock:
+                with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+                    chain_pem = ""
+                    # Python 3.10+: get_unverified_chain() で全チェーンを取得
+                    if hasattr(ssock, "get_unverified_chain"):
+                        try:
+                            chain = ssock.get_unverified_chain()
+                            for cert in chain:
+                                # _ssl.Certificate.public_bytes(format)
+                                # format=ssl._ssl.ENCODING_PEM 相当が
+                                # 環境によって異なるので、 DER で取って
+                                # ssl.DER_cert_to_PEM_cert で PEM 化する。
+                                der = cert.public_bytes(
+                                    ssl._ssl.ENCODING_DER
+                                ) if hasattr(ssl, "_ssl") and hasattr(
+                                    ssl._ssl, "ENCODING_DER"
+                                ) else None
+                                if der:
+                                    chain_pem += ssl.DER_cert_to_PEM_cert(der)
+                            if chain_pem:
+                                return chain_pem
+                        except Exception as e:
+                            log.warning(
+                                "get_unverified_chain failed, "
+                                "falling back to peer cert only: %s", e)
+                    # フォールバック: leaf 証明書のみ (binary_form=True で
+                    # CERT_NONE でも DER バイト列が取れる)
+                    der = ssock.getpeercert(binary_form=True)
+                    if der:
+                        return ssl.DER_cert_to_PEM_cert(der)
+            return ""
+        except Exception as e:
+            log.warning("failed to fetch CA bundle from %s: %s",
+                        api_server_url, e)
+            return ""
+
+    # ── kubernetes client は初回利用時に lazy 初期化 ──
+    _core = _apps = _rbac = _custom = None
+
+    def _init_k8s():
+        global _core, _apps, _rbac, _custom
+        if _core is not None:
+            return
+        try:
+            _k8sconfig.load_incluster_config()
+            log.info("loaded in-cluster kubeconfig")
+        except _k8sconfig.ConfigException:
+            _k8sconfig.load_kube_config()
+            log.info("loaded local kubeconfig (dev mode)")
+
+        # kubernetes Python client (OpenAPI Generator 36+) では
+        # Configuration.api_key の値が ApiClient によって自動で Authorization
+        # ヘッダに変換されない既知の問題がある (理由は不明だが、 in-cluster
+        # config から作った Configuration では api_key 経由のヘッダ追加が
+        # 動かず、 401 になる)。
+        #
+        # 回避策: ApiClient.set_default_header で Authorization を直接設定する。
+        # token 値は load_incluster_config() がセットした api_key から取り、
+        # "bearer " (小文字 prefix) を取り除いて "Bearer " (大文字始まり、
+        # RKE2 が要求する形式) を付け直す。
+        _cfg = _k8sclient.Configuration.get_default_copy()
+        _tok = (_cfg.api_key or {}).get("authorization", "")
+        if _tok.lower().startswith("bearer "):
+            _tok = _tok[len("bearer "):]
+
+        _api_client = _k8sclient.ApiClient(configuration=_cfg)
+        _api_client.set_default_header("Authorization", f"Bearer {_tok}")
+
+        _core = _k8sclient.CoreV1Api(api_client=_api_client)
+        _apps = _k8sclient.AppsV1Api(api_client=_api_client)
+        _rbac = _k8sclient.RbacAuthorizationV1Api(api_client=_api_client)
+        _custom = _k8sclient.CustomObjectsApi(api_client=_api_client)
+
+
+    def _ensure_namespace(name):
+        try:
+            _core.read_namespace(name)
+            return f"namespace/{name} already exists"
+        except ApiException as e:
+            if e.status != 404:
+                raise
+        _core.create_namespace(_k8sclient.V1Namespace(
+            metadata=_k8sclient.V1ObjectMeta(name=name)))
+        return f"namespace/{name} created"
+
+
+    def _apply_serviceaccount(ns, name):
+        try:
+            _core.read_namespaced_service_account(name, ns)
+            return f"serviceaccount/{name} already exists"
+        except ApiException as e:
+            if e.status != 404:
+                raise
+        _core.create_namespaced_service_account(ns, _k8sclient.V1ServiceAccount(
+            metadata=_k8sclient.V1ObjectMeta(name=name, namespace=ns)))
+        return f"serviceaccount/{name} created"
+
+
+    def _apply_clusterrolebinding(name, role, ns, sa):
+        body = _k8sclient.V1ClusterRoleBinding(
+            metadata=_k8sclient.V1ObjectMeta(name=name),
+            role_ref=_k8sclient.V1RoleRef(
+                api_group="rbac.authorization.k8s.io",
+                kind="ClusterRole",
+                name=role,
+            ),
+            subjects=[_k8sclient.RbacV1Subject(
+                kind="ServiceAccount", name=sa, namespace=ns,
+            )],
+        )
+        try:
+            _rbac.read_cluster_role_binding(name)
+            _rbac.replace_cluster_role_binding(name, body)
+            return f"clusterrolebinding/{name} replaced"
+        except ApiException as e:
+            if e.status != 404:
+                raise
+        _rbac.create_cluster_role_binding(body)
+        return f"clusterrolebinding/{name} created"
+
+
+    def _apply_secret(ns, name, data):
+        body = _k8sclient.V1Secret(
+            metadata=_k8sclient.V1ObjectMeta(name=name, namespace=ns),
+            type="Opaque",
+            data={k: base64.b64encode(v.encode()).decode() for k, v in data.items()},
+        )
+        try:
+            _core.read_namespaced_secret(name, ns)
+            _core.replace_namespaced_secret(name, ns, body)
+            return f"secret/{name} replaced"
+        except ApiException as e:
+            if e.status != 404:
+                raise
+        _core.create_namespaced_secret(ns, body)
+        return f"secret/{name} created"
+
+
+    def _delete_deployment_if_exists(ns, name):
+        try:
+            _apps.read_namespaced_deployment(name, ns)
+            _apps.delete_namespaced_deployment(name, ns)
+            return f"deployment/{name} deleted"
+        except ApiException as e:
+            if e.status == 404:
+                return f"deployment/{name} not present"
+            raise
+
+
+    def _delete_secret_if_exists(ns, name):
+        try:
+            _core.read_namespaced_secret(name, ns)
+            _core.delete_namespaced_secret(name, ns)
+            return f"secret/{name} deleted"
+        except ApiException as e:
+            if e.status == 404:
+                return f"secret/{name} not present"
+            raise
+
+
+    def _delete_helm_releases(ns, label_prefix):
+        """旧 Rancher 内蔵 Fleet 由来の fleet-agent helm release Secret を消す。
+        Secret 名は sh.helm.release.v1.fleet-agent-{cluster_id}.{vN}。
+        cluster_id は変動するため、 prefix 一致で全件削除する。"""
+        try:
+            secrets = _core.list_namespaced_secret(ns).items
+        except ApiException as e:
+            return f"failed to list secrets: {e}"
+        removed = []
+        for s in secrets:
+            sname = s.metadata.name
+            if sname.startswith(label_prefix):
+                try:
+                    _core.delete_namespaced_secret(sname, ns)
+                    removed.append(sname)
+                except ApiException as e:
+                    if e.status != 404:
+                        return f"failed to delete secret/{sname}: {e}"
+        if not removed:
+            return f"no helm release secrets with prefix '{label_prefix}'"
+        return f"helm release secrets removed: {', '.join(removed)}"
+
+
+    _FLEET_AGENT_DEPLOYMENT = {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {
+            "name": "fleet-agent",
+            "namespace": "cattle-fleet-system",
+            "labels": {"app": "fleet-agent"},
+        },
+        "spec": {
+            "replicas": 1,
+            "selector": {"matchLabels": {"app": "fleet-agent"}},
+            "template": {
+                "metadata": {"labels": {"app": "fleet-agent"}},
+                "spec": {
+                    "serviceAccountName": "fleet-agent",
+                    "securityContext": {
+                        "runAsNonRoot": True,
+                        "runAsUser": 1000,
+                        "runAsGroup": 1000,
+                    },
+                    "containers": [{
+                        "name": "fleet-agent",
+                        "image": "rancher/fleet-agent:v0.15.1",
+                        "imagePullPolicy": "IfNotPresent",
+                        "command": ["fleetagent"],
+                        "env": [
+                            {"name": "NAMESPACE",
+                             "valueFrom": {"fieldRef": {"fieldPath": "metadata.namespace"}}},
+                            {"name": "BUNDLEDEPLOYMENT_RECONCILER_WORKERS", "value": "50"},
+                            {"name": "DRIFT_RECONCILER_WORKERS", "value": "50"},
+                            {"name": "CATTLE_ELECTION_LEASE_DURATION", "value": "30s"},
+                            {"name": "CATTLE_ELECTION_RETRY_PERIOD", "value": "10s"},
+                            {"name": "CATTLE_ELECTION_RENEW_DEADLINE", "value": "25s"},
+                            # AGENT_TLS_MODE は設定しない。
+                            # fleet-agent v0.15.1 のデフォルト動作で
+                            # Cloudflare 終端の公的 CA 証明書を検証する
+                            # (コンテナイメージ同梱の CA bundle を使用)。
+                            # 明示的に "system-store" を指定すると、 Go x509 が
+                            # /dev/null を CA ディレクトリとして開こうとして
+                            # 失敗するケースが発生する。
+                        ],
+                        "securityContext": {
+                            "allowPrivilegeEscalation": False,
+                            "readOnlyRootFilesystem": True,
+                            "privileged": False,
+                            "capabilities": {"drop": ["ALL"]},
+                        },
+                        "volumeMounts": [
+                            {"mountPath": "/tmp", "name": "tmp"},
+                            {"mountPath": "/.kube", "name": "kube"},
+                        ],
+                        "resources": {
+                            "requests": {"cpu": "50m", "memory": "100Mi"},
+                            "limits": {"cpu": "500m", "memory": "500Mi"},
+                        },
+                    }],
+                    "volumes": [
+                        {"name": "tmp", "emptyDir": {}},
+                        {"name": "kube", "emptyDir": {}},
+                    ],
+                },
+            },
+        },
+    }
+
+
+    def _apply_fleet_agent_deployment():
+        name = _FLEET_AGENT_DEPLOYMENT["metadata"]["name"]
+        ns   = _FLEET_AGENT_DEPLOYMENT["metadata"]["namespace"]
+        try:
+            _apps.read_namespaced_deployment(name, ns)
+            _apps.replace_namespaced_deployment(name, ns, _FLEET_AGENT_DEPLOYMENT)
+            return f"deployment/{name} replaced"
+        except ApiException as e:
+            if e.status != 404:
+                raise
+        _apps.create_namespaced_deployment(ns, _FLEET_AGENT_DEPLOYMENT)
+        return f"deployment/{name} created"
+
+
+    def register_tools(mcp):
+        """mcp_server.py の末尾でこの関数を呼ぶことでツールが登録される。"""
+
+        @mcp.tool()
+        async def fleet_agent_install(values_yaml: str) -> str:
+            """この downstream クラスタに fleet-agent をインストールして、
+            新 Fleet サーバ管理下に置く。
+
+            Args:
+                values_yaml: Fleet サーバで発行された ClusterRegistrationToken
+                             の Secret から取り出した values.yaml の中身。
+                             必須キー: apiServerURL, token, clusterNamespace,
+                             systemRegistrationNamespace。 apiServerCA は空文字可。
+
+            動作:
+              1. 既存 fleet-agent Deployment があれば削除 (旧 Rancher 内蔵 Fleet 由来)
+              2. cattle-fleet-system namespace を作成
+              3. fleet-agent ServiceAccount と cluster-admin の
+                 ClusterRoleBinding を作成
+              4. fleet-agent-bootstrap Secret を values から作成
+              5. fleet-agent Deployment を作成
+            """
+            try:
+                vals = _yaml.safe_load(values_yaml) or {}
+            except _yaml.YAMLError as e:
+                return f"ERROR: invalid values_yaml: {e}"
+
+            required = ("apiServerURL", "token",
+                        "clusterNamespace", "systemRegistrationNamespace")
+            missing = [k for k in required if not vals.get(k)]
+            if missing:
+                return f"ERROR: required keys missing in values_yaml: {missing}"
+
+            _init_k8s()
+            ns = "cattle-fleet-system"
+            results = []
+            # 旧 Rancher 内蔵 Fleet 由来の状態を完全に消す:
+            #   1. fleet-agent Deployment を削除
+            #   2. 常駐用 fleet-agent Secret を削除 (旧 cluster ID を保持しているため)
+            #   3. 旧 helm release Secret (sh.helm.release.v1.fleet-agent-*) を削除
+            # その後で新規 bootstrap secret と Deployment を作る。
+            results.append(_delete_deployment_if_exists(ns, "fleet-agent"))
+            results.append(_delete_secret_if_exists(ns, "fleet-agent"))
+            results.append(_delete_helm_releases(ns, "sh.helm.release.v1.fleet-agent-"))
+            results.append(_ensure_namespace(ns))
+            results.append(_apply_serviceaccount(ns, "fleet-agent"))
+            results.append(_apply_clusterrolebinding(
+                "fleet-agent", "cluster-admin", ns, "fleet-agent"))
+            results.append(_apply_secret(ns, "fleet-agent-bootstrap", {
+                "values":                       values_yaml,
+                "apiServerURL":                 vals["apiServerURL"],
+                "apiServerCA":                  vals.get("apiServerCA", ""),
+                "token":                        vals["token"],
+                "clusterNamespace":             vals["clusterNamespace"],
+                "systemRegistrationNamespace":  vals["systemRegistrationNamespace"],
+            }))
+            results.append(_apply_fleet_agent_deployment())
+
+            return "fleet_agent_install completed:\n" + "\n".join(f"  - {r}" for r in results)
+
+
+        @mcp.tool()
+        async def fleet_token_create(target_cluster_name: str,
+                                     ttl: str = "1h",
+                                     fleet_namespace: str = "fleet-default") -> str:
+            """Fleet サーバが乗っているクラスタ (= 自クラスタ) で、 新規スポーククラスタ
+            登録用の ClusterRegistrationToken を発行し、 values.yaml を返す。
+
+            このツールは自クラスタの kube-apiserver が Fleet manager の場合のみ
+            意味がある (例: rancher クラスタ)。 fleet-default namespace に
+            fleet.cattle.io/v1alpha1 ClusterRegistrationToken CRD が存在する
+            前提。
+
+            動作:
+              1. fleet-default namespace に既存の同名 ClusterRegistrationToken
+                 があれば削除 (再発行に対応)
+              2. 新規 ClusterRegistrationToken を作成 (spec.ttl)
+              3. 5 秒待って Fleet controller が Secret <name>-registration を
+                 生成するのを確認
+              4. Secret から values キーの中身 (= downstream クラスタの
+                 fleet_agent_install に渡すべき YAML) を取り出して返す
+              5. ClusterRegistrationToken の spec.clientID (Cluster CR と
+                 紐付けるための一意な ID) も返す
+
+            Args:
+                target_cluster_name: ClusterRegistrationToken の name
+                                     (例: "example-cluster")。 Secret 名は
+                                     "<target>-registration"。
+                ttl: token の TTL (例: "1h"、 default "1h")
+                fleet_namespace: 通常は "fleet-default"
+
+            戻り値:
+              values_yaml:
+                <values.yaml の中身>
+              client_id: <ClusterRegistrationToken.spec.clientID>
+            """
+            _init_k8s()
+
+            group = "fleet.cattle.io"
+            version = "v1alpha1"
+            plural = "clusterregistrationtokens"
+
+            # 1. 既存があれば削除
+            try:
+                _custom.delete_namespaced_custom_object(
+                    group=group, version=version,
+                    namespace=fleet_namespace, plural=plural,
+                    name=target_cluster_name,
+                )
+            except ApiException as e:
+                if e.status != 404:
+                    return f"ERROR: failed to delete existing token: {e}"
+
+            # 2. 新規作成
+            body = {
+                "apiVersion": f"{group}/{version}",
+                "kind": "ClusterRegistrationToken",
+                "metadata": {"name": target_cluster_name, "namespace": fleet_namespace},
+                "spec": {"ttl": ttl},
+            }
+            try:
+                _custom.create_namespaced_custom_object(
+                    group=group, version=version,
+                    namespace=fleet_namespace, plural=plural,
+                    body=body,
+                )
+            except ApiException as e:
+                return f"ERROR: failed to create token: {e}"
+
+            # 3. Fleet controller が Secret を生成するまで待つ (最大 15 秒)
+            import time as _time
+            secret_name = target_cluster_name
+            values_b64 = None
+            for _ in range(15):
+                try:
+                    s = _core.read_namespaced_secret(secret_name, fleet_namespace)
+                    if s.data and "values" in s.data:
+                        values_b64 = s.data["values"]
+                        break
+                except ApiException as e:
+                    if e.status != 404:
+                        return f"ERROR: failed to read secret: {e}"
+                _time.sleep(1)
+
+            if not values_b64:
+                return (f"ERROR: secret/{secret_name} (or its values key) "
+                        f"was not generated within 15s")
+
+            values_yaml = base64.b64decode(values_b64).decode()
+
+            # apiServerCA を埋め込む (note:tls-troubleshooting への対処)。
+            # values_yaml に apiServerCA: "" のままだと、 fleet-agent が
+            # system cert pool を参照しに行き、 コンテナイメージの
+            # /etc/ssl/certs が /dev/null になっている問題で TLS verify
+            # に失敗する。 ここで apiServerURL に TLS 接続して証明書チェーン
+            # を取得し、 values_yaml の apiServerCA フィールドを置き換える。
+            try:
+                vals_dict = _yaml.safe_load(values_yaml) or {}
+                api_url = vals_dict.get("apiServerURL", "")
+                if api_url and not vals_dict.get("apiServerCA"):
+                    ca_pem = _fetch_server_ca_bundle(api_url)
+                    if ca_pem:
+                        vals_dict["apiServerCA"] = ca_pem
+                        values_yaml = _yaml.safe_dump(
+                            vals_dict, default_style="|"
+                        )
+                        log.info(
+                            "embedded apiServerCA into values_yaml "
+                            "for token %s (%d bytes)",
+                            target_cluster_name, len(ca_pem))
+            except Exception as e:
+                log.warning("failed to embed apiServerCA: %s", e)
+
+            # 4. ClusterRegistrationToken の clientID を取得
+            try:
+                token_obj = _custom.get_namespaced_custom_object(
+                    group=group, version=version,
+                    namespace=fleet_namespace, plural=plural,
+                    name=target_cluster_name,
+                )
+                client_id = token_obj.get("status", {}).get("clientID", "")
+            except ApiException as e:
+                client_id = f"(failed to read: {e})"
+
+            return f"values_yaml:\n{values_yaml}\nclient_id: {client_id}\n"
+
+
+        @mcp.tool()
+        async def fleet_cluster_label(client_id: str,
+                                      cluster_name_label: str,
+                                      fleet_namespace: str = "fleet-default",
+                                      timeout_seconds: int = 60) -> str:
+            """Fleet サーバが乗っているクラスタ (= 自クラスタ) で、 指定 clientID を
+            持つ Cluster CR に label `cluster-name=<value>` を付与する。
+
+            fleet_agent_install で downstream クラスタが新 Fleet に登録された後、
+            その Cluster CR を識別するために spec.clientID を使う。
+            (Cluster CR の名前は cluster-XXXXXXXXXXXX のような自動生成 ID。)
+
+            動作:
+              1. fleet-default namespace の Cluster CR を list
+              2. spec.clientID == client_id のものを探す
+              3. なければ少し待ってリトライ (downstream の fleet-agent が
+                 まだ登録中の可能性、 timeout_seconds で打ち切り)
+              4. 見つけたら metadata.labels に cluster-name=<value> を merge
+
+            Args:
+                client_id: fleet_token_create が返した clientID
+                cluster_name_label: ラベル値 (例: "example-cluster")
+                fleet_namespace: 通常は "fleet-default"
+                timeout_seconds: Cluster CR が現れるのを待つ秒数 (default 60)
+            """
+            _init_k8s()
+
+            group = "fleet.cattle.io"
+            version = "v1alpha1"
+            plural = "clusters"
+
+            import time as _time
+            target = None
+            elapsed = 0
+            while elapsed < timeout_seconds:
+                try:
+                    lst = _custom.list_namespaced_custom_object(
+                        group=group, version=version,
+                        namespace=fleet_namespace, plural=plural,
+                    )
+                except ApiException as e:
+                    return f"ERROR: failed to list clusters: {e}"
+                for c in lst.get("items", []):
+                    cid = c.get("spec", {}).get("clientID", "")
+                    if cid == client_id:
+                        target = c
+                        break
+                if target:
+                    break
+                _time.sleep(3)
+                elapsed += 3
+
+            if not target:
+                return (f"ERROR: no Cluster CR with clientID={client_id} found "
+                        f"within {timeout_seconds}s")
+
+            name = target["metadata"]["name"]
+            patch = {"metadata": {"labels": {"cluster-name": cluster_name_label}}}
+            try:
+                _custom.patch_namespaced_custom_object(
+                    group=group, version=version,
+                    namespace=fleet_namespace, plural=plural,
+                    name=name, body=patch,
+                )
+            except ApiException as e:
+                return f"ERROR: failed to patch cluster/{name}: {e}"
+
+            return (f"cluster/{name} labeled cluster-name={cluster_name_label} "
+                    f"(clientID={client_id})")
+
+
+        @mcp.tool()
+        async def fleet_cluster_delete(name: str = "",
+                                       client_id: str = "",
+                                       cluster_name_label: str = "",
+                                       fleet_namespace: str = "fleet-default") -> str:
+            """Fleet サーバが乗っているクラスタ (= 自クラスタ) で、 指定された
+            Cluster CR を削除する (kubectl delete cluster.fleet.cattle.io 相当)。
+
+            主な用途は移行作業時の片付け:
+              - 過去に登録された Cluster CR で、 downstream の fleet-agent が
+                既に切り離されてしまったもの (Last Seen が古いまま停止)
+              - fleet_agent_install で再登録した結果生まれる「孤児になった旧
+                Cluster CR」 (新 Cluster CR が別 ID で作られるため)
+
+            Cluster CR を削除すると ownerReference 経由で以下も連動削除される:
+              - cluster-fleet-default-cluster-XXX namespace
+              - 中の BundleDeployment 群
+              - 中の Helm release Secret 群
+
+            downstream クラスタへの影響:
+              - downstream の fleet-agent が動いていない場合: 影響なし (主用途)
+              - 動いている場合: keepResources: true の Bundle ならリソース保護、
+                それ以外は downstream のリソースも削除される可能性があるので注意。
+
+            特定方法 (優先順位: name > client_id > cluster_name_label):
+              - name: Cluster CR の metadata.name で直接指定
+                       (例: "cluster-xxxxxxxxxxxx")
+              - client_id: spec.clientID で検索
+              - cluster_name_label: metadata.labels."cluster-name" で検索
+
+            いずれも未指定の場合はエラー。cluster_name_label で複数の Cluster CR
+            がマッチした場合は、マッチした全 name を返してエラーで停止する
+            (誤って複数消すのを防ぐ安全装置)。 複数を一括削除したい場合は
+            name で 1 件ずつ指定するか、 client_id を使って厳密に特定する。
+
+            Args:
+                name: Cluster CR の metadata.name
+                client_id: Cluster CR の spec.clientID
+                cluster_name_label: metadata.labels."cluster-name" の値
+                fleet_namespace: 通常は "fleet-default"
+            """
+            if not (name or client_id or cluster_name_label):
+                return ("ERROR: must specify at least one of: "
+                        "name, client_id, cluster_name_label")
+
+            _init_k8s()
+
+            group = "fleet.cattle.io"
+            version = "v1alpha1"
+            plural = "clusters"
+
+            target_name = ""
+
+            if name:
+                target_name = name
+            elif client_id:
+                try:
+                    lst = _custom.list_namespaced_custom_object(
+                        group=group, version=version,
+                        namespace=fleet_namespace, plural=plural,
+                    )
+                except ApiException as e:
+                    return f"ERROR: failed to list clusters: {e}"
+                for c in lst.get("items", []):
+                    cid = c.get("spec", {}).get("clientID", "")
+                    if cid == client_id:
+                        target_name = c["metadata"]["name"]
+                        break
+                if not target_name:
+                    return (f"ERROR: no Cluster CR with clientID={client_id} "
+                            f"found in {fleet_namespace}")
+            else:
+                try:
+                    lst = _custom.list_namespaced_custom_object(
+                        group=group, version=version,
+                        namespace=fleet_namespace, plural=plural,
+                        label_selector=f"cluster-name={cluster_name_label}",
+                    )
+                except ApiException as e:
+                    return f"ERROR: failed to list clusters: {e}"
+                matched = [c["metadata"]["name"] for c in lst.get("items", [])]
+                if not matched:
+                    return (f"ERROR: no Cluster CR with label "
+                            f"cluster-name={cluster_name_label} found "
+                            f"in {fleet_namespace}")
+                if len(matched) > 1:
+                    return ("ERROR: multiple Cluster CRs matched label "
+                            f"cluster-name={cluster_name_label}: {matched}. "
+                            "Specify name= or client_id= to disambiguate.")
+                target_name = matched[0]
+
+            try:
+                _custom.delete_namespaced_custom_object(
+                    group=group, version=version,
+                    namespace=fleet_namespace, plural=plural,
+                    name=target_name,
+                )
+            except ApiException as e:
+                if e.status == 404:
+                    return f"cluster/{target_name} not found (already deleted)"
+                return f"ERROR: failed to delete cluster/{target_name}: {e}"
+
+            return f"cluster/{target_name} deleted from {fleet_namespace}"

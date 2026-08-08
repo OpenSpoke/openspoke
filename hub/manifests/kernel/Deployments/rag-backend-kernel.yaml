@@ -1,0 +1,643 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-backend-kernel
+  namespace: rag-company1
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: rag-backend-kernel
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: rag-backend-kernel
+      namespace: rag-company1
+      annotations:
+        restarted-at: "2026-06-22T03:35:00Z"
+    spec:
+      serviceAccountName: rag-backend-kernel
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: rag-type
+                    operator: In
+                    values:
+                      - milvus
+      containers:
+        - command:
+            - bash
+            - '-c'
+            - >
+              echo "Preloading Level Zero libraries..."
+
+              export LD_PRELOAD="/usr/local/lib/libze_loader.so.1
+              /usr/local/lib/libze_intel_gpu.so.1
+              /usr/local/lib/libigdgmm.so.12"
+
+              echo "Starting rag-backend-kernel (core only, Intel GPU)"
+
+              echo "Ensuring pymilvus 2.4.15 in image site-packages..."
+
+              pip install --quiet --upgrade pymilvus==2.4.15 || echo "WARN:
+              pymilvus upgrade failed, continuing"
+
+              python3 -c "import pymilvus; print(f'pymilvus version: {pymilvus.__version__}')"
+
+              export
+              PYTHONPATH=/model-cache/packages:/usr/local/lib/python3.12/site-packages:/app
+
+              export HF_HOME=/model-cache
+
+              export TRANSFORMERS_CACHE=/model-cache
+
+              cd /app
+
+              python3 -c "import main; import uvicorn;
+              uvicorn.run(main.app, host='0.0.0.0', port=8000, workers=1)"
+          env:
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  key: token
+                  name: github-api-token
+            - name: GOOGLE_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  key: client_id
+                  name: google-oauth-credentials
+            - name: GOOGLE_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  key: client_secret
+                  name: google-oauth-credentials
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: api-key
+                  name: anthropic-api-key
+            - name: MCP_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: api-key
+                  name: mcp-api-key
+            - name: MCP_SERVER_URL
+              value: 'http://mcp-company1.mcp.svc.cluster.local:8000/sse'
+            - name: PYTHONPATH
+              value: /model-cache/packages:/app
+            - name: HF_HOME
+              value: /model-cache
+            - name: TRANSFORMERS_CACHE
+              value: /model-cache
+            - name: HF_HUB_OFFLINE
+              value: '1'
+            - name: TRANSFORMERS_OFFLINE
+              value: '1'
+            - name: RERANKER_FORCE_CPU
+              value: '1'
+            - name: EMBEDDING_FORCE_CPU
+              value: '1'
+            - name: OPENSEARCH_URL
+              value: 'http://opensearch.opensearch.svc.cluster.local:9200'
+            - name: PDF_CONVERTER_URL
+              value: 'http://pdf-converter.pdf-converter.svc.cluster.local:8000'
+            - name: KV_VALKEY_HOST
+              value: 'valkey.valkey.svc.cluster.local'
+            - name: KV_VALKEY_PORT
+              value: '6379'
+            - name: KNOWLEDGE_MIGRATE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: knowledge-migrate-token
+                  key: token
+                  optional: true
+            - name: KINTONE_SUBDOMAIN
+              valueFrom:
+                secretKeyRef:
+                  name: kintone-credentials
+                  key: subdomain
+                  optional: true
+            - name: KINTONE_DOMAIN_SUFFIX
+              valueFrom:
+                secretKeyRef:
+                  name: kintone-credentials
+                  key: domain-suffix
+                  optional: true
+            - name: KINTONE_TOKENS_JSON
+              valueFrom:
+                secretKeyRef:
+                  name: kintone-credentials
+                  key: tokens.json
+                  optional: true
+            - name: LD_LIBRARY_PATH
+              value: >-
+                /opt/intel/oneapi/redist/lib:/opt/intel/oneapi/pti/0.10/lib:/usr/local/lib
+            - name: ZE_ENABLE_PCI_ID_DEVICE_ORDER
+              value: '1'
+            - name: SYCL_DEVICE_FILTER
+              value: level_zero:gpu
+            - name: ONEAPI_DEVICE_SELECTOR
+              value: level_zero:gpu
+          image: rag-backend-gpu-offline:v1.0.3
+          imagePullPolicy: IfNotPresent
+          name: backend
+          ports:
+            - containerPort: 8000
+              name: 8000tcp
+              protocol: TCP
+          resources:
+            limits:
+              cpu: '2'
+              memory: 8Gi
+            requests:
+              cpu: 200m
+              memory: 2Gi
+          securityContext:
+            privileged: true
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+            - mountPath: /app/main.py
+              name: backend-kernel
+              subPath: main.py
+              readOnly: true
+            - mountPath: /app/requirements.txt
+              name: backend-kernel
+              subPath: requirements.txt
+              readOnly: true
+            - mountPath: /app/web_content_fetcher.py
+              name: backend-kernel
+              subPath: web_content_fetcher.py
+              readOnly: true
+            - mountPath: /app/k8s_observer.py
+              name: backend-kernel-k8s-observer
+              subPath: k8s_observer.py
+              readOnly: true
+            - mountPath: /app/github_account.py
+              name: backend-kernel-github-account
+              subPath: github_account.py
+              readOnly: true
+            - mountPath: /app/github_ops.py
+              name: backend-kernel-github-ops
+              subPath: github_ops.py
+              readOnly: true
+            - mountPath: /app/spoke_archive.py
+              name: backend-kernel-spoke-archive
+              subPath: spoke_archive.py
+              readOnly: true
+            - mountPath: /app/pubsub.py
+              name: backend-kernel-pubsub
+              subPath: pubsub.py
+              readOnly: true
+            - mountPath: /app/knowledge_migrate.py
+              name: backend-kernel-knowledge-migrate
+              subPath: knowledge_migrate.py
+              readOnly: true
+            - mountPath: /app/opensearch_migrate.py
+              name: backend-kernel-opensearch-migrate
+              subPath: opensearch_migrate.py
+              readOnly: true
+            - mountPath: /app/memgraph_migrate.py
+              name: backend-kernel-memgraph-migrate
+              subPath: memgraph_migrate.py
+              readOnly: true
+            - mountPath: /app/kintone_common.py
+              name: backend-kernel-kintone-common
+              subPath: kintone_common.py
+              readOnly: true
+            - mountPath: /app/kintone_records.py
+              name: backend-kernel-kintone-records
+              subPath: kintone_records.py
+              readOnly: true
+            - mountPath: /app/kintone_app.py
+              name: backend-kernel-kintone-app
+              subPath: kintone_app.py
+              readOnly: true
+            - mountPath: /app/kintone_comments.py
+              name: backend-kernel-kintone-comments
+              subPath: kintone_comments.py
+              readOnly: true
+            - mountPath: /app/kintone_files.py
+              name: backend-kernel-kintone-files
+              subPath: kintone_files.py
+              readOnly: true
+            - mountPath: /app/kintone_status.py
+              name: backend-kernel-kintone-status
+              subPath: kintone_status.py
+              readOnly: true
+            - mountPath: /app/kintone_spaces.py
+              name: backend-kernel-kintone-spaces
+              subPath: kintone_spaces.py
+              readOnly: true
+            - mountPath: /model-cache
+              name: model-cache
+            - mountPath: /dev/dri
+              name: dev-dri
+            - mountPath: /opt/intel/oneapi/redist/lib
+              name: intel-libs
+              readOnly: true
+            - mountPath: /usr/local/lib/libze_loader.so.1
+              name: level-zero
+              readOnly: true
+            - mountPath: /usr/local/lib/libOpenCL.so.1
+              name: opencl
+              readOnly: true
+            - mountPath: /usr/local/lib/libze_intel_gpu.so.1
+              name: level-zero-driver
+              readOnly: true
+            - mountPath: /usr/local/lib/libigdgmm.so.12
+              name: intel-gmmlib
+              readOnly: true
+            - mountPath: /opt/intel/oneapi/pti/0.10/lib
+              name: intel-pti
+              readOnly: true
+      dnsPolicy: ClusterFirst
+      initContainers:
+        - command:
+            - sh
+            - '-c'
+            - |
+              set -e
+              # 通常運用では PVC をそのまま使う。MinIO から戻すのは MODEL_CACHE_MODE=restore のときだけ。
+              if [ "$MODEL_CACHE_MODE" != "restore" ]; then
+                echo "[restore] skip (MODEL_CACHE_MODE=${MODEL_CACHE_MODE:-unset})"
+                exit 0
+              fi
+              echo "[restore] MODEL_CACHE_MODE=restore: mirroring from MinIO ..."
+              mc mirror --overwrite dst/models/kernel-cache-hub /model-cache || echo "[restore] minio empty/failed"
+              echo "[restore] done"
+          env:
+            - name: MC_HOST_dst
+              value: 'http://minioadmin:minioadminpassword@minio.milvus.svc.cluster.local:9000'
+          image: minio/mc:RELEASE.2024-10-08T09-37-26Z
+          imagePullPolicy: IfNotPresent
+          name: model-restore
+          resources:
+            limits:
+              cpu: '2'
+              memory: 1Gi
+            requests:
+              cpu: '500m'
+              memory: 256Mi
+          volumeMounts:
+            - mountPath: /model-cache
+              name: model-cache
+        - command:
+            - bash
+            - '-c'
+            - >
+              set -e
+
+              # 通常運用では PVC をそのまま使い DL しない。再構築は MODEL_CACHE_MODE=rebuild のときだけ。
+
+              if [ "$MODEL_CACHE_MODE" != "rebuild" ]; then
+                echo "[download] skip (MODEL_CACHE_MODE=${MODEL_CACHE_MODE:-unset})"
+                exit 0
+              fi
+
+              echo "Checking cache..."
+
+
+              if [ -d "/model-cache/packages" ] && \
+                 [ -d "/model-cache/hub/models--BAAI--bge-reranker-base" ] && \
+                 [ -d "/model-cache/hub/models--sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2" ] && \
+                 PYTHONPATH=/model-cache/packages:/usr/local/lib/python3.12/site-packages python3 -c "import googleapiclient" 2>/dev/null && \
+                 PYTHONPATH=/model-cache/packages:/usr/local/lib/python3.12/site-packages python3 -c "import anthropic" 2>/dev/null && \
+                 PYTHONPATH=/model-cache/packages:/usr/local/lib/python3.12/site-packages python3 -c "import redis" 2>/dev/null && \
+                 PYTHONPATH=/model-cache/packages:/usr/local/lib/python3.12/site-packages python3 -c "import kubernetes" 2>/dev/null && \
+                 PYTHONPATH=/model-cache/packages:/usr/local/lib/python3.12/site-packages python3 -c "import pymilvus, sys; sys.exit(0 if pymilvus.__version__ == '2.4.15' else 1)" 2>/dev/null && \
+                 PYTHONPATH=/model-cache/packages:/usr/local/lib/python3.12/site-packages HF_HOME=/model-cache TRANSFORMERS_CACHE=/model-cache HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python3 -c "from sentence_transformers import SentenceTransformer, CrossEncoder; SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2'); CrossEncoder('BAAI/bge-reranker-base')" 2>/dev/null; then
+                echo "Cache found (pymilvus 2.4.15 + models loadable), skipping download"
+                exit 0
+              fi
+
+
+              echo "Starting download (Intel GPU / IPEX)..."
+
+              # 古い pymilvus が混ざっていると import が壊れるので packages を作り直す。
+
+              rm -rf /model-cache/packages
+
+              mkdir -p /model-cache/packages
+
+
+              echo "Step 1a: Installing PyTorch 2.6.0+xpu (pytorch.org xpu index)..."
+
+              pip install --target=/model-cache/packages --no-cache-dir \
+                --index-url https://download.pytorch.org/whl/xpu \
+                --extra-index-url https://pypi.org/simple \
+                torch==2.6.0+xpu torchvision
+
+              echo "Step 1b: Installing IPEX 2.6.10+xpu (intel xpu index)..."
+
+              pip install --target=/model-cache/packages --no-cache-dir \
+                --extra-index-url https://pytorch-extension.intel.com/release-whl/stable/xpu/us/ \
+                --extra-index-url https://pypi.org/simple \
+                intel-extension-for-pytorch==2.6.10+xpu
+
+              echo "Removing execstack from IPEX libraries with patchelf..."
+
+              find /model-cache/packages/intel_extension_for_pytorch -name
+              "*.so" -exec patchelf --clear-execstack {} \; 2>/dev/null || true
+
+              echo "Step 2: Installing other packages..."
+
+              pip install --target=/model-cache/packages --no-cache-dir \
+                setuptools \
+                fastapi==0.104.1 \
+                uvicorn==0.24.0 \
+                pymilvus==2.4.15 \
+                marshmallow==3.20.0 \
+                environs==9.5.0 \
+                requests==2.31.0 \
+                pydantic==2.5.0 \
+                python-multipart==0.0.6 \
+                python-docx==1.1.0 \
+                openpyxl==3.1.2 \
+                python-pptx==0.6.23 \
+                neo4j==5.15.0 \
+                beautifulsoup4==4.12.2 \
+                lxml==4.9.3 \
+                google-auth==2.23.4 \
+                google-auth-oauthlib==1.1.0 \
+                google-api-python-client==2.108.0 \
+                pypdf==3.17.4 \
+                anthropic>=0.45.0 \
+                redis==5.0.0 \
+                kubernetes==31.0.0
+
+              echo "Step 3: Installing sentence-transformers (without
+              overwriting torch)..."
+
+              pip install --target=/model-cache/packages --no-cache-dir \
+                --no-deps sentence-transformers
+
+              echo "Step 4: Installing sentence-transformers dependencies..."
+
+              pip install --target=/model-cache/packages --no-cache-dir \
+                transformers tqdm huggingface-hub tokenizers scikit-learn scipy numpy pillow
+
+              echo "Step 5: Downloading reranker and embedding models..."
+
+              export
+              LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:/opt/intel/oneapi/pti/0.10/lib:/usr/local/lib
+
+              export PYTHONPATH=/model-cache/packages
+
+              export HF_HOME=/model-cache
+
+              export TRANSFORMERS_CACHE=/model-cache
+
+
+              python3 << 'PYTHON'
+
+              import sys
+
+              sys.path.insert(0, '/model-cache/packages')
+
+              from sentence_transformers import CrossEncoder, SentenceTransformer
+
+              import os
+
+              os.environ['HF_HOME'] = '/model-cache'
+
+              os.environ['TRANSFORMERS_CACHE'] = '/model-cache'
+
+              print("Downloading reranker model...")
+
+              reranker = CrossEncoder('BAAI/bge-reranker-base')
+
+              print("Reranker model downloaded!")
+
+              print("Downloading embedding model...")
+
+              embedder = SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
+
+              print("Embedding model downloaded!")
+
+              PYTHON
+
+
+              echo "Download complete"
+
+              touch /model-cache/.rebuilt
+
+              du -sh /model-cache/packages /model-cache/hub || true
+          image: rag-backend-gpu-offline:v1.0.3
+          imagePullPolicy: IfNotPresent
+          name: download-models
+          resources: {}
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+            - mountPath: /model-cache
+              name: model-cache
+            - mountPath: /opt/intel/oneapi/redist/lib
+              name: intel-libs
+              readOnly: true
+            - mountPath: /usr/local/lib/libze_loader.so.1
+              name: level-zero
+              readOnly: true
+            - mountPath: /usr/local/lib/libOpenCL.so.1
+              name: opencl
+              readOnly: true
+            - mountPath: /usr/local/lib/libze_intel_gpu.so.1
+              name: level-zero-driver
+              readOnly: true
+            - mountPath: /usr/local/lib/libigdgmm.so.12
+              name: intel-gmmlib
+              readOnly: true
+            - mountPath: /opt/intel/oneapi/pti/0.10/lib
+              name: intel-pti
+              readOnly: true
+        - command:
+            - sh
+            - '-c'
+            - |
+              set -e
+              # 通常運用ではバックアップしない。MinIO へ保存するのは MODEL_CACHE_MODE=backup のときだけ。
+              if [ "$MODEL_CACHE_MODE" != "backup" ]; then
+                echo "[backup] skip (MODEL_CACHE_MODE=${MODEL_CACHE_MODE:-unset})"
+                exit 0
+              fi
+              echo "[backup] MODEL_CACHE_MODE=backup: mirroring to MinIO ..."
+              mc mb --ignore-existing dst/models || true
+              mc mirror --overwrite /model-cache dst/models/kernel-cache-hub || echo "[backup] mirror failed (non-fatal)"
+              echo "[backup] done"
+          env:
+            - name: MC_HOST_dst
+              value: 'http://minioadmin:minioadminpassword@minio.milvus.svc.cluster.local:9000'
+          image: minio/mc:RELEASE.2024-10-08T09-37-26Z
+          imagePullPolicy: IfNotPresent
+          name: model-backup
+          resources:
+            limits:
+              cpu: '2'
+              memory: 1Gi
+            requests:
+              cpu: '500m'
+              memory: 256Mi
+          volumeMounts:
+            - mountPath: /model-cache
+              name: model-cache
+        - command:
+            - bash
+            - '-c'
+            - |
+              MILVUS_HOST="milvus-proxy.milvus.svc.cluster.local"
+              MAX_WAIT=300
+              ELAPSED=0
+
+              check_milvus() {
+                python3 - << PYEOF
+              import urllib.request, socket, sys
+              host = "milvus-proxy.milvus.svc.cluster.local"
+              try:
+                  res = urllib.request.urlopen("http://{}:9091/healthz".format(host), timeout=5)
+                  body = res.read().decode()
+                  if "OK" not in body:
+                      sys.exit(1)
+              except Exception as e:
+                  print("healthz failed:", e, file=sys.stderr)
+                  sys.exit(1)
+              try:
+                  s = socket.create_connection((host, 19530), timeout=5)
+                  s.close()
+              except Exception as e:
+                  print("gRPC port not ready:", e, file=sys.stderr)
+                  sys.exit(1)
+              sys.exit(0)
+              PYEOF
+              }
+
+              echo "Waiting for Milvus..."
+              until check_milvus; do
+                if [ "${ELAPSED}" -ge "${MAX_WAIT}" ]; then
+                  echo "Timeout: Milvus did not become ready within ${MAX_WAIT}s"
+                  exit 1
+                fi
+                echo "  Milvus not ready (${ELAPSED}s elapsed), retrying in 5s..."
+                sleep 5
+                ELAPSED=$((ELAPSED + 5))
+              done
+              echo "Milvus is ready after ${ELAPSED}s."
+          image: rag-backend-gpu-offline:v1.0.3
+          imagePullPolicy: IfNotPresent
+          name: wait-for-milvus
+          resources:
+            limits:
+              cpu: 200m
+              memory: 128Mi
+            requests:
+              cpu: 100m
+              memory: 64Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext:
+        supplementalGroups:
+          - 991
+      terminationGracePeriodSeconds: 30
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-cache
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel
+          name: backend-kernel
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-k8s-observer
+          name: backend-kernel-k8s-observer
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-github-account
+          name: backend-kernel-github-account
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-github-ops
+          name: backend-kernel-github-ops
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-spoke-archive
+          name: backend-kernel-spoke-archive
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-pubsub
+          name: backend-kernel-pubsub
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-knowledge-migrate
+          name: backend-kernel-knowledge-migrate
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-opensearch-migrate
+          name: backend-kernel-opensearch-migrate
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-memgraph-migrate
+          name: backend-kernel-memgraph-migrate
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-kintone-common
+          name: backend-kernel-kintone-common
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-kintone-records
+          name: backend-kernel-kintone-records
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-kintone-app
+          name: backend-kernel-kintone-app
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-kintone-comments
+          name: backend-kernel-kintone-comments
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-kintone-files
+          name: backend-kernel-kintone-files
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-kintone-status
+          name: backend-kernel-kintone-status
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-kintone-spaces
+          name: backend-kernel-kintone-spaces
+        - hostPath:
+            path: /dev/dri
+            type: Directory
+          name: dev-dri
+        - hostPath:
+            path: /opt/intel/oneapi/redist/lib
+            type: Directory
+          name: intel-libs
+        - hostPath:
+            path: /usr/lib/x86_64-linux-gnu/libze_loader.so.1
+            type: File
+          name: level-zero
+        - hostPath:
+            path: /usr/lib/x86_64-linux-gnu/libOpenCL.so.1
+            type: File
+          name: opencl
+        - hostPath:
+            path: /usr/lib/x86_64-linux-gnu/libze_intel_gpu.so.1
+            type: File
+          name: level-zero-driver
+        - hostPath:
+            path: /usr/lib/x86_64-linux-gnu/libigdgmm.so.12
+            type: File
+          name: intel-gmmlib
+        - hostPath:
+            path: /opt/intel/oneapi/pti/0.10/lib
+            type: Directory
+          name: intel-pti

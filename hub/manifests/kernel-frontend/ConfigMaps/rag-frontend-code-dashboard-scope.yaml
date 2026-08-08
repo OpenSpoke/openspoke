@@ -1,0 +1,219 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-frontend-code-dashboard-scope
+  namespace: rag-company1
+data:
+  user_scope.py: |
+    """user_scope.py — フロントエンド表示の ACL ヘルパ.
+
+    oauth2-proxy が注入する HTTP ヘッダから現在ログイン中の Keycloak ユーザーを識別し、
+    OpenSearch user_acl index から allowed_clusters / allowed_modules を取得して返す。
+
+    各 view は get_current_scope() を呼び、 admin なら全許可、 非 admin なら ACL に
+    従って表示内容を絞り込む。 MCP 側 (cluster_*/ledger_* tool) の ACL とは独立して
+    動作する (どちらも同じ user_acl OpenSearch index を参照する)。
+    """
+    import os
+    import streamlit as st
+    import requests
+
+    HUB_OS_URL = os.environ.get(
+        "HUB_OS_URL",
+        "http://opensearch.opensearch.svc.cluster.local:9200",
+    )
+    _USER_ACL_INDEX = "user_acl"
+
+    # Phase 2 step 1: frontend admin はハードコード email リストで判定。
+    # Phase 2 step 2 で realm role (X-Auth-Request-Groups) ベースに移行予定。
+    # Customize this set with the Keycloak email(s) that should have
+    # admin access to the dashboard.
+    _ADMIN_EMAILS = {
+        "admin@example.com",
+    }
+
+    # ----- HTTP ヘッダから現在ユーザー -----
+
+    def _all_headers():
+        try:
+            return dict(st.context.headers)
+        except Exception:
+            return {}
+
+    def _header_get(*names):
+        headers = _all_headers()
+        lower_map = {k.lower(): v for k, v in headers.items()}
+        for n in names:
+            v = lower_map.get(n.lower(), "") or ""
+            if v:
+                return v
+        return ""
+
+    def current_email():
+        return _header_get(
+            "X-Auth-Request-Email",
+            "X-Forwarded-Email",
+            "X-Auth-Email",
+        ).lower()
+
+    def current_username():
+        """Keycloak preferred_username (= user_acl の _id)。
+
+        重要: oauth2-proxy は X-Forwarded-User に Keycloak sub claim (UUID) を
+        セットする。 user_acl は preferred_username (email 形式) を _id に
+        するので、 必ず preferred-username 系ヘッダを先に読む。 UUID は
+        フォールバックとして残すが、 通常は使われない。
+        """
+        return _header_get(
+            "X-Forwarded-Preferred-Username",
+            "X-Auth-Request-Preferred-Username",
+            "X-Forwarded-Email",
+            "X-Auth-Request-Email",
+            "X-Forwarded-User",
+            "X-Auth-Request-User",
+            "X-Auth-User",
+        )
+
+    def is_admin():
+        return current_email() in _ADMIN_EMAILS
+
+    # ----- OpenSearch から user_acl 取得 -----
+
+    def _os_get_acl(username):
+        if not username:
+            return {}
+        url = f"{HUB_OS_URL}/{_USER_ACL_INDEX}/_doc/{username}"
+        try:
+            resp = requests.get(url, timeout=5)
+            if resp.status_code == 200:
+                return dict(resp.json().get("_source", {}) or {})
+        except Exception:
+            pass
+        return {}
+
+    # ----- 現在ユーザーのスコープ -----
+
+    def get_current_scope():
+        """現在のユーザーのアクセス権限を返す.
+
+        Returns dict with:
+            is_admin: bool
+            username: str (空文字なら未識別)
+            email: str
+            allowed_clusters: set of str ({"*"} で全許可)
+            allowed_modules: set of str
+        """
+        username = current_username()
+        email = current_email()
+        if is_admin():
+            return {
+                "is_admin": True,
+                "username": username,
+                "email": email,
+                "allowed_clusters": {"*"},
+                "allowed_modules": {"*"},
+            }
+        if not username:
+            return {
+                "is_admin": False,
+                "username": "",
+                "email": email,
+                "allowed_clusters": set(),
+                "allowed_modules": set(),
+            }
+        acl = _os_get_acl(username)
+        return {
+            "is_admin": False,
+            "username": username,
+            "email": email,
+            "allowed_clusters": set(acl.get("allowed_clusters") or []),
+            "allowed_modules": set(acl.get("allowed_modules") or []),
+        }
+
+    # ----- 判定ヘルパ -----
+
+    def is_cluster_allowed(scope, cluster_name):
+        if scope.get("is_admin"):
+            return True
+        allowed = scope.get("allowed_clusters") or set()
+        if "*" in allowed:
+            return True
+        return cluster_name in allowed
+
+    def is_module_allowed(scope, key):
+        """key は 'Category/Module' 形式または単体 'Module' 名."""
+        if scope.get("is_admin"):
+            return True
+        allowed = scope.get("allowed_modules") or set()
+        if "*" in allowed:
+            return True
+        if key in allowed:
+            return True
+        # 部分一致 (単体 name 指定の場合)
+        if "/" in key:
+            _, last = key.rsplit("/", 1)
+            if last in allowed:
+                return True
+        return False
+
+    # ----- フィルタヘルパ -----
+
+    def filter_clusters(scope, items, key_func=None):
+        """cluster name で items を絞り込む."""
+        if scope.get("is_admin"):
+            return list(items)
+        kf = key_func or (
+            lambda c: (
+                c.get("cluster_name") or c.get("name") or c.get("_id")
+                if isinstance(c, dict) else str(c)
+            )
+        )
+        return [c for c in items if is_cluster_allowed(scope, kf(c))]
+
+    def filter_modules(scope, items, key_func=None):
+        """module key (Category/Module) で items を絞り込む."""
+        if scope.get("is_admin"):
+            return list(items)
+        kf = key_func or (lambda m: m if isinstance(m, str) else str(m))
+        return [m for m in items if is_module_allowed(scope, kf(m))]
+
+    # ----- 表示ヘルパ -----
+
+    def render_scope_banner(scope, on="sidebar"):
+        """利用可能なリソースをサイドバーに表示."""
+        target = st.sidebar if on == "sidebar" else st
+        if scope.get("is_admin"):
+            target.success("🛡 admin")
+            return
+        if not scope.get("username"):
+            target.warning("⚠ ログイン情報を取得できません")
+            return
+        allowed_c = scope.get("allowed_clusters") or set()
+        allowed_m = scope.get("allowed_modules") or set()
+        if not allowed_c and not allowed_m:
+            target.info(
+                f"`{scope['username']}` で利用できるリソースが設定されていません。"
+                " admin にご相談ください."
+            )
+            return
+        lines = []
+        if "*" in allowed_c:
+            lines.append("クラスタ: (すべて)")
+        elif allowed_c:
+            lines.append("クラスタ: " + ", ".join(sorted(allowed_c)))
+        if "*" in allowed_m:
+            lines.append("モジュール: (すべて)")
+        elif allowed_m:
+            lines.append("モジュール: " + ", ".join(sorted(allowed_m)))
+        if lines:
+            target.info("\n\n".join(lines))
+
+    def require_admin_or_stop():
+        """admin で無ければ st.stop() で描画停止."""
+        if is_admin():
+            return
+        st.error(
+            "このページは admin (`openspoke_admin` 相当) 専用です。"
+            f" 現在のユーザー `{current_email() or '(unknown)'}` には権限がありません."
+        )
+        st.stop()

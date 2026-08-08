@@ -1,0 +1,187 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-backend-kernel-knowledge-migrate
+  namespace: rag-spoke
+data:
+  knowledge_migrate.py: |
+    """knowledge base 移行モジュール (export + pull、 対称・双方向)。
+
+    制御プレーン (Claude / MCP) とデータプレーン (kernel 間 HTTP) を分離する。
+    どちらの kernel にも対称配置し、 source_base_url を指定すれば AWS <-> hub
+    どちら向きにも pull できる。 content は kernel 間を直接流れ、 呼び出し側
+    (Claude) のコンテキストには載らない。
+
+    公開エンドポイント (cloudflared で対象 path のみ公開、 共有トークン必須):
+    - POST /core/knowledge/migrate_export : 自分の 1 collection を全件 JSON で返す (source 役)
+    - POST /core/knowledge/migrate_pull   : source の migrate_export を pull し自分に投入 (target 役)
+
+    認証: env KNOWLEDGE_MIGRATE_TOKEN と Authorization: Bearer <token> を照合。
+    未設定時は 503、 不一致は 401 (公開時は必ず Secret で設定する)。
+
+    main.py から `from knowledge_migrate import router` で取り込む
+    (k8s_observer / github_account / pubsub と同じ流儀)。
+    """
+    import os
+    import logging
+    import httpx
+    from fastapi import APIRouter, Header, HTTPException
+
+    logger = logging.getLogger("knowledge_migrate")
+    router = APIRouter()
+
+    _SELF = "http://localhost:8000"
+    _KNOWLEDGE_PREFIX = "secretary_knowledge_"
+    _MIGRATE_TOKEN = os.environ.get("KNOWLEDGE_MIGRATE_TOKEN", "")
+
+
+    def _check_token(authorization):
+        """共有トークン検証。 未設定なら 503、 不一致なら 401。"""
+        if not _MIGRATE_TOKEN:
+            raise HTTPException(status_code=503, detail="KNOWLEDGE_MIGRATE_TOKEN not configured")
+        if authorization != f"Bearer {_MIGRATE_TOKEN}":
+            raise HTTPException(status_code=401, detail="invalid or missing migrate token")
+
+
+    @router.post("/core/knowledge/migrate_export")
+    async def knowledge_migrate_export(request: dict, authorization: str = Header(None)):
+        """自分の 1 collection の全エントリ (id/title/content/category) を返す (source 役)。
+
+        Body: {"collection": "secretary_knowledge_example", "limit": 10000}
+        Returns: {"ok", "collection", "count", "entries":[{id,title,content,category}], "error"}
+        """
+        _check_token(authorization)
+        collection = request.get("collection") or ""
+        limit = int(request.get("limit") or 10000)
+        if not collection:
+            return {"ok": False, "collection": "", "count": 0, "entries": [],
+                    "error": "collection is required"}
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as c:
+                r = await c.post(
+                    f"{_SELF}/core/vectorstore/query",
+                    json={
+                        "namespace": collection,
+                        "expr": 'id != ""',
+                        "output_fields": ["id", "title", "content", "category"],
+                        "limit": limit,
+                    },
+                )
+            d = r.json()
+            if not d.get("ok"):
+                return {"ok": False, "collection": collection, "count": 0, "entries": [],
+                        "error": d.get("error") or "vectorstore query failed"}
+            rows = d.get("results") or []
+            entries = []
+            for x in rows:
+                eid = x.get("id")
+                if not eid:
+                    continue
+                entries.append({
+                    "id": eid,
+                    "title": x.get("title") or "",
+                    "content": x.get("content") or "",
+                    "category": x.get("category") or "topic",
+                })
+            logger.info(f"[KNOWLEDGE_MIGRATE] export {collection}: {len(entries)} entries")
+            return {"ok": True, "collection": collection, "count": len(entries),
+                    "entries": entries, "error": None}
+        except Exception as e:
+            logger.error(f"[KNOWLEDGE_MIGRATE] export error {collection}: {e}", exc_info=True)
+            return {"ok": False, "collection": collection, "count": 0, "entries": [],
+                    "error": f"{type(e).__name__}: {str(e)[:200]}"}
+
+
+    @router.post("/core/knowledge/migrate_pull")
+    async def knowledge_migrate_pull(request: dict, authorization: str = Header(None)):
+        """source kernel の migrate_export を pull し、 自分の knowledge base に投入する (target 役)。
+
+        Body:
+            {
+              "source_base_url": "https://<source-kernel>",                  必須 (末尾スラッシュ可)
+              "source_token":    "<source の KNOWLEDGE_MIGRATE_TOKEN>",        必須
+              "collections":     ["secretary_knowledge_example", ...],       必須
+              "mode":            "upsert",                                     任意 (create/update/upsert)
+              "dry_run":         false                                         任意
+            }
+        Returns: {"ok", "summary": {collection: {fetched,upserted,failed,...}}, "error"}
+        """
+        _check_token(authorization)
+        source = (request.get("source_base_url") or "").rstrip("/")
+        source_token = request.get("source_token") or ""
+        collections = request.get("collections") or []
+        mode = request.get("mode") or "upsert"
+        dry_run = bool(request.get("dry_run"))
+
+        if not source:
+            return {"ok": False, "summary": {}, "error": "source_base_url is required"}
+        if not collections or not isinstance(collections, list):
+            return {"ok": False, "summary": {}, "error": "collections (non-empty list) is required"}
+
+        src_headers = {"Authorization": f"Bearer {source_token}"} if source_token else {}
+        summary = {}
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as c:
+                for coll in collections:
+                    # 1. source の migrate_export を Bearer 付きで叩いて全件取得
+                    try:
+                        r = await c.post(
+                            f"{source}/core/knowledge/migrate_export",
+                            json={"collection": coll, "limit": 10000},
+                            headers=src_headers,
+                        )
+                        d = r.json()
+                    except Exception as ee:
+                        summary[coll] = {"error": f"export call failed: {type(ee).__name__}: {str(ee)[:150]}"}
+                        continue
+                    if not d.get("ok"):
+                        summary[coll] = {"error": d.get("error") or "export not ok"}
+                        continue
+                    entries = d.get("entries") or []
+                    if dry_run:
+                        summary[coll] = {"fetched": len(entries), "upserted": 0, "failed": 0, "dry_run": True}
+                        continue
+                    # 2. collection 名から user_id を復元 (secretary_knowledge_example -> example)
+                    if coll.startswith(_KNOWLEDGE_PREFIX):
+                        user_id = coll[len(_KNOWLEDGE_PREFIX):]
+                    else:
+                        user_id = coll
+                    # 3. 自分の knowledge/upsert に投入 (embedding はこの kernel で再生成)
+                    up = 0
+                    fail = 0
+                    errors = []
+                    for e in entries:
+                        eid = e.get("id")
+                        if not eid:
+                            continue
+                        try:
+                            rr = await c.post(
+                                f"{_SELF}/core/knowledge/upsert",
+                                json={
+                                    "user_id": user_id,
+                                    "id": eid,
+                                    "title": e.get("title") or "",
+                                    "content": e.get("content") or "",
+                                    "category": e.get("category") or "topic",
+                                    "mode": mode,
+                                },
+                            )
+                            if rr.json().get("ok"):
+                                up += 1
+                            else:
+                                fail += 1
+                                if len(errors) < 5:
+                                    errors.append(f"{eid}: {rr.json().get('error')}")
+                        except Exception as ee:
+                            fail += 1
+                            if len(errors) < 5:
+                                errors.append(f"{eid}: {type(ee).__name__}: {str(ee)[:100]}")
+                    res = {"fetched": len(entries), "upserted": up, "failed": fail}
+                    if errors:
+                        res["sample_errors"] = errors
+                    summary[coll] = res
+                    logger.info(f"[KNOWLEDGE_MIGRATE] pull {coll}: fetched={len(entries)} upserted={up} failed={fail}")
+            return {"ok": True, "summary": summary, "error": None}
+        except Exception as e:
+            logger.error(f"[KNOWLEDGE_MIGRATE] migrate_pull error: {e}", exc_info=True)
+            return {"ok": False, "summary": summary, "error": f"{type(e).__name__}: {str(e)[:200]}"}

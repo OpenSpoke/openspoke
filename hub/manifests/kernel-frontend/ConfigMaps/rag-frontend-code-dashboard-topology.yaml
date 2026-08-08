@@ -1,0 +1,489 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-frontend-code-dashboard-topology
+  namespace: rag-company1
+data:
+  view_topology.py: |
+    """Hub & Spoke topology view.
+
+    spoke_clusters (admin 登録) と spoke_health (CronJob spoke-probe が 1 分
+    間隔で書き込む live status) を cluster_name で merge して表示する。
+
+    ノード色分け (spoke_health.status 基準):
+      - active       (稼働中)  青
+      - unreachable  (未接続)  赤
+      - stopped      (停止)    灰
+      - unknown      (未 probe) 黄
+
+    中央の hub (rag) は status 無関係に常時 オレンジ。
+
+    ハブ ↔ 各スポーク間のエッジ:
+      - 既存の 1 本 (灰色実線) : spoke-probe による url の到達状態を示す。
+          spoke-probe が hub から GET するため矢印は hub→spoke 片方向。
+      - データチャンネル 3 本 (knowledge / opensearch / memgraph) :
+          spoke_health.data_channels に格納された各 channel の状態を
+          色と線種で表現。 矢印は **両方向** (pull 型なので、 hub が
+          spoke から pull することも、 spoke が hub から pull することも
+          できる)。
+          色:
+            knowledge  = 緑   (#3aa655)
+            opensearch = 青   (#4a90e2)
+            memgraph   = 橙   (#e8a82b)
+          状態 (線種):
+            open    = 実線 + 不透明
+            closed  = 点線 + 半透明
+            unknown = 破線 + さらに半透明、 色は灰でフォールバック
+    """
+    import json
+
+    import streamlit as st
+    import streamlit.components.v1 as components
+
+    import kernel_api
+    import user_scope
+
+
+    DATA_CHANNELS = ("knowledge", "opensearch", "memgraph")
+
+
+    def render():
+        st.title("Spokes")
+
+        col1, col2 = st.columns([6, 1])
+        with col2:
+            if st.button("Refresh", key="topology_refresh"):
+                kernel_api.clear_caches()
+                st.rerun()
+
+        if not kernel_api.hub_healthy():
+            st.error("hub OpenSearch (opensearch.opensearch.svc:9200) に接続できません")
+            return
+
+        spokes_all = kernel_api.list_spokes()
+        if not spokes_all:
+            st.warning("spoke_clusters index にデータがありません")
+            return
+
+        # ACL: 許可されたスポークのみ表示 (hub の rag は常時表示する)
+        scope = user_scope.get_current_scope()
+        spokes = [
+            s for s in spokes_all
+            if (s.get("cluster_name") or s.get("_id")) == "rag"
+            or user_scope.is_cluster_allowed(scope, s.get("cluster_name") or s.get("_id"))
+        ]
+
+        health_map = kernel_api.list_spoke_health()
+
+        # 統計サマリ
+        counts = {"active": 0, "unreachable": 0, "stopped": 0, "unknown": 0}
+        for s in spokes:
+            cid = s.get("cluster_name") or s.get("_id", "?")
+            if cid == "rag":
+                continue
+            h = health_map.get(cid, {})
+            counts[h.get("status", "unknown")] = counts.get(h.get("status", "unknown"), 0) + 1
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("稼働中", counts["active"])
+        c2.metric("未接続", counts["unreachable"])
+        c3.metric("停止", counts["stopped"])
+        c4.metric("未 probe", counts["unknown"])
+
+        # データチャンネルのサマリ (open / closed / unknown を合計)
+        ch_counts = {ch: {"open": 0, "closed": 0, "unknown": 0} for ch in DATA_CHANNELS}
+        for s in spokes:
+            cid = s.get("cluster_name") or s.get("_id", "?")
+            if cid == "rag":
+                continue
+            dc = (health_map.get(cid, {}) or {}).get("data_channels") or {}
+            for ch in DATA_CHANNELS:
+                st_v = dc.get(ch, "unknown")
+                ch_counts[ch][st_v if st_v in ("open", "closed") else "unknown"] += 1
+
+        st.caption(
+            "データチャンネル (kernel-to-kernel migrate HTTPS): "
+            + "  /  ".join(
+                f"{ch}: open={ch_counts[ch]['open']} closed={ch_counts[ch]['closed']} unknown={ch_counts[ch]['unknown']}"
+                for ch in DATA_CHANNELS
+            )
+        )
+
+        hub_health = health_map.get("rag", {}) or {}
+        hub_dc = hub_health.get("data_channels") or {}
+
+        nodes = [{
+            "data": {
+                "id": "rag",
+                "label": "rag\n(hub)",
+                "url": hub_health.get("url", ""),
+                "env": "onprem-rke2",
+                "purpose": "hub cluster",
+                "status": "active",
+                "data_channels": hub_dc,
+            },
+            "classes": "hub",
+        }]
+        edges = []
+        for s in spokes:
+            cid = s.get("cluster_name") or s.get("_id", "?")
+            if cid == "rag":
+                continue
+            h = health_map.get(cid, {})
+            status = h.get("status", "unknown")
+            dc = h.get("data_channels") or {}
+            nodes.append({
+                "data": {
+                    "id": cid,
+                    "label": cid,
+                    "url": s.get("url", ""),
+                    "env": s.get("env", ""),
+                    "purpose": s.get("purpose", "") or s.get("description", ""),
+                    "status": status,
+                    "k8s": s.get("k8s_distribution", ""),
+                    "tunnel": s.get("cloudflare_tunnel_id", ""),
+                    "http_code": h.get("http_code", ""),
+                    "last_probe_at": h.get("last_probe_at", ""),
+                    "last_active_at": h.get("last_active_at", ""),
+                    "probe_error": h.get("error", ""),
+                    "probe_duration_ms": h.get("probe_duration_ms", ""),
+                    "data_channels": dc,
+                },
+                "classes": f"spoke status-{status}",
+            })
+            # 既存の到達性エッジ (灰色実線)
+            edges.append({
+                "data": {"id": f"e-{cid}", "source": "rag", "target": cid},
+                "classes": "reach",
+            })
+            # データチャンネル 3 本 (knowledge / opensearch / memgraph)
+            for ch in DATA_CHANNELS:
+                state = dc.get(ch, "unknown")
+                if state not in ("open", "closed", "unknown"):
+                    state = "unknown"
+                edges.append({
+                    "data": {
+                        "id": f"e-{cid}-{ch}",
+                        "source": "rag",
+                        "target": cid,
+                        "channel": ch,
+                        "state": state,
+                    },
+                    "classes": f"channel channel-{ch} channel-state-{state}",
+                })
+
+        elements_json = json.dumps(nodes + edges, ensure_ascii=False)
+
+        html = (
+            '<div id="cy" style="width:100%; height:680px; background:#1e1e1e; '
+            'border:1px solid #333; border-radius:8px;"></div>\n'
+            '<div id="legend" style="margin-top:6px; padding:8px 12px; '
+            'background:#262730; color:#fafafa; border-radius:6px; '
+            'font-family:monospace; font-size:12px; line-height:1.5;">'
+            'データチャンネル: '
+            '<span style="color:#3aa655">━━ knowledge</span> &nbsp; '
+            '<span style="color:#4a90e2">━━ opensearch</span> &nbsp; '
+            '<span style="color:#e8a82b">━━ memgraph</span> &nbsp;&nbsp; / &nbsp; '
+            '実線=open &nbsp; 点線=closed &nbsp; 破線(灰)=unknown'
+            '</div>\n'
+            '<div id="info" style="margin-top:8px; padding:10px 14px; '
+            'background:#262730; color:#fafafa; border-radius:6px; '
+            'min-height:280px; font-family:monospace; font-size:13px; '
+            'white-space:pre-wrap; line-height:1.6;">'
+            'ノードかエッジをクリックすると詳細を表示します</div>\n'
+            '<script src="https://unpkg.com/cytoscape@3.30.2/dist/cytoscape.min.js"></script>\n'
+            '<script>\n'
+            '(function() {\n'
+            '  const elements = __ELEMENTS_JSON__;\n'
+            '  const cy = cytoscape({\n'
+            '    container: document.getElementById("cy"),\n'
+            '    elements: elements,\n'
+            '    style: [\n'
+            '      { selector: "node", style: {\n'
+            '        "label": "data(label)", "color": "#fff",\n'
+            '        "text-valign": "center", "text-halign": "center",\n'
+            '        "font-size": 13, "text-wrap": "wrap",\n'
+            '        "background-color": "#4a90e2",\n'
+            '        "width": 76, "height": 76,\n'
+            '        "border-width": 3, "border-color": "#2c5f9e"\n'
+            '      } },\n'
+            '      { selector: ".hub", style: {\n'
+            '        "background-color": "#e8a82b", "border-color": "#a87a1a",\n'
+            '        "width": 116, "height": 116,\n'
+            '        "font-size": 16, "font-weight": "bold"\n'
+            '      } },\n'
+            '      { selector: ".status-active", style: {\n'
+            '        "background-color": "#3aa655", "border-color": "#1f6e36"\n'
+            '      } },\n'
+            '      { selector: ".status-unreachable", style: {\n'
+            '        "background-color": "#d23a3a", "border-color": "#8a1f1f"\n'
+            '      } },\n'
+            '      { selector: ".status-stopped", style: {\n'
+            '        "background-color": "#7a7a7a", "border-color": "#4a4a4a",\n'
+            '        "opacity": 0.7\n'
+            '      } },\n'
+            '      { selector: ".status-unknown", style: {\n'
+            '        "background-color": "#d4b740", "border-color": "#8a7820"\n'
+            '      } },\n'
+            '      { selector: "node:selected", style: {\n'
+            '        "border-color": "#ff4b4b", "border-width": 5\n'
+            '      } },\n'
+            '      { selector: "edge", style: {\n'
+            '        "curve-style": "unbundled-bezier"\n'
+            '      } },\n'
+            '      { selector: ".reach", style: {\n'
+            '        "width": 2, "line-color": "#888",\n'
+            '        "target-arrow-shape": "triangle", "target-arrow-color": "#888",\n'
+            '        "control-point-distances": [0], "control-point-weights": [0.5]\n'
+            '      } },\n'
+            '      { selector: ".channel", style: {\n'
+            '        "width": 3,\n'
+            '        "target-arrow-shape": "triangle",\n'
+            '        "source-arrow-shape": "triangle"\n'
+            '      } },\n'
+            '      { selector: ".channel-knowledge", style: {\n'
+            '        "line-color": "#3aa655",\n'
+            '        "target-arrow-color": "#3aa655", "source-arrow-color": "#3aa655",\n'
+            '        "control-point-distances": [50], "control-point-weights": [0.5]\n'
+            '      } },\n'
+            '      { selector: ".channel-opensearch", style: {\n'
+            '        "line-color": "#4a90e2",\n'
+            '        "target-arrow-color": "#4a90e2", "source-arrow-color": "#4a90e2",\n'
+            '        "control-point-distances": [-50], "control-point-weights": [0.5]\n'
+            '      } },\n'
+            '      { selector: ".channel-memgraph", style: {\n'
+            '        "line-color": "#e8a82b",\n'
+            '        "target-arrow-color": "#e8a82b", "source-arrow-color": "#e8a82b",\n'
+            '        "control-point-distances": [100], "control-point-weights": [0.5]\n'
+            '      } },\n'
+            '      { selector: ".channel-state-open", style: {\n'
+            '        "line-style": "solid", "opacity": 1.0\n'
+            '      } },\n'
+            '      { selector: ".channel-state-closed", style: {\n'
+            '        "line-style": "dotted", "opacity": 0.55\n'
+            '      } },\n'
+            '      { selector: ".channel-state-unknown", style: {\n'
+            '        "line-style": "dashed", "opacity": 0.3,\n'
+            '        "line-color": "#888",\n'
+            '        "target-arrow-color": "#888", "source-arrow-color": "#888"\n'
+            '      } },\n'
+            '      { selector: "edge:selected", style: {\n'
+            '        "width": 5, "opacity": 1.0\n'
+            '      } }\n'
+            '    ],\n'
+            '    layout: {\n'
+            '      name: "concentric",\n'
+            '      concentric: function(n) { return n.hasClass("hub") ? 100 : 1; },\n'
+            '      levelWidth: function() { return 1; },\n'
+            '      minNodeSpacing: 120,\n'
+            '      animate: true,\n'
+            '      animationDuration: 500\n'
+            '    }\n'
+            '  });\n'
+            '  function fmtChannels(dc) {\n'
+            '    if (!dc || typeof dc !== "object") return "";\n'
+            '    const order = ["knowledge", "opensearch", "memgraph"];\n'
+            '    let lines = "";\n'
+            '    for (const ch of order) {\n'
+            '      const s = dc[ch] || "unknown";\n'
+            '      lines += "    " + ch.padEnd(12) + " " + s + "\\n";\n'
+            '    }\n'
+            '    return lines;\n'
+            '  }\n'
+            '  function fmtNode(n) {\n'
+            '    const url = n.data("url") || "";\n'
+            '    const env = n.data("env") || "";\n'
+            '    const purpose = n.data("purpose") || "";\n'
+            '    const status = n.data("status") || "";\n'
+            '    const k8s = n.data("k8s") || "";\n'
+            '    const tunnel = n.data("tunnel") || "";\n'
+            '    const httpCode = n.data("http_code");\n'
+            '    const probedAt = n.data("last_probe_at") || "";\n'
+            '    const activeAt = n.data("last_active_at") || "";\n'
+            '    const err = n.data("probe_error") || "";\n'
+            '    const dur = n.data("probe_duration_ms");\n'
+            '    const dc = n.data("data_channels") || {};\n'
+            '    let s = "[" + n.id() + "]";\n'
+            '    s += n.hasClass("hub") ? "  (hub)\\n" : "  (spoke)\\n";\n'
+            '    if (status) s += "  status:        " + status + "\\n";\n'
+            '    if (url) s += "  url:           " + url + "\\n";\n'
+            '    if (env) s += "  env:           " + env + (k8s ? "  /  " + k8s : "") + "\\n";\n'
+            '    if (purpose) s += "  purpose:       " + purpose + "\\n";\n'
+            '    if (tunnel) s += "  tunnel:        " + tunnel + "\\n";\n'
+            '    if (httpCode !== "" && httpCode != null) s += "  http_code:     " + httpCode + (dur ? "  (" + dur + "ms)" : "") + "\\n";\n'
+            '    if (probedAt) s += "  last_probe:    " + probedAt + "\\n";\n'
+            '    if (activeAt) s += "  last_active:   " + activeAt + "\\n";\n'
+            '    if (err) s += "  error:         " + err + "\\n";\n'
+            '    const chLines = fmtChannels(dc);\n'
+            '    if (chLines) s += "  data_channels:\\n" + chLines;\n'
+            '    return s.trim();\n'
+            '  }\n'
+            '  function fmtEdge(e) {\n'
+            '    const ch = e.data("channel");\n'
+            '    const src = e.data("source");\n'
+            '    const tgt = e.data("target");\n'
+            '    if (!ch) {\n'
+            '      return "[edge] " + src + " -> " + tgt + "\\n  (reachability link from spoke-probe)";\n'
+            '    }\n'
+            '    const state = e.data("state") || "unknown";\n'
+            '    return "[data channel] " + src + " -> " + tgt + "\\n"\n'
+            '      + "  channel:  " + ch + "\\n"\n'
+            '      + "  state:    " + state + "\\n"\n'
+            '      + "  endpoint: /core/" + ch + "/migrate_export";\n'
+            '  }\n'
+            '  cy.on("tap", "node", function(evt) {\n'
+            '    document.getElementById("info").textContent = fmtNode(evt.target);\n'
+            '  });\n'
+            '  cy.on("tap", "edge", function(evt) {\n'
+            '    document.getElementById("info").textContent = fmtEdge(evt.target);\n'
+            '  });\n'
+            '  cy.on("tap", function(evt) {\n'
+            '    if (evt.target === cy) {\n'
+            '      document.getElementById("info").textContent =\n'
+            '        "ノードかエッジをクリックすると詳細を表示します";\n'
+            '    }\n'
+            '  });\n'
+            '})();\n'
+            '</script>\n'
+        )
+        html = html.replace("__ELEMENTS_JSON__", elements_json)
+        components.html(html, height=1000, scrolling=False)
+
+        # ──────────────────────────────────────────────────────
+        # スポーク管理 (admin 限定)
+        # ──────────────────────────────────────────────────────
+        # スポークを OpenSpoke 管理下から外す/戻す 操作 UI。
+        # 操作は kernel_api 経由で backend kernel (rag-backend-kernel) の
+        # /core/spoke/disable, /core/spoke/enable, /core/spoke/list-archived
+        # を呼び出す。 破壊的でない (可逆) 設計:
+        #   - spoke_clusters の doc を spoke_clusters_archive に統合保存
+        #   - Fleet GitRepo の削除/編集前 YAML を archive に保存
+        #   - enable で完全に元の状態に復元できる
+        if scope.get("is_admin"):
+            st.markdown("---")
+            st.subheader("スポーク管理 (admin 限定)")
+
+            _archived_by_default = (
+                scope.get("email") or scope.get("username") or "anonymous"
+            )
+
+            # === 管理下から外す ===
+            st.markdown("**管理下から外す**")
+            _active_names = sorted([
+                (s.get("cluster_name") or s.get("_id"))
+                for s in spokes_all
+                if (s.get("cluster_name") or s.get("_id")) != "rag"
+            ])
+            _selected_disable = st.selectbox(
+                "対象スポーク",
+                [""] + _active_names,
+                key="spoke_disable_select",
+            )
+            if _selected_disable:
+                st.warning(
+                    f"`{_selected_disable}` を OpenSpoke 管理下から外します。 "
+                    "以下を行います (すべて可逆):\n\n"
+                    "- spoke_clusters → spoke_clusters_archive へ doc 移動\n"
+                    "- Fleet 個別 GitRepo を削除 (該当 cluster だけが "
+                    "target のもの)\n"
+                    f"- Fleet fanout GitRepo の targets から "
+                    f"`{_selected_disable}` を除外\n"
+                    "- Spoke per-cluster bootstrap "
+                    "(clusters/spoke-XXXX/) を削除\n\n"
+                    "以下は touch しません: Fleet Cluster CR / "
+                    "Cloudflare Tunnel / ledger / Application 配信用 "
+                    "manifest 本体"
+                )
+                if st.button(
+                    f"確認: {_selected_disable} を管理下から外す",
+                    type="primary",
+                    key="spoke_disable_btn",
+                ):
+                    with st.spinner(
+                        f"{_selected_disable} を管理下から外しています..."
+                    ):
+                        _result = kernel_api.spoke_disable(
+                            _selected_disable,
+                            archived_by=_archived_by_default,
+                        )
+                    if (isinstance(_result, dict)
+                            and "_error" in _result):
+                        st.error(f"失敗: {_result['_error']}")
+                    else:
+                        st.success(
+                            f"`{_selected_disable}` をアーカイブしました"
+                        )
+                        st.json(_result)
+                        # Fleet Cluster CR 削除 (独立 API call).
+                        # disable と分離することで backend kernel ↔
+                        # 中央ハブ MCP の循環依存による HTTP デッド
+                        # ロック様状況を回避.
+                        with st.spinner(
+                            "Cluster CR を削除中..."
+                        ):
+                            _cr_result = kernel_api.delete_cluster_cr(
+                                _selected_disable
+                            )
+                        st.markdown("**Cluster CR 削除結果**")
+                        st.json(_cr_result)
+                        kernel_api.clear_caches()
+
+            # === アーカイブ済み一覧 ===
+            _archived = kernel_api.list_archived_spokes()
+            st.markdown(
+                f"**アーカイブ済みスポーク ({len(_archived)} 件)**"
+            )
+            if _archived:
+                _rows = []
+                for a in _archived:
+                    _src = a.get("spoke_clusters_source") or {}
+                    _rows.append({
+                        "cluster_name": (
+                            a.get("cluster_name") or a.get("_id")
+                        ),
+                        "archived_at": a.get("archived_at", ""),
+                        "archived_by": a.get("archived_by", ""),
+                        "previous_status": a.get("previous_status", ""),
+                        "env": _src.get("env", ""),
+                        "url": _src.get("url", ""),
+                    })
+                st.table(_rows)
+
+                # === 管理下に戻す ===
+                st.markdown("**管理下に戻す**")
+                _archived_names = sorted([
+                    a.get("cluster_name") or a.get("_id")
+                    for a in _archived
+                ])
+                _selected_enable = st.selectbox(
+                    "対象アーカイブ",
+                    [""] + _archived_names,
+                    key="spoke_enable_select",
+                )
+                if _selected_enable:
+                    st.info(
+                        f"`{_selected_enable}` を OpenSpoke 管理下に戻します。 "
+                        "アーカイブ時に保存した git 状態と spoke_clusters doc を "
+                        "すべて復元します。"
+                    )
+                    if st.button(
+                        f"確認: {_selected_enable} を管理下に戻す",
+                        type="primary",
+                        key="spoke_enable_btn",
+                    ):
+                        with st.spinner(
+                            f"{_selected_enable} を復元しています..."
+                        ):
+                            _result = kernel_api.spoke_enable(
+                                _selected_enable
+                            )
+                        if (isinstance(_result, dict)
+                                and "_error" in _result):
+                            st.error(f"失敗: {_result['_error']}")
+                        else:
+                            st.success(
+                                f"`{_selected_enable}` を復元しました"
+                            )
+                            st.json(_result)
+                            kernel_api.clear_caches()
+            else:
+                st.caption("アーカイブはありません.")

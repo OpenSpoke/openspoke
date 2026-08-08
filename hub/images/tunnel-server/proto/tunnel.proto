@@ -1,0 +1,68 @@
+syntax = "proto3";
+
+package openspoke.tunnel.v1;
+
+option go_package = "github.com/openspoke/openspoke-tunnel/proto;tunnelpb";
+
+// Tunnel service.
+//
+// A spoke opens a Connect(stream) to the hub and holds it. While that
+// stream is up, the hub can create any number of virtual TCP streams
+// that terminate at the spoke's configured target (default:
+// mcp-company1:8000).
+service Tunnel {
+  rpc Connect(stream ClientFrame) returns (stream ServerFrame);
+}
+
+// hub -> spoke frames.
+message ServerFrame {
+  // Hub-assigned virtual TCP stream id. Zero is reserved for control
+  // frames (handshake / ping).
+  uint64 stream_id = 1;
+
+  oneof kind {
+    HandshakeChallenge challenge = 10;
+    OpenStream open = 20;
+    Data data = 21;
+    CloseStream close = 22;
+    Ping ping = 30;
+  }
+}
+
+// spoke -> hub frames.
+message ClientFrame {
+  uint64 stream_id = 1;
+
+  oneof kind {
+    HandshakeResponse handshake = 10;
+    Data data = 21;
+    CloseStream close = 22;
+    Pong pong = 30;
+  }
+}
+
+// hub -> spoke: authentication challenge.
+message HandshakeChallenge {
+  bytes nonce = 1;        // 32 random bytes
+  int64 issued_at = 2;    // unix millis
+}
+
+// spoke -> hub: response to challenge.
+message HandshakeResponse {
+  string spoke_id = 1;
+  bytes signature = 2;    // Phase 1: raw pre-shared token bytes.
+                          // Phase 3: Ed25519(nonce || spoke_id || issued_at).
+  string tunnel_client_ver = 3;
+}
+
+// hub -> spoke: open a new virtual TCP stream.
+message OpenStream {
+  string protocol = 1;    // v0 only supports "tcp"
+  string target = 2;      // v0 is pinned to the client's TARGET env
+                          // (e.g. "mcp-company1:8000")
+}
+
+message Data { bytes payload = 1; }
+message CloseStream { bool half = 1; string reason = 2; }
+message Ping { int64 sent_at = 1; }
+message Pong { int64 sent_at = 1; }

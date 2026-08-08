@@ -1,0 +1,294 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-backend-kernel-memgraph-migrate
+  namespace: rag-spoke
+data:
+  memgraph_migrate.py: |
+    """memgraph graph 移行モジュール (export + pull、 対称・双方向)。
+
+    knowledge_migrate.py と同じ思想。 Memgraph グラフを kernel 間で
+    直接転送する。 制御側 (Claude / MCP) のコンテキストには載らない。
+
+    公開エンドポイント (cloudflared で対象 path のみ公開、 共有トークン必須):
+    - POST /core/memgraph/migrate_export : 全 node または全 edge を 1 ページずつ返す
+    - POST /core/memgraph/migrate_pull   : source の export を pull し自分に MERGE で投入
+
+    認証: env KNOWLEDGE_MIGRATE_TOKEN (knowledge_migrate と共用) と Authorization: Bearer。
+    未設定時は 503、 不一致は 401。
+
+    node の内部 id はクラスタ依存のため target 側で再生成される。 同一性を
+    保つため property `nid_src` (= source 側の id(n)) を全 node に付与し、
+    edge は両端 nid_src でマッチしながら MERGE する。
+
+    memgraph driver は同期 (blocking) なので run_in_threadpool で逃がし
+    FastAPI の event loop を握らないようにする (uvicorn workers=1 対策)。
+
+    main.py から `from memgraph_migrate import router` で取り込む。
+    """
+    import os
+    import logging
+    import httpx
+    from fastapi import APIRouter, Header, HTTPException
+    from starlette.concurrency import run_in_threadpool
+
+    try:
+        from neo4j import GraphDatabase
+        NEO4J_AVAILABLE = True
+    except ImportError:
+        NEO4J_AVAILABLE = False
+
+    logger = logging.getLogger("memgraph_migrate")
+    router = APIRouter()
+
+    _NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://memgraph.memgraph.svc.cluster.local:7687")
+    _NEO4J_USER = os.environ.get("NEO4J_USER", "")
+    _NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD", "")
+    _MIGRATE_TOKEN = os.environ.get("KNOWLEDGE_MIGRATE_TOKEN", "")
+    _DEFAULT_BATCH = 1000
+
+
+    def _check_token(authorization):
+        if not _MIGRATE_TOKEN:
+            raise HTTPException(status_code=503, detail="KNOWLEDGE_MIGRATE_TOKEN not configured")
+        if authorization != f"Bearer {_MIGRATE_TOKEN}":
+            raise HTTPException(status_code=401, detail="invalid or missing migrate token")
+
+
+    def _get_driver():
+        if not NEO4J_AVAILABLE:
+            raise RuntimeError("neo4j driver not installed")
+        if _NEO4J_USER and _NEO4J_PASSWORD:
+            return GraphDatabase.driver(_NEO4J_URI, auth=(_NEO4J_USER, _NEO4J_PASSWORD))
+        return GraphDatabase.driver(_NEO4J_URI)
+
+
+    def _export_nodes_blocking(offset, limit):
+        driver = _get_driver()
+        try:
+            with driver.session() as session:
+                result = session.run(
+                    "MATCH (n) RETURN id(n) AS nid, labels(n) AS labels, properties(n) AS props "
+                    "ORDER BY id(n) SKIP $offset LIMIT $limit",
+                    offset=offset, limit=limit,
+                )
+                items = []
+                for rec in result:
+                    items.append({
+                        "nid": rec["nid"],
+                        "labels": list(rec["labels"] or []),
+                        "props": dict(rec["props"] or {}),
+                    })
+                return items
+        finally:
+            driver.close()
+
+
+    def _export_edges_blocking(offset, limit):
+        driver = _get_driver()
+        try:
+            with driver.session() as session:
+                result = session.run(
+                    "MATCH (a)-[r]->(b) RETURN id(a) AS src, id(b) AS dst, "
+                    "type(r) AS rel_type, properties(r) AS props "
+                    "ORDER BY id(r) SKIP $offset LIMIT $limit",
+                    offset=offset, limit=limit,
+                )
+                items = []
+                for rec in result:
+                    items.append({
+                        "src": rec["src"],
+                        "dst": rec["dst"],
+                        "rel_type": rec["rel_type"],
+                        "props": dict(rec["props"] or {}),
+                    })
+                return items
+        finally:
+            driver.close()
+
+
+    def _merge_nodes_blocking(items):
+        if not items:
+            return 0, 0, []
+        driver = _get_driver()
+        merged = 0
+        failed = 0
+        errors = []
+        try:
+            with driver.session() as session:
+                for it in items:
+                    try:
+                        labels = it.get("labels") or []
+                        props = dict(it.get("props") or {})
+                        props["nid_src"] = it["nid"]
+                        label_str = ":".join(labels) if labels else ""
+                        if label_str:
+                            cypher = f"MERGE (n:{label_str} {{nid_src: $nid_src}}) SET n += $props"
+                        else:
+                            cypher = "MERGE (n {nid_src: $nid_src}) SET n += $props"
+                        session.run(cypher, nid_src=it["nid"], props=props)
+                        merged += 1
+                    except Exception as ee:
+                        failed += 1
+                        if len(errors) < 5:
+                            errors.append(f"node nid={it.get('nid')}: {type(ee).__name__}: {str(ee)[:100]}")
+        finally:
+            driver.close()
+        return merged, failed, errors
+
+
+    def _merge_edges_blocking(items):
+        if not items:
+            return 0, 0, []
+        driver = _get_driver()
+        merged = 0
+        failed = 0
+        errors = []
+        try:
+            with driver.session() as session:
+                for it in items:
+                    try:
+                        rel_type = it.get("rel_type") or "RELATED"
+                        cypher = (
+                            "MATCH (a {nid_src: $src_nid}), (b {nid_src: $dst_nid}) "
+                            f"MERGE (a)-[r:{rel_type}]->(b) SET r += $props"
+                        )
+                        session.run(cypher,
+                                    src_nid=it["src"],
+                                    dst_nid=it["dst"],
+                                    props=dict(it.get("props") or {}))
+                        merged += 1
+                    except Exception as ee:
+                        failed += 1
+                        if len(errors) < 5:
+                            errors.append(f"edge {it.get('src')}->{it.get('dst')}: {type(ee).__name__}: {str(ee)[:100]}")
+        finally:
+            driver.close()
+        return merged, failed, errors
+
+
+    @router.post("/core/memgraph/migrate_export")
+    async def memgraph_migrate_export(request: dict, authorization: str = Header(None)):
+        """全 node または全 edge を 1 ページずつ返す。
+
+        Body: {"kind": "nodes"|"edges", "offset": 0, "limit": 1000}
+        Returns: {"ok", "kind", "count", "items", "error"}
+            count==0 で終了 (呼び出し側の責任)。
+        """
+        _check_token(authorization)
+        kind = request.get("kind") or "nodes"
+        offset = int(request.get("offset") or 0)
+        limit = int(request.get("limit") or _DEFAULT_BATCH)
+        if kind not in ("nodes", "edges"):
+            return {"ok": False, "kind": kind, "count": 0, "items": [],
+                    "error": "kind must be 'nodes' or 'edges'"}
+        try:
+            if kind == "nodes":
+                items = await run_in_threadpool(_export_nodes_blocking, offset, limit)
+            else:
+                items = await run_in_threadpool(_export_edges_blocking, offset, limit)
+            logger.info(f"[MEMGRAPH_MIGRATE] export {kind} offset={offset}: {len(items)} items")
+            return {"ok": True, "kind": kind, "count": len(items), "items": items, "error": None}
+        except Exception as e:
+            logger.error(f"[MEMGRAPH_MIGRATE] export error: {e}", exc_info=True)
+            return {"ok": False, "kind": kind, "count": 0, "items": [],
+                    "error": f"{type(e).__name__}: {str(e)[:200]}"}
+
+
+    @router.post("/core/memgraph/migrate_pull")
+    async def memgraph_migrate_pull(request: dict, authorization: str = Header(None)):
+        """source kernel から全 node + 全 edge を pull し、 自分の memgraph に MERGE で投入する。
+
+        Body:
+            {
+              "source_base_url": "https://<source-kernel>",  必須
+              "source_token":    "<source の KNOWLEDGE_MIGRATE_TOKEN>",  必須
+              "batch_size":      1000,  任意
+              "dry_run":         false  任意
+            }
+        Returns: {"ok", "summary": {nodes_fetched,nodes_merged,edges_fetched,edges_merged,...}, "error"}
+        """
+        _check_token(authorization)
+        source = (request.get("source_base_url") or "").rstrip("/")
+        source_token = request.get("source_token") or ""
+        batch_size = int(request.get("batch_size") or _DEFAULT_BATCH)
+        dry_run = bool(request.get("dry_run"))
+
+        if not source:
+            return {"ok": False, "summary": {}, "error": "source_base_url is required"}
+
+        src_headers = {"Authorization": f"Bearer {source_token}"} if source_token else {}
+        summary = {"nodes_fetched": 0, "nodes_merged": 0, "nodes_failed": 0,
+                   "edges_fetched": 0, "edges_merged": 0, "edges_failed": 0}
+        sample_errors = []
+        try:
+            async with httpx.AsyncClient(timeout=600.0) as c:
+                # Phase 1: nodes (先に全 node を投入してから edge をはるため)
+                offset = 0
+                while True:
+                    try:
+                        r = await c.post(
+                            f"{source}/core/memgraph/migrate_export",
+                            json={"kind": "nodes", "offset": offset, "limit": batch_size},
+                            headers=src_headers,
+                        )
+                        d = r.json()
+                    except Exception as ee:
+                        sample_errors.append(f"export nodes: {type(ee).__name__}: {str(ee)[:120]}")
+                        break
+                    if not d.get("ok"):
+                        sample_errors.append(d.get("error") or "export nodes not ok")
+                        break
+                    items = d.get("items") or []
+                    summary["nodes_fetched"] += len(items)
+                    if not items:
+                        break
+                    if not dry_run:
+                        merged, failed, errs = await run_in_threadpool(_merge_nodes_blocking, items)
+                        summary["nodes_merged"] += merged
+                        summary["nodes_failed"] += failed
+                        for e in errs:
+                            if len(sample_errors) < 5:
+                                sample_errors.append(e)
+                    offset += len(items)
+                    if len(items) < batch_size:
+                        break
+                # Phase 2: edges
+                offset = 0
+                while True:
+                    try:
+                        r = await c.post(
+                            f"{source}/core/memgraph/migrate_export",
+                            json={"kind": "edges", "offset": offset, "limit": batch_size},
+                            headers=src_headers,
+                        )
+                        d = r.json()
+                    except Exception as ee:
+                        sample_errors.append(f"export edges: {type(ee).__name__}: {str(ee)[:120]}")
+                        break
+                    if not d.get("ok"):
+                        sample_errors.append(d.get("error") or "export edges not ok")
+                        break
+                    items = d.get("items") or []
+                    summary["edges_fetched"] += len(items)
+                    if not items:
+                        break
+                    if not dry_run:
+                        merged, failed, errs = await run_in_threadpool(_merge_edges_blocking, items)
+                        summary["edges_merged"] += merged
+                        summary["edges_failed"] += failed
+                        for e in errs:
+                            if len(sample_errors) < 5:
+                                sample_errors.append(e)
+                    offset += len(items)
+                    if len(items) < batch_size:
+                        break
+            if dry_run:
+                summary["dry_run"] = True
+            if sample_errors:
+                summary["sample_errors"] = sample_errors
+            logger.info(f"[MEMGRAPH_MIGRATE] pull: {summary}")
+            return {"ok": True, "summary": summary, "error": None}
+        except Exception as e:
+            logger.error(f"[MEMGRAPH_MIGRATE] pull error: {e}", exc_info=True)
+            return {"ok": False, "summary": summary, "error": f"{type(e).__name__}: {str(e)[:200]}"}

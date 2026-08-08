@@ -1,0 +1,84 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-shell
+  namespace: rag-spoke
+  labels:
+    app: node-shell
+spec:
+  selector:
+    matchLabels:
+      app: node-shell
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: node-shell
+    spec:
+      hostPID: true
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: server
+          image: python:3.11-slim
+          imagePullPolicy: IfNotPresent
+          command:
+            - python3
+            - -u
+            - /app/server.py
+          env:
+            - name: HTTP_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: node-shell-auth
+                  key: api_key
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: PORT
+              value: "8080"
+          ports:
+            - containerPort: 8080
+              name: http
+              protocol: TCP
+          securityContext:
+            privileged: true
+            runAsUser: 0
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - mountPath: /app
+              name: app-code
+              readOnly: true
+      volumes:
+        - name: app-code
+          configMap:
+            name: node-shell-server
+            defaultMode: 0444

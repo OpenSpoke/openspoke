@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: milvus-querycoord
+  namespace: milvus
+spec:
+  internalTrafficPolicy: Cluster
+  ipFamilies:
+    - IPv4
+  ipFamilyPolicy: SingleStack
+  ports:
+    - port: 19531
+      protocol: TCP
+      targetPort: 19531
+  selector:
+    app: milvus-querycoord
+  sessionAffinity: None
+  type: ClusterIP

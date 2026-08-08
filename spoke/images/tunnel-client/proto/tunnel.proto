@@ -1,0 +1,55 @@
+syntax = "proto3";
+
+package openspoke.tunnel.v1;
+
+option go_package = "github.com/openspoke/openspoke-tunnel-client/proto;tunnelpb";
+
+// This file is kept byte-identical (modulo go_package) with
+// hub/images/tunnel-server/proto/tunnel.proto. Regenerate both
+// whenever the protocol changes.
+
+service Tunnel {
+  rpc Connect(stream ClientFrame) returns (stream ServerFrame);
+}
+
+message ServerFrame {
+  uint64 stream_id = 1;
+  oneof kind {
+    HandshakeChallenge challenge = 10;
+    OpenStream open = 20;
+    Data data = 21;
+    CloseStream close = 22;
+    Ping ping = 30;
+  }
+}
+
+message ClientFrame {
+  uint64 stream_id = 1;
+  oneof kind {
+    HandshakeResponse handshake = 10;
+    Data data = 21;
+    CloseStream close = 22;
+    Pong pong = 30;
+  }
+}
+
+message HandshakeChallenge {
+  bytes nonce = 1;
+  int64 issued_at = 2;
+}
+
+message HandshakeResponse {
+  string spoke_id = 1;
+  bytes signature = 2;
+  string tunnel_client_ver = 3;
+}
+
+message OpenStream {
+  string protocol = 1;
+  string target = 2;
+}
+
+message Data { bytes payload = 1; }
+message CloseStream { bool half = 1; string reason = 2; }
+message Ping { int64 sent_at = 1; }
+message Pong { int64 sent_at = 1; }

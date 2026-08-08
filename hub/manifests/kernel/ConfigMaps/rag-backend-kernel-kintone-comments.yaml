@@ -1,0 +1,101 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-backend-kernel-kintone-comments
+  namespace: rag-company1
+data:
+  kintone_comments.py: |
+    """kintone レコードコメント (/core/kintone/comments/*).
+
+    エンドポイント:
+      POST /core/kintone/comments/list   : レコードのコメント一覧
+      POST /core/kintone/comments/add    : コメント追加
+      POST /core/kintone/comments/delete : コメント削除
+    """
+    import logging
+    from fastapi import APIRouter
+
+    import kintone_common as _kc
+
+    logger = logging.getLogger("kintone_comments")
+    router = APIRouter()
+
+
+    def _err(msg):
+        return {"ok": False, "status_code": 0, "data": None, "error": msg}
+
+
+    @router.post("/core/kintone/comments/list")
+    async def kintone_comments_list(request: dict):
+        """レコードのコメント一覧 (GET /k/v1/record/comments.json).
+
+        Body:
+            {
+              "app":    <int>,
+              "record": <int>,                # レコード ID
+              "order":  "asc"|"desc" (任意),
+              "offset": <int> (任意),
+              "limit":  <int> (任意、 max 10)
+            }
+        Returns: {"comments": [...], "older": bool, "newer": bool}
+        """
+        app = request.get("app")
+        record_id = request.get("record")
+        if app is None or record_id is None:
+            return _err("app and record are required")
+        params = {"app": app, "record": record_id}
+        for key in ("order", "offset", "limit"):
+            v = request.get(key)
+            if v is not None:
+                params[key] = v
+        return await _kc.request(
+            "GET", "/k/v1/record/comments.json", app, params=params,
+        )
+
+
+    @router.post("/core/kintone/comments/add")
+    async def kintone_comments_add(request: dict):
+        """コメント追加 (POST /k/v1/record/comment.json).
+
+        Body:
+            {
+              "app":    <int>,
+              "record": <int>,
+              "comment": {
+                "text":     "<本文>",
+                "mentions": [{"code": "<userCode>", "type": "USER"|"GROUP"|"ORGANIZATION"}, ...]
+              }
+            }
+        Returns: {"id": "<str>"}
+        """
+        app = request.get("app")
+        record_id = request.get("record")
+        comment = request.get("comment")
+        if app is None or record_id is None or comment is None:
+            return _err("app, record, comment are required")
+        if not isinstance(comment, dict) or not comment.get("text"):
+            return _err("comment.text is required")
+        return await _kc.request(
+            "POST", "/k/v1/record/comment.json", app,
+            body={"app": app, "record": record_id, "comment": comment},
+        )
+
+
+    @router.post("/core/kintone/comments/delete")
+    async def kintone_comments_delete(request: dict):
+        """コメント削除 (DELETE /k/v1/record/comment.json).
+
+        Body:
+            {"app": <int>, "record": <int>, "comment": <int>}
+            ("comment" はコメント ID)
+        Returns: {}
+        """
+        app = request.get("app")
+        record_id = request.get("record")
+        comment_id = request.get("comment")
+        if app is None or record_id is None or comment_id is None:
+            return _err("app, record, comment (id) are required")
+        return await _kc.request(
+            "DELETE", "/k/v1/record/comment.json", app,
+            body={"app": app, "record": record_id, "comment": comment_id},
+        )

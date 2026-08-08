@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    workload.user.cattle.io/workloadselector: apps.deployment-milvus-minio
+  name: minio
+  namespace: milvus
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      workload.user.cattle.io/workloadselector: apps.deployment-milvus-minio
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: minio
+        workload.user.cattle.io/workloadselector: apps.deployment-milvus-minio
+      name: minio
+      namespace: milvus
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: rag-type
+                    operator: In
+                    values:
+                      - milvus
+      containers:
+        - args:
+            - server
+            - /data
+            - '--console-address=:9001'
+          env:
+            - name: MINIO_ROOT_USER
+              value: minioadmin
+            - name: MINIO_ROOT_PASSWORD
+              value: minioadminpassword
+            - name: MINIO_REGION
+              value: us-east-1
+          image: minio/minio:RELEASE.2024-01-16T16-07-38Z
+          imagePullPolicy: IfNotPresent
+          name: minio
+          ports:
+            - containerPort: 9000
+              name: 9000tcp
+              protocol: TCP
+            - containerPort: 9001
+              name: 9001tcp
+              protocol: TCP
+          resources: {}
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+            - mountPath: /data
+              name: minio-data-local
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
+      volumes:
+        - name: minio-data-local
+          persistentVolumeClaim:
+            claimName: minio-data-local

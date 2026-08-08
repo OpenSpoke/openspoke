@@ -1,0 +1,122 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-backend-kernel-kintone-spaces
+  namespace: rag-company1
+data:
+  kintone_spaces.py: |
+    """kintone スペース / スレッド (/core/kintone/spaces/*).
+
+    エンドポイント:
+      POST /core/kintone/spaces/get_space        : スペース情報取得
+      POST /core/kintone/spaces/get_members      : スペースメンバー一覧
+      POST /core/kintone/spaces/update_thread    : スレッド本文更新
+      POST /core/kintone/spaces/add_thread_comment : スレッドにコメント追加
+
+    全 endpoint は body の auth_app_id で「どの app の token を認証に使うか」
+    を指定する必要がある (spaces 系 API は app に紐づかないため)。
+    指定された token を持つ user の権限でアクセスする。
+    """
+    import logging
+    from fastapi import APIRouter
+
+    import kintone_common as _kc
+
+    logger = logging.getLogger("kintone_spaces")
+    router = APIRouter()
+
+
+    def _err(msg):
+        return {"ok": False, "status_code": 0, "data": None, "error": msg}
+
+
+    @router.post("/core/kintone/spaces/get_space")
+    async def kintone_spaces_get_space(request: dict):
+        """スペース情報 (GET /k/v1/space.json).
+
+        Body: {"auth_app_id": <int>, "id": <int>}
+        Returns: スペース詳細 (name, defaultThread, members, apps, ...)
+        """
+        auth_app_id = request.get("auth_app_id")
+        space_id = request.get("id")
+        if auth_app_id is None or space_id is None:
+            return _err("auth_app_id and id are required")
+        return await _kc.request(
+            "GET", "/k/v1/space.json", auth_app_id, params={"id": space_id},
+        )
+
+
+    @router.post("/core/kintone/spaces/get_members")
+    async def kintone_spaces_get_members(request: dict):
+        """スペースメンバー一覧 (GET /k/v1/space/members.json).
+
+        Body: {"auth_app_id": <int>, "id": <int>}
+        Returns: {"members": [...]}
+        """
+        auth_app_id = request.get("auth_app_id")
+        space_id = request.get("id")
+        if auth_app_id is None or space_id is None:
+            return _err("auth_app_id and id are required")
+        return await _kc.request(
+            "GET", "/k/v1/space/members.json", auth_app_id, params={"id": space_id},
+        )
+
+
+    @router.post("/core/kintone/spaces/update_thread")
+    async def kintone_spaces_update_thread(request: dict):
+        """スレッド本文更新 (PUT /k/v1/space/thread.json).
+
+        Body:
+            {
+              "auth_app_id": <int>,
+              "id":          <int>,         # スレッド ID
+              "name":        "<str>" (任意),
+              "body":        "<str>" (HTML 可、 任意)
+            }
+        Returns: {}
+        """
+        auth_app_id = request.get("auth_app_id")
+        thread_id = request.get("id")
+        if auth_app_id is None or thread_id is None:
+            return _err("auth_app_id and id are required")
+        body = {"id": thread_id}
+        if request.get("name") is not None:
+            body["name"] = request["name"]
+        if request.get("body") is not None:
+            body["body"] = request["body"]
+        if len(body) == 1:
+            return _err("at least one of name/body is required")
+        return await _kc.request(
+            "PUT", "/k/v1/space/thread.json", auth_app_id, body=body,
+        )
+
+
+    @router.post("/core/kintone/spaces/add_thread_comment")
+    async def kintone_spaces_add_thread_comment(request: dict):
+        """スレッドにコメント追加 (POST /k/v1/space/thread/comment.json).
+
+        Body:
+            {
+              "auth_app_id": <int>,
+              "space":       <int>,
+              "thread":      <int>,
+              "comment": {
+                "text":     "<本文>",
+                "mentions": [{"code": "<userCode>", "type": "USER"|"GROUP"|"ORGANIZATION"}, ...] (任意),
+                "files":    [{"fileKey": "<str>"}, ...] (任意)
+              }
+            }
+        Returns: {"id": "<str>"}
+        """
+        auth_app_id = request.get("auth_app_id")
+        space_id = request.get("space")
+        thread_id = request.get("thread")
+        comment = request.get("comment")
+        if auth_app_id is None or space_id is None or thread_id is None:
+            return _err("auth_app_id, space, thread are required")
+        if not isinstance(comment, dict) or not comment.get("text"):
+            return _err("comment.text is required")
+        return await _kc.request(
+            "POST", "/k/v1/space/thread/comment.json", auth_app_id,
+            body={"space": space_id, "thread": thread_id, "comment": comment},
+        )

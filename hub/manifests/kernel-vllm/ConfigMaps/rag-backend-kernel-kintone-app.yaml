@@ -1,0 +1,131 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-backend-kernel-kintone-app
+  namespace: rag-company1
+data:
+  kintone_app.py: |
+    """kintone アプリ情報 (/core/kintone/app/*).
+
+    エンドポイント:
+      POST /core/kintone/app/get_app       : アプリ基本情報
+      POST /core/kintone/app/get_fields    : フィールド定義 (スキーマ)
+      POST /core/kintone/app/get_layout    : フォームレイアウト
+      POST /core/kintone/app/get_views     : ビュー定義一覧
+      POST /core/kintone/app/list_apps     : アプリ一覧 (admin スコープ要)
+
+    list_apps は kintone 全アプリ横断のため、 認証用に「どの app_id の
+    トークンを使うか」 を body の auth_app_id で指定する必要がある
+    (kintone は token を発行したアプリの権限で動く仕様)。
+    """
+    import logging
+    from fastapi import APIRouter
+
+    import kintone_common as _kc
+
+    logger = logging.getLogger("kintone_app")
+    router = APIRouter()
+
+
+    def _err(msg):
+        return {"ok": False, "status_code": 0, "data": None, "error": msg}
+
+
+    @router.post("/core/kintone/app/get_app")
+    async def kintone_app_get_app(request: dict):
+        """アプリ基本情報 (GET /k/v1/app.json).
+
+        Body: {"app": <int>}
+        Returns: {"appId", "code", "name", "description", "spaceId", ...}
+        """
+        app = request.get("app")
+        if app is None:
+            return _err("app is required")
+        return await _kc.request(
+            "GET", "/k/v1/app.json", app, params={"id": app},
+        )
+
+
+    @router.post("/core/kintone/app/get_fields")
+    async def kintone_app_get_fields(request: dict):
+        """フィールド定義 (GET /k/v1/app/form/fields.json).
+
+        Body:
+            {"app": <int>, "lang": "default"|"ja"|"en"|"zh"|"user" (任意), "preview": bool (任意)}
+        Returns: {"properties": {...}, "revision": "<str>"}
+
+        preview=True で運用前 (preview) の設定を取得 (アプリ運用後の編集中設定)。
+        """
+        app = request.get("app")
+        if app is None:
+            return _err("app is required")
+        params = {"app": app}
+        if request.get("lang"):
+            params["lang"] = request["lang"]
+        path = "/k/v1/preview/app/form/fields.json" if request.get("preview") else "/k/v1/app/form/fields.json"
+        return await _kc.request("GET", path, app, params=params)
+
+
+    @router.post("/core/kintone/app/get_layout")
+    async def kintone_app_get_layout(request: dict):
+        """フォームレイアウト (GET /k/v1/app/form/layout.json).
+
+        Body: {"app": <int>, "preview": bool (任意)}
+        Returns: {"layout": [...], "revision": "<str>"}
+        """
+        app = request.get("app")
+        if app is None:
+            return _err("app is required")
+        path = "/k/v1/preview/app/form/layout.json" if request.get("preview") else "/k/v1/app/form/layout.json"
+        return await _kc.request("GET", path, app, params={"app": app})
+
+
+    @router.post("/core/kintone/app/get_views")
+    async def kintone_app_get_views(request: dict):
+        """ビュー定義一覧 (GET /k/v1/app/views.json).
+
+        Body: {"app": <int>, "lang": str (任意), "preview": bool (任意)}
+        Returns: {"views": {...}, "revision": "<str>"}
+        """
+        app = request.get("app")
+        if app is None:
+            return _err("app is required")
+        params = {"app": app}
+        if request.get("lang"):
+            params["lang"] = request["lang"]
+        path = "/k/v1/preview/app/views.json" if request.get("preview") else "/k/v1/app/views.json"
+        return await _kc.request("GET", path, app, params=params)
+
+
+    @router.post("/core/kintone/app/list_apps")
+    async def kintone_app_list_apps(request: dict):
+        """アプリ一覧 (GET /k/v1/apps.json).
+
+        Body:
+            {
+              "auth_app_id": <int>,           # 必須 (この app_id のトークンで認証)
+              "ids":         [<int>...],      # 任意 (絞り込み)
+              "codes":       ["<code>"...],   # 任意 (アプリコード)
+              "name":        "<部分一致>",     # 任意
+              "spaceIds":    [<int>...],      # 任意
+              "limit":       <int> (max 100), # 任意
+              "offset":      <int>            # 任意
+            }
+        Returns: {"apps": [...]}
+        """
+        auth_app_id = request.get("auth_app_id")
+        if auth_app_id is None:
+            return _err("auth_app_id is required (which app's token to use for authentication)")
+        param_list = []
+        for key in ("limit", "offset", "name"):
+            v = request.get(key)
+            if v is not None:
+                param_list.append((key, v))
+        for key in ("ids", "codes", "spaceIds"):
+            vs = request.get(key) or []
+            if isinstance(vs, list):
+                for v in vs:
+                    param_list.append((key, v))
+        return await _kc.request(
+            "GET", "/k/v1/apps.json", auth_app_id, params=param_list,
+        )

@@ -1,0 +1,83 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-backend-kernel-kintone-status
+  namespace: rag-company1
+data:
+  kintone_status.py: |
+    """kintone レコードステータス変更 (プロセス管理) (/core/kintone/status/*).
+
+    エンドポイント:
+      POST /core/kintone/status/update      : 1 レコードのステータス更新
+      POST /core/kintone/status/bulk_update : 複数レコードのステータス更新 (max 100)
+
+    アプリのプロセス管理 (ワークフロー) が有効でないと使えない。
+    """
+    import logging
+    from fastapi import APIRouter
+
+    import kintone_common as _kc
+
+    logger = logging.getLogger("kintone_status")
+    router = APIRouter()
+
+    _KINTONE_MAX_BULK = 100
+
+
+    def _err(msg):
+        return {"ok": False, "status_code": 0, "data": None, "error": msg}
+
+
+    @router.post("/core/kintone/status/update")
+    async def kintone_status_update(request: dict):
+        """1 レコードのステータス更新 (PUT /k/v1/record/status.json).
+
+        Body:
+            {
+              "app":       <int>,
+              "id":        <int>,
+              "action":    "<アクション名>",      # 必須
+              "assignee":  "<userCode>" (任意, 次の作業者),
+              "revision":  <int> (任意, 楽観ロック)
+            }
+        Returns: {"revision": "<str>"}
+        """
+        app = request.get("app")
+        record_id = request.get("id")
+        action = request.get("action")
+        if app is None or record_id is None or not action:
+            return _err("app, id, action are required")
+        body = {"app": app, "id": record_id, "action": action}
+        if request.get("assignee"):
+            body["assignee"] = request["assignee"]
+        if request.get("revision") is not None:
+            body["revision"] = request["revision"]
+        return await _kc.request(
+            "PUT", "/k/v1/record/status.json", app, body=body,
+        )
+
+
+    @router.post("/core/kintone/status/bulk_update")
+    async def kintone_status_bulk_update(request: dict):
+        """複数レコードのステータス更新 (PUT /k/v1/records/status.json, max 100).
+
+        Body:
+            {
+              "app": <int>,
+              "records": [
+                {"id": <int>, "action": "<str>", "assignee": "<str>"(任意), "revision": <int>(任意)},
+                ...
+              ]
+            }
+        Returns: {"records": [{"id": "<str>", "revision": "<str>"}, ...]}
+        """
+        app = request.get("app")
+        records = request.get("records")
+        if app is None or not isinstance(records, list) or not records:
+            return _err("app and records (non-empty list) are required")
+        if len(records) > _KINTONE_MAX_BULK:
+            return _err(f"records exceeds kintone limit ({_KINTONE_MAX_BULK})")
+        return await _kc.request(
+            "PUT", "/k/v1/records/status.json", app,
+            body={"app": app, "records": records},
+        )

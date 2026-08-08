@@ -1,0 +1,112 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-backend-kernel-kintone-files
+  namespace: rag-company1
+data:
+  kintone_files.py: |
+    """kintone 添付ファイル (/core/kintone/files/*).
+
+    エンドポイント:
+      POST /core/kintone/files/upload    : ファイル upload (base64 入力 → fileKey)
+      POST /core/kintone/files/download  : ファイル download (fileKey → base64 出力)
+
+    バイナリは MCP / JSON 経路では扱いづらいため、 全て base64 で
+    やりとりする (kernel 内で encode/decode)。 大きなファイルは
+    kernel のレスポンスが膨れるため上限 (≒ 数MB 程度) に注意。
+    """
+    import base64
+    import binascii
+    import logging
+    from fastapi import APIRouter
+
+    import kintone_common as _kc
+
+    logger = logging.getLogger("kintone_files")
+    router = APIRouter()
+
+    _DEFAULT_MIME = "application/octet-stream"
+    # download した bytes が大きすぎると JSON が膨らみすぎるので警告ログを出す
+    _WARN_DL_SIZE = 8 * 1024 * 1024  # 8 MB
+
+
+    def _err(msg, status=0):
+        return {"ok": False, "status_code": status, "data": None, "error": msg}
+
+
+    @router.post("/core/kintone/files/upload")
+    async def kintone_files_upload(request: dict):
+        """ファイル upload (POST /k/v1/file.json, multipart).
+
+        Body:
+            {
+              "app":          <int>,           # 認証用 (どの app の token を使うか)
+              "filename":     "<str>",
+              "content_b64":  "<base64 string>",
+              "mime_type":    "<str>" (任意, 既定 application/octet-stream)
+            }
+        Returns: {"fileKey": "<str>"}
+        """
+        app = request.get("app")
+        filename = request.get("filename")
+        content_b64 = request.get("content_b64")
+        mime = request.get("mime_type") or _DEFAULT_MIME
+        if app is None:
+            return _err("app is required")
+        if not filename or not isinstance(filename, str):
+            return _err("filename is required (str)")
+        if not content_b64 or not isinstance(content_b64, str):
+            return _err("content_b64 is required (base64 string)")
+        try:
+            raw = base64.b64decode(content_b64, validate=True)
+        except (binascii.Error, ValueError) as e:
+            return _err(f"invalid base64: {type(e).__name__}: {str(e)[:120]}")
+        files = {"file": (filename, raw, mime)}
+        return await _kc.request(
+            "POST", "/k/v1/file.json", app, files=files, timeout=120.0,
+        )
+
+
+    @router.post("/core/kintone/files/download")
+    async def kintone_files_download(request: dict):
+        """ファイル download (GET /k/v1/file.json).
+
+        Body:
+            {"app": <int>, "fileKey": "<str>"}
+        Returns:
+            {
+              "ok": true,
+              "status_code": 200,
+              "data": {
+                "filename":      "<str>" (Content-Disposition から取れれば),
+                "content_type":  "<str>",
+                "size":          <int>,
+                "content_b64":   "<base64 string>"
+              },
+              "error": null
+            }
+        """
+        app = request.get("app")
+        file_key = request.get("fileKey")
+        if app is None or not file_key:
+            return _err("app and fileKey are required")
+        res = await _kc.request_bytes(
+            "GET", "/k/v1/file.json", app,
+            params={"fileKey": file_key}, timeout=120.0,
+        )
+        if not res.get("ok"):
+            return {"ok": False, "status_code": res.get("status_code", 0),
+                    "data": None, "error": res.get("error") or "download failed"}
+        content = res.get("content") or b""
+        if len(content) > _WARN_DL_SIZE:
+            logger.warning(f"[KINTONE] download {file_key} large: {len(content)} bytes")
+        return {
+            "ok": True,
+            "status_code": res.get("status_code", 200),
+            "data": {
+                "content_type": res.get("content_type") or _DEFAULT_MIME,
+                "size":         len(content),
+                "content_b64":  base64.b64encode(content).decode("ascii"),
+            },
+            "error": None,
+        }

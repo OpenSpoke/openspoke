@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: milvus-querynode
+  namespace: milvus
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: milvus-querynode
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: milvus-querynode
+      namespace: milvus
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: rag-type
+                    operator: In
+                    values:
+                      - milvus
+      containers:
+        - command:
+            - milvus
+            - run
+            - querynode
+          env:
+            - name: ETCD_USE_EMBED
+              value: 'false'
+            - name: ETCD_ENDPOINTS
+              value: etcd:2379
+            - name: ETCD_ROOT_PATH
+              value: by-dev
+            - name: MINIO_ADDRESS
+              value: minio:9000
+            - name: MINIO_ACCESS_KEY_ID
+              value: minioadmin
+            - name: MINIO_SECRET_ACCESS_KEY
+              value: minioadminpassword
+            - name: MINIO_USE_SSL
+              value: 'false'
+            - name: MINIO_BUCKET_NAME
+              value: milvus-bucket
+            - name: MINIO_ROOT_PATH
+              value: file
+            - name: PULSAR_ADDRESS
+              value: pulsar://pulsar:6650
+            - name: COMMON_STORAGE_TYPE
+              value: minio
+            - name: ROOT_COORD_ADDRESS
+              value: milvus-rootcoord:53100
+            - name: QUERY_COORD_ADDRESS
+              value: milvus-querycoord:19531
+          image: milvusdb/milvus:v2.4.15
+          imagePullPolicy: IfNotPresent
+          name: querynode
+          resources:
+            limits:
+              cpu: '2'
+              memory: 8Gi
+            requests:
+              cpu: '1'
+              memory: 4Gi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30

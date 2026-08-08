@@ -1,0 +1,61 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: fleet-state-publisher
+  namespace: rag-company1
+spec:
+  schedule: "*/1 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 120
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      ttlSecondsAfterFinished: 600
+      template:
+        metadata:
+          labels:
+            app: fleet-state-publisher
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: publisher
+              image: python:3.12-slim
+              imagePullPolicy: IfNotPresent
+              command:
+                - sh
+                - -c
+                - >
+                  pip install --quiet --no-cache-dir mcp httpx anyio &&
+                  python3 /code/publish.py
+              env:
+                - name: HUB_OS_URL
+                  value: "http://opensearch.opensearch.svc.cluster.local:9200"
+                - name: HUB_MCP_URL
+                  value: "http://mcp-company1.mcp.svc.cluster.local:8000/sse"
+                - name: FLEET_CLUSTER
+                  value: "fleet-cluster"
+                - name: EXEC_NODE
+                  value: "example-node"
+                - name: MCP_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: mcp-api-key
+                      key: api-key
+              resources:
+                limits:
+                  cpu: 500m
+                  memory: 256Mi
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+              volumeMounts:
+                - name: code
+                  mountPath: /code
+                  readOnly: true
+          volumes:
+            - name: code
+              configMap:
+                name: fleet-state-publisher-code
+                defaultMode: 420

@@ -1,0 +1,112 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: milvus-proxy
+  namespace: milvus
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: milvus-proxy
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: milvus-proxy
+      namespace: milvus
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: rag-type
+                    operator: In
+                    values:
+                      - milvus
+      containers:
+        - command:
+            - milvus
+            - run
+            - proxy
+          env:
+            - name: ETCD_USE_EMBED
+              value: 'false'
+            - name: ETCD_ENDPOINTS
+              value: etcd:2379
+            - name: ETCD_ROOT_PATH
+              value: by-dev
+            - name: MINIO_ADDRESS
+              value: minio:9000
+            - name: MINIO_ACCESS_KEY_ID
+              value: minioadmin
+            - name: MINIO_SECRET_ACCESS_KEY
+              value: minioadminpassword
+            - name: MINIO_USE_SSL
+              value: 'false'
+            - name: MINIO_BUCKET_NAME
+              value: milvus-bucket
+            - name: MINIO_ROOT_PATH
+              value: file
+            - name: PULSAR_ADDRESS
+              value: pulsar://pulsar:6650
+            - name: COMMON_STORAGE_TYPE
+              value: minio
+            - name: ROOT_COORD_ADDRESS
+              value: milvus-rootcoord:53100
+            - name: QUERY_COORD_ADDRESS
+              value: milvus-querycoord:19531
+            - name: DATA_COORD_ADDRESS
+              value: milvus-datacoord:13333
+            - name: INDEX_COORD_ADDRESS
+              value: milvus-indexcoord:31000
+          image: milvusdb/milvus:v2.4.15
+          imagePullPolicy: IfNotPresent
+          livenessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /healthz
+              port: 9091
+              scheme: HTTP
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            successThreshold: 1
+            timeoutSeconds: 1
+          name: proxy
+          ports:
+            - containerPort: 19530
+              name: grpc
+              protocol: TCP
+            - containerPort: 9091
+              name: metrics
+              protocol: TCP
+          readinessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /healthz
+              port: 9091
+              scheme: HTTP
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 1
+          resources:
+            limits:
+              cpu: 500m
+              memory: 2Gi
+            requests:
+              cpu: 200m
+              memory: 1Gi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30

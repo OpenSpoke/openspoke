@@ -1,0 +1,594 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-frontend-code-dashboard-users
+  namespace: rag-company1
+data:
+  view_users.py: |
+    """Users view — Phase 2 統合ユーザー管理 UI.
+
+    Keycloak Admin API + OpenSearch user_acl を 1 つの UI で同期管理する。
+
+    - **ユーザー一覧**: Keycloak rag realm の users を取得し、 各 user の openspoke_admin
+      role 有無 と OpenSearch user_acl の allowed_clusters/modules を併せて表示。
+    - **新規追加**: 1 form で Keycloak user 作成 (firstname/lastname/email/初期パスワード)
+      + openspoke_admin role 付与 (任意) + OpenSearch user_acl 登録 を一括実行。
+    - **編集**: 各 user の expander 内で firstname/lastname/email/admin フラグ/パスワード
+      リセット/ACL を編集して 「保存」 で Keycloak + OpenSearch 両方を更新。
+    - **削除**: 「削除」 で Keycloak user 削除 + OpenSearch ACL 削除を同時実行。
+
+    Keycloak Admin API 接続情報は env vars 経由:
+      KEYCLOAK_URL, KEYCLOAK_REALM, KEYCLOAK_ADMIN_CLIENT_ID, KEYCLOAK_ADMIN_CLIENT_SECRET
+
+    admin 識別は oauth2-proxy が注入する X-Auth-Request-Email header を
+    `_ADMIN_EMAILS` リストと突き合わせる (Phase 2 で realm role ベースに移行予定)。
+    """
+    import datetime as _dt
+    import json
+    import os
+    import time
+    import streamlit as st
+    import requests
+
+    import kernel_api  # spoke 一覧の取得用に再利用
+
+    HUB_OS_URL = "http://opensearch.opensearch.svc.cluster.local:9200"
+    _USER_ACL_INDEX = "user_acl"
+
+    # Phase 2 でも frontend admin 判定は ハードコード のままとする (UI に到達する
+    # ためのゲート)。 MCP 側の admin 判定とは独立。 ここを変更すれば admin を増やせる。
+    # Customize this set with the Keycloak email(s) that should have
+    # admin access to the dashboard.
+    _ADMIN_EMAILS = {
+        "admin@example.com",
+    }
+
+    # Keycloak Admin API 接続情報 (env で注入)
+    KEYCLOAK_URL = os.environ.get("KEYCLOAK_URL", "https://keycloak.example.com")
+    KEYCLOAK_REALM = os.environ.get("KEYCLOAK_REALM", "rag")
+    KEYCLOAK_ADMIN_CLIENT_ID = os.environ.get(
+        "KEYCLOAK_ADMIN_CLIENT_ID", "openspoke-admin-api"
+    )
+    KEYCLOAK_ADMIN_CLIENT_SECRET = os.environ.get(
+        "KEYCLOAK_ADMIN_CLIENT_SECRET", ""
+    )
+
+    _ADMIN_ROLE_NAME = "openspoke_admin"
+
+    # ===== OpenSearch helpers (user_acl 用) =====
+
+    def _os_request(method, path, payload=None):
+        url = f"{HUB_OS_URL}{path}"
+        try:
+            resp = requests.request(
+                method, url,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=10,
+            )
+            return resp.status_code, (resp.json() if resp.text else {})
+        except Exception as e:
+            return 0, {"_error": str(e)}
+
+    def _ensure_acl_index():
+        status, _ = _os_request("HEAD", f"/{_USER_ACL_INDEX}")
+        if status == 200:
+            return
+        mapping = {
+            "mappings": {
+                "properties": {
+                    "username":         {"type": "keyword"},
+                    "display_name":     {"type": "keyword"},
+                    "email":            {"type": "keyword"},
+                    "allowed_clusters": {"type": "keyword"},
+                    "allowed_modules":  {"type": "keyword"},
+                    "created_at":       {"type": "date"},
+                    "updated_at":       {"type": "date"},
+                }
+            }
+        }
+        _os_request("PUT", f"/{_USER_ACL_INDEX}", mapping)
+
+    def _get_acl_doc(username):
+        """OpenSearch から ACL を取得。 無ければ空 dict を返す."""
+        status, body = _os_request("GET", f"/{_USER_ACL_INDEX}/_doc/{username}")
+        if status == 200:
+            return dict(body.get("_source", {}) or {})
+        return {}
+
+    def _put_acl_doc(username, doc):
+        existing = _get_acl_doc(username)
+        now = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        doc.setdefault("created_at", existing.get("created_at") or now)
+        doc["updated_at"] = now
+        doc["username"] = username
+        return _os_request(
+            "PUT",
+            f"/{_USER_ACL_INDEX}/_doc/{username}?refresh=true",
+            doc,
+        )
+
+    def _delete_acl_doc(username):
+        return _os_request(
+            "DELETE",
+            f"/{_USER_ACL_INDEX}/_doc/{username}?refresh=true",
+            None,
+        )
+
+    # ===== Keycloak Admin API client =====
+
+    class KeycloakAdminError(Exception):
+        def __init__(self, status, message):
+            super().__init__(f"Keycloak Admin API error {status}: {message}")
+            self.status = status
+            self.message = message
+
+    class KeycloakAdminAPI:
+        """Client Credentials grant で取得した access_token で Keycloak Admin API を叩く."""
+
+        def __init__(self):
+            self.base = KEYCLOAK_URL.rstrip("/")
+            self.realm = KEYCLOAK_REALM
+            self.client_id = KEYCLOAK_ADMIN_CLIENT_ID
+            self.client_secret = KEYCLOAK_ADMIN_CLIENT_SECRET
+            self._token = None
+            self._expires_at = 0.0
+
+        def _fetch_token(self):
+            url = f"{self.base}/realms/{self.realm}/protocol/openid-connect/token"
+            try:
+                resp = requests.post(
+                    url,
+                    data={
+                        "grant_type": "client_credentials",
+                        "client_id": self.client_id,
+                        "client_secret": self.client_secret,
+                    },
+                    timeout=10,
+                )
+            except Exception as e:
+                raise KeycloakAdminError(0, f"token request failed: {e}")
+            if resp.status_code != 200:
+                raise KeycloakAdminError(resp.status_code, resp.text)
+            body = resp.json()
+            self._token = body["access_token"]
+            self._expires_at = time.time() + body.get("expires_in", 60)
+
+        def _ensure_token(self):
+            if not self._token or time.time() >= self._expires_at - 30:
+                self._fetch_token()
+
+        def _admin_url(self, path):
+            return f"{self.base}/admin/realms/{self.realm}{path}"
+
+        def _request(self, method, path, **kwargs):
+            self._ensure_token()
+            headers = kwargs.pop("headers", {}) or {}
+            headers["Authorization"] = f"Bearer {self._token}"
+            try:
+                resp = requests.request(
+                    method,
+                    self._admin_url(path),
+                    headers=headers,
+                    timeout=10,
+                    **kwargs,
+                )
+            except Exception as e:
+                raise KeycloakAdminError(0, f"request failed: {e}")
+            return resp
+
+        def list_users(self, max_users=500):
+            resp = self._request("GET", f"/users?max={max_users}&briefRepresentation=false")
+            if resp.status_code != 200:
+                raise KeycloakAdminError(resp.status_code, resp.text)
+            return resp.json()
+
+        def get_user_by_username(self, username):
+            resp = self._request(
+                "GET",
+                f"/users?username={requests.utils.quote(username)}&exact=true",
+            )
+            if resp.status_code != 200:
+                raise KeycloakAdminError(resp.status_code, resp.text)
+            arr = resp.json()
+            return arr[0] if arr else None
+
+        def create_user(self, username, first_name, last_name, email, enabled=True):
+            payload = {
+                "username": username,
+                "firstName": first_name,
+                "lastName": last_name,
+                "email": email,
+                "enabled": enabled,
+                "emailVerified": True,
+            }
+            resp = self._request("POST", "/users", json=payload)
+            if resp.status_code == 409:
+                raise KeycloakAdminError(409, "User already exists")
+            if resp.status_code not in (201, 204):
+                raise KeycloakAdminError(resp.status_code, resp.text)
+            # Location header に新規 user ID
+            loc = resp.headers.get("Location", "")
+            user_id = loc.rsplit("/", 1)[-1] if loc else ""
+            if not user_id:
+                # 取り直し
+                u = self.get_user_by_username(username)
+                user_id = u["id"] if u else ""
+            return user_id
+
+        def update_user(self, user_id, first_name=None, last_name=None, email=None, enabled=None):
+            payload = {}
+            if first_name is not None:
+                payload["firstName"] = first_name
+            if last_name is not None:
+                payload["lastName"] = last_name
+            if email is not None:
+                payload["email"] = email
+            if enabled is not None:
+                payload["enabled"] = enabled
+            if not payload:
+                return
+            resp = self._request("PUT", f"/users/{user_id}", json=payload)
+            if resp.status_code not in (200, 204):
+                raise KeycloakAdminError(resp.status_code, resp.text)
+
+        def delete_user(self, user_id):
+            resp = self._request("DELETE", f"/users/{user_id}")
+            if resp.status_code not in (200, 204):
+                raise KeycloakAdminError(resp.status_code, resp.text)
+
+        def reset_password(self, user_id, password, temporary=False):
+            payload = {
+                "type": "password",
+                "value": password,
+                "temporary": bool(temporary),
+            }
+            resp = self._request(
+                "PUT", f"/users/{user_id}/reset-password", json=payload
+            )
+            if resp.status_code not in (200, 204):
+                raise KeycloakAdminError(resp.status_code, resp.text)
+
+        def get_realm_role(self, role_name):
+            resp = self._request("GET", f"/roles/{role_name}")
+            if resp.status_code == 404:
+                return None
+            if resp.status_code != 200:
+                raise KeycloakAdminError(resp.status_code, resp.text)
+            return resp.json()
+
+        def get_user_realm_roles(self, user_id):
+            resp = self._request("GET", f"/users/{user_id}/role-mappings/realm")
+            if resp.status_code != 200:
+                raise KeycloakAdminError(resp.status_code, resp.text)
+            return resp.json()
+
+        def assign_realm_role(self, user_id, role_obj):
+            resp = self._request(
+                "POST", f"/users/{user_id}/role-mappings/realm", json=[role_obj]
+            )
+            if resp.status_code not in (200, 204):
+                raise KeycloakAdminError(resp.status_code, resp.text)
+
+        def remove_realm_role(self, user_id, role_obj):
+            resp = self._request(
+                "DELETE", f"/users/{user_id}/role-mappings/realm", json=[role_obj]
+            )
+            if resp.status_code not in (200, 204):
+                raise KeycloakAdminError(resp.status_code, resp.text)
+
+    # ===== Identity (admin gate) =====
+
+    def _all_headers():
+        try:
+            return dict(st.context.headers)
+        except Exception:
+            return {}
+
+    def _header_get(*names):
+        headers = _all_headers()
+        lower_map = {k.lower(): v for k, v in headers.items()}
+        for n in names:
+            v = lower_map.get(n.lower(), "") or ""
+            if v:
+                return v
+        return ""
+
+    def _current_email():
+        return _header_get(
+            "X-Auth-Request-Email",
+            "X-Forwarded-Email",
+            "X-Auth-Email",
+        ).lower()
+
+    def _current_user_name():
+        # oauth2-proxy の X-Forwarded-User は Keycloak sub UUID なので
+        # preferred-username 系を必ず優先する.
+        return _header_get(
+            "X-Forwarded-Preferred-Username",
+            "X-Auth-Request-Preferred-Username",
+            "X-Forwarded-Email",
+            "X-Auth-Request-Email",
+            "X-Forwarded-User",
+            "X-Auth-Request-User",
+            "X-Auth-User",
+        )
+
+    def _is_admin():
+        return _current_email() in _ADMIN_EMAILS
+
+    # ===== Form helpers =====
+
+    def _parse_list(raw):
+        if not raw:
+            return []
+        raw = raw.strip()
+        if raw == "*":
+            return ["*"]
+        parts = []
+        for line in raw.replace(",", "\n").split("\n"):
+            v = line.strip()
+            if v:
+                parts.append(v)
+        return parts
+
+    def _format_list_for_textarea(value):
+        if not value:
+            return ""
+        if isinstance(value, str):
+            return value
+        return "\n".join(str(v) for v in value)
+
+    # ===== Sync helpers =====
+
+    def _user_is_admin(kc, user_id):
+        try:
+            roles = kc.get_user_realm_roles(user_id)
+        except KeycloakAdminError:
+            return False
+        return any(r.get("name") == _ADMIN_ROLE_NAME for r in roles)
+
+    def _set_user_admin(kc, user_id, want_admin, current_admin):
+        if want_admin == current_admin:
+            return
+        role = kc.get_realm_role(_ADMIN_ROLE_NAME)
+        if not role:
+            raise KeycloakAdminError(
+                404, f"realm role '{_ADMIN_ROLE_NAME}' が rag realm に存在しません"
+            )
+        role_obj = {"id": role["id"], "name": role["name"]}
+        if want_admin:
+            kc.assign_realm_role(user_id, role_obj)
+        else:
+            kc.remove_realm_role(user_id, role_obj)
+
+    # ===== Main render =====
+
+    def render():
+        st.title("Users (Keycloak + user_acl 統合管理)")
+
+        me_email = _current_email()
+        me_user = _current_user_name()
+        st.caption(
+            f"あなた: {me_user or '(unknown)'} "
+            f"<{me_email or '(no email header)'}>"
+        )
+
+        if not _is_admin():
+            st.error(
+                "このページは admin (`openspoke_admin` 相当) 専用です。"
+                f" 現在のユーザー `{me_email or '(unknown)'}` には権限がありません。"
+            )
+            with st.expander("Debug: 受け取った HTTP ヘッダ一覧", expanded=False):
+                headers = _all_headers()
+                if headers:
+                    st.json({k: v for k, v in headers.items()})
+                else:
+                    st.warning(
+                        "st.context.headers が空です (Streamlit のバージョンが古い、 "
+                        "または HTTP ヘッダにアクセスできない接続経路)。"
+                    )
+            return
+
+        if not KEYCLOAK_ADMIN_CLIENT_SECRET:
+            st.error(
+                "KEYCLOAK_ADMIN_CLIENT_SECRET env が未設定です。"
+                " rag-frontend Deployment と keycloak-admin-api-secret を確認してください。"
+            )
+            return
+
+        _ensure_acl_index()
+        kc = KeycloakAdminAPI()
+
+        # 接続確認 (token 取得)
+        try:
+            kc._ensure_token()
+        except KeycloakAdminError as e:
+            st.error(
+                f"Keycloak Admin API に接続できません: {e.message}"
+                f"  client_id={KEYCLOAK_ADMIN_CLIENT_ID} realm={KEYCLOAK_REALM}"
+            )
+            return
+
+        # スポーククラスタ一覧 (cluster 選択肢参考)
+        if kernel_api.hub_healthy():
+            spokes = kernel_api.list_spokes()
+        else:
+            spokes = []
+        cluster_options = sorted([
+            s.get("cluster_name") or s.get("_id")
+            for s in spokes
+        ])
+
+        # === ユーザー一覧 ===
+        try:
+            kc_users = kc.list_users()
+        except KeycloakAdminError as e:
+            st.error(f"ユーザー一覧取得失敗: {e.message}")
+            return
+
+        st.subheader(f"Keycloak rag realm のユーザー ({len(kc_users)} 名)")
+        st.caption(
+            "各ユーザーの allowed_clusters / allowed_modules は OpenSearch user_acl から"
+            " 取得しています。 未登録は空。 admin (openspoke_admin role) は ACL を無視して全許可。"
+        )
+
+        for u in kc_users:
+            uid = u.get("id")
+            username = u.get("username", "(no username)")
+            first = u.get("firstName", "") or ""
+            last = u.get("lastName", "") or ""
+            email = u.get("email", "") or ""
+            full_name = f"{last} {first}".strip() or "(name unset)"
+            is_admin_now = _user_is_admin(kc, uid)
+            admin_badge = "  🛡 admin" if is_admin_now else ""
+            acl_doc = _get_acl_doc(username)
+
+            with st.expander(
+                f"{full_name}  ({username}){admin_badge}",
+                expanded=False,
+            ):
+                with st.form(f"edit_{uid}"):
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        new_last = st.text_input(
+                            "苗字 (Last name)", value=last, key=f"ln_{uid}"
+                        )
+                    with c2:
+                        new_first = st.text_input(
+                            "名前 (First name)", value=first, key=f"fn_{uid}"
+                        )
+                    new_email = st.text_input("Email", value=email, key=f"em_{uid}")
+                    new_is_admin = st.checkbox(
+                        "Admin (openspoke_admin role を付与)",
+                        value=is_admin_now,
+                        key=f"adm_{uid}",
+                    )
+
+                    st.markdown("**パスワード変更** (空欄なら変更しない):")
+                    new_pw = st.text_input(
+                        "新パスワード", value="", type="password", key=f"pw_{uid}"
+                    )
+                    pw_temp = st.checkbox(
+                        "Temporary (次回ログイン時に変更を強制)",
+                        value=False,
+                        key=f"pwtmp_{uid}",
+                    )
+
+                    st.markdown("**ACL (admin の場合は無視されます):**")
+                    new_clusters = st.text_area(
+                        "allowed_clusters (1 行 1 つ、 `*` で全許可)",
+                        value=_format_list_for_textarea(acl_doc.get("allowed_clusters")),
+                        height=100,
+                        key=f"cl_{uid}",
+                    )
+                    new_modules = st.text_area(
+                        "allowed_modules (1 行 1 つ、 `Category/Module` 形式、 `*` で全許可)",
+                        value=_format_list_for_textarea(acl_doc.get("allowed_modules")),
+                        height=100,
+                        key=f"mo_{uid}",
+                    )
+                    if cluster_options:
+                        st.caption(
+                            "登録済みクラスタ参考: " + ", ".join(cluster_options)
+                        )
+
+                    bc1, bc2 = st.columns([1, 1])
+                    with bc1:
+                        do_save = st.form_submit_button("保存")
+                    with bc2:
+                        do_delete = st.form_submit_button(
+                            "削除", type="secondary"
+                        )
+
+                    if do_save:
+                        try:
+                            kc.update_user(
+                                uid,
+                                first_name=new_first,
+                                last_name=new_last,
+                                email=new_email,
+                            )
+                            if new_pw:
+                                kc.reset_password(uid, new_pw, temporary=pw_temp)
+                            _set_user_admin(kc, uid, new_is_admin, is_admin_now)
+                            _put_acl_doc(username, {
+                                "display_name": f"{new_last} {new_first}".strip(),
+                                "email": new_email,
+                                "allowed_clusters": _parse_list(new_clusters),
+                                "allowed_modules":  _parse_list(new_modules),
+                            })
+                            st.success(f"{username} を更新しました.")
+                            st.rerun()
+                        except KeycloakAdminError as e:
+                            st.error(f"更新失敗: {e.message}")
+                    if do_delete:
+                        try:
+                            kc.delete_user(uid)
+                            _delete_acl_doc(username)
+                            st.success(f"{username} を削除しました.")
+                            st.rerun()
+                        except KeycloakAdminError as e:
+                            st.error(f"削除失敗: {e.message}")
+
+        # === 新規追加 ===
+        st.markdown("---")
+        st.subheader("新規ユーザー追加")
+        with st.form("new_user"):
+            c1, c2 = st.columns(2)
+            with c1:
+                n_last = st.text_input("苗字 (Last name)")
+            with c2:
+                n_first = st.text_input("名前 (First name)")
+            n_email = st.text_input("Email (例: tanaka@example.com)")
+            n_username = st.text_input(
+                "Username (Keycloak preferred_username。 空なら Email を使用)"
+            )
+            n_pw = st.text_input("初期パスワード", type="password")
+            n_pw_temp = st.checkbox(
+                "Temporary (次回ログイン時に変更を強制)", value=True
+            )
+            n_is_admin = st.checkbox(
+                "Admin (openspoke_admin role を付与)", value=False
+            )
+            n_clusters = st.text_area(
+                "allowed_clusters (1 行 1 つ、 `*` で全許可)", height=100
+            )
+            n_modules = st.text_area(
+                "allowed_modules (1 行 1 つ、 `Category/Module` 形式、 `*` で全許可)",
+                height=100,
+            )
+            if cluster_options:
+                st.caption(
+                    "登録済みクラスタ参考: " + ", ".join(cluster_options)
+                )
+            do_create = st.form_submit_button("追加")
+            if do_create:
+                username = (n_username or n_email).strip()
+                if not username:
+                    st.error("Username (または Email) は必須です.")
+                elif not n_email:
+                    st.error("Email は必須です.")
+                elif not n_pw:
+                    st.error("初期パスワードは必須です.")
+                else:
+                    try:
+                        uid = kc.create_user(
+                            username=username,
+                            first_name=n_first,
+                            last_name=n_last,
+                            email=n_email,
+                        )
+                        kc.reset_password(uid, n_pw, temporary=n_pw_temp)
+                        if n_is_admin:
+                            _set_user_admin(kc, uid, True, False)
+                        _put_acl_doc(username, {
+                            "display_name": f"{n_last} {n_first}".strip(),
+                            "email": n_email,
+                            "allowed_clusters": _parse_list(n_clusters),
+                            "allowed_modules":  _parse_list(n_modules),
+                        })
+                        st.success(f"{username} を追加しました.")
+                        st.rerun()
+                    except KeycloakAdminError as e:
+                        st.error(f"追加失敗: {e.message}")

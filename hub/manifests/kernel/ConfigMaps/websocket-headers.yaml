@@ -1,0 +1,8 @@
+apiVersion: v1
+data:
+  Connection: upgrade
+  Upgrade: $http_upgrade
+kind: ConfigMap
+metadata:
+  name: websocket-headers
+  namespace: rag-company1

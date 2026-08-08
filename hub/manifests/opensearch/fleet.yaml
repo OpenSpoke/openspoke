@@ -1,0 +1,4 @@
+helm:
+  takeOwnership: true
+  atomic: false
+  timeoutSeconds: 900

@@ -1,0 +1,23 @@
+# Example Fleet GitRepo that fans out the spoke MCP server to all
+# clusters labeled as spokes.
+#
+# The same GitRepo Bundle is distributed to every cluster matching the
+# selector below, so a single GitRepo definition handles N spoke clusters.
+apiVersion: fleet.cattle.io/v1alpha1
+kind: GitRepo
+metadata:
+  name: spoke-mcp
+  namespace: fleet-default
+spec:
+  repo: https://github.com/OpenSpoke/openspoke.git
+  branch: main
+  # clientSecretName: fleet-git-credentials  # for private forks
+  paths:
+    - spoke/kubernetes/template/mcp
+  pollingInterval: 1m0s
+  keepResources: true
+  targets:
+    - name: all-spokes
+      clusterSelector:
+        matchLabels:
+          role: spoke

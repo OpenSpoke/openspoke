@@ -1,0 +1,190 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-backend-kernel-kintone-common
+  namespace: rag-company1
+data:
+  kintone_common.py: |
+    """kintone 接続の共通モジュール。
+
+    各 kintone カテゴリのルータ (kintone_records / kintone_app / ...) から
+    import される共通基盤:
+      - サブドメイン / トークン解決 (env 経由)
+      - HTTP リクエストラッパ (_request)
+      - kintone エラーの正規化 (ok / status_code / data / error)
+
+    環境変数:
+      KINTONE_SUBDOMAIN     : kintone サブドメイン (例 "yourcompany")
+      KINTONE_DOMAIN_SUFFIX : ホスト suffix (".cybozu.com" / ".kintone.com" 既定 ".cybozu.com")
+      KINTONE_TOKENS_JSON   : {"<app_id>": "<token>" or ["<t1>","<t2>"]} 形式の JSON
+
+    認証は app_id 単位の API トークン。 複数トークン合成 (read + write 等) は
+    list で渡し、 kintone 仕様の通り X-Cybozu-API-Token に "," 区切りで結合する。
+
+    全関数は examples/opensearch_migrate.py と同じく
+    返り値を {"ok": bool, "status_code": int, "data": dict|None, "error": str|None}
+    に正規化する。 ルータ側はそのまま透過すればよい。
+    """
+    import os
+    import json
+    import logging
+    import httpx
+
+    logger = logging.getLogger("kintone_common")
+
+    _SUBDOMAIN     = os.environ.get("KINTONE_SUBDOMAIN", "")
+    _DOMAIN_SUFFIX = os.environ.get("KINTONE_DOMAIN_SUFFIX", ".cybozu.com")
+    _TOKENS_RAW    = os.environ.get("KINTONE_TOKENS_JSON", "{}")
+
+    try:
+        _TOKENS = json.loads(_TOKENS_RAW)
+        if not isinstance(_TOKENS, dict):
+            logger.warning("[KINTONE] KINTONE_TOKENS_JSON is not a JSON object; ignoring")
+            _TOKENS = {}
+    except Exception as e:
+        logger.warning(f"[KINTONE] failed to parse KINTONE_TOKENS_JSON: {e}")
+        _TOKENS = {}
+
+
+    def _err(status, msg):
+        return {"ok": False, "status_code": status, "data": None, "error": msg}
+
+
+    def base_url():
+        """kintone のベース URL を返す。 サブドメイン未設定なら None。"""
+        if not _SUBDOMAIN:
+            return None
+        return f"https://{_SUBDOMAIN}{_DOMAIN_SUFFIX}"
+
+
+    def resolve_token(app_id):
+        """app_id に紐づく API トークンを解決する。
+
+        Returns: (token_str, None) on success、 (None, error_msg) on failure。
+        トークン値が list の場合は "," 区切りで結合する (kintone 仕様)。
+        """
+        if app_id is None:
+            return None, "app_id is required"
+        key = str(app_id)
+        val = _TOKENS.get(key)
+        if val is None:
+            return None, f"no API token registered for app_id={key}"
+        if isinstance(val, list):
+            if not val:
+                return None, f"empty token list for app_id={key}"
+            return ",".join(str(t) for t in val), None
+        return str(val), None
+
+
+    def headers_for(app_id, content_type="application/json"):
+        """kintone リクエスト用ヘッダを組み立てる。
+
+        Returns: (headers_dict, None) on success、 (None, error_msg) on failure。
+        """
+        token, err = resolve_token(app_id)
+        if err:
+            return None, err
+        h = {"X-Cybozu-API-Token": token}
+        if content_type:
+            h["Content-Type"] = content_type
+        return h, None
+
+
+    async def request(method, path, app_id,
+                      params=None, body=None, timeout=30.0,
+                      files=None, extra_headers=None):
+        """kintone REST API への共通呼び出しラッパ。
+
+        Args:
+            method:        HTTP method ("GET" / "POST" / "PUT" / "DELETE")
+            path:          "/k/v1/record.json" 等の path
+            app_id:        トークン解決に使う app_id (必須)
+            params:        query parameters (dict)
+            body:          JSON body (dict)
+            timeout:       秒
+            files:         multipart 用 (kintone_files のみが使う)
+            extra_headers: 追加ヘッダ (multipart 等で Content-Type を変えたいとき)
+
+        Returns:
+            {"ok": bool, "status_code": int, "data": dict|None, "error": str|None}
+        """
+        url_base = base_url()
+        if not url_base:
+            return _err(503, "KINTONE_SUBDOMAIN not configured")
+
+        # files が指定されたら Content-Type は httpx に任せる (multipart boundary)
+        ct = None if files is not None else "application/json"
+        hdrs, err = headers_for(app_id, content_type=ct)
+        if err:
+            return _err(503, err)
+        if extra_headers:
+            hdrs.update(extra_headers)
+
+        url = f"{url_base}{path}"
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as c:
+                kwargs = {"headers": hdrs}
+                if params is not None:
+                    kwargs["params"] = params
+                if files is not None:
+                    kwargs["files"] = files
+                elif body is not None:
+                    # kintone は DELETE でも body を受ける (records 削除など)
+                    kwargs["json"] = body
+                r = await c.request(method.upper(), url, **kwargs)
+        except Exception as e:
+            logger.error(f"[KINTONE] {method} {path} transport error: {e}", exc_info=True)
+            return _err(0, f"{type(e).__name__}: {str(e)[:200]}")
+
+        # kintone は基本 JSON を返すが、 ファイル DL は bytes
+        ctype = r.headers.get("content-type", "")
+        if "application/json" in ctype:
+            try:
+                data = r.json()
+            except Exception:
+                data = {"raw": r.text[:500]}
+        else:
+            # バイナリは呼び出し側で r.content を直接欲しい場合のために
+            # data には base64 を入れない (大きすぎる) ; flag だけ返す。
+            data = {"_binary": True, "content_type": ctype, "size": len(r.content)}
+
+        if r.status_code >= 400:
+            msg = None
+            if isinstance(data, dict):
+                msg = data.get("message") or data.get("error")
+            return {"ok": False, "status_code": r.status_code, "data": data,
+                    "error": msg or f"HTTP {r.status_code}"}
+        return {"ok": True, "status_code": r.status_code, "data": data, "error": None}
+
+
+    async def request_bytes(method, path, app_id, params=None, timeout=60.0):
+        """バイナリレスポンスを生で返す版 (file download 用)。
+
+        Returns:
+            {"ok": bool, "status_code": int, "content": bytes|None,
+             "content_type": str, "error": str|None}
+        """
+        url_base = base_url()
+        if not url_base:
+            return {"ok": False, "status_code": 503, "content": None,
+                    "content_type": "", "error": "KINTONE_SUBDOMAIN not configured"}
+        hdrs, err = headers_for(app_id, content_type=None)
+        if err:
+            return {"ok": False, "status_code": 503, "content": None,
+                    "content_type": "", "error": err}
+        url = f"{url_base}{path}"
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as c:
+                kwargs = {"headers": hdrs}
+                if params is not None:
+                    kwargs["params"] = params
+                r = await c.request(method.upper(), url, **kwargs)
+        except Exception as e:
+            return {"ok": False, "status_code": 0, "content": None,
+                    "content_type": "", "error": f"{type(e).__name__}: {str(e)[:200]}"}
+        if r.status_code >= 400:
+            return {"ok": False, "status_code": r.status_code, "content": None,
+                    "content_type": r.headers.get("content-type", ""),
+                    "error": f"HTTP {r.status_code}: {r.text[:200]}"}
+        return {"ok": True, "status_code": r.status_code, "content": r.content,
+                "content_type": r.headers.get("content-type", ""), "error": None}

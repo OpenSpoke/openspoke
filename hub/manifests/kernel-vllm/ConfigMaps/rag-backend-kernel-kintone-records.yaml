@@ -1,0 +1,228 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-backend-kernel-kintone-records
+  namespace: rag-company1
+data:
+  kintone_records.py: |
+    """kintone レコード CRUD (/core/kintone/records/*).
+
+    エンドポイント:
+      POST /core/kintone/records/get_one      : 1 レコード取得
+      POST /core/kintone/records/search       : クエリ検索 (records.json)
+      POST /core/kintone/records/create       : 1 レコード作成
+      POST /core/kintone/records/bulk_create  : 複数作成 (max 100)
+      POST /core/kintone/records/update       : 1 レコード更新
+      POST /core/kintone/records/bulk_update  : 複数更新 (max 100)
+      POST /core/kintone/records/delete       : 複数削除 (max 100)
+
+    全 endpoint は kintone_common.request() を透過するだけで、
+    返り値は {"ok", "status_code", "data", "error"} 形式。
+    body の "app" がトークン解決のキーになる。
+    """
+    import logging
+    from fastapi import APIRouter
+
+    import kintone_common as _kc
+
+    logger = logging.getLogger("kintone_records")
+    router = APIRouter()
+
+    _KINTONE_MAX_BULK = 100  # kintone API の records.json 上限
+
+
+    @router.post("/core/kintone/records/get_one")
+    async def kintone_records_get_one(request: dict):
+        """1 レコード取得 (GET /k/v1/record.json).
+
+        Body:
+            {"app": <int>, "id": <int>}
+        Returns:
+            kintone レスポンス: {"record": {...}}
+        """
+        app = request.get("app")
+        record_id = request.get("id")
+        if app is None or record_id is None:
+            return {"ok": False, "status_code": 0, "data": None,
+                    "error": "app and id are required"}
+        return await _kc.request(
+            "GET", "/k/v1/record.json", app,
+            params={"app": app, "id": record_id},
+        )
+
+
+    @router.post("/core/kintone/records/search")
+    async def kintone_records_search(request: dict):
+        """レコード検索 (GET /k/v1/records.json).
+
+        Body:
+            {
+              "app":        <int>,
+              "query":      "<kintone クエリ式>",   # 任意 (limit/offset/order 含む)
+              "fields":     ["fieldCode1", ...],     # 任意 (省略時は全フィールド)
+              "totalCount": true | false             # 任意
+            }
+        Returns:
+            kintone レスポンス: {"records": [...], "totalCount": "<str>"}
+        """
+        app = request.get("app")
+        if app is None:
+            return {"ok": False, "status_code": 0, "data": None,
+                    "error": "app is required"}
+        params = {"app": app}
+        if request.get("query") is not None:
+            params["query"] = request["query"]
+        fields = request.get("fields") or []
+        # kintone は同名 fields パラメータの繰り返し。 httpx は dict なら 1 件のみ
+        # 受けるため、 [(k,v),...] のリストで渡す必要がある。
+        if fields:
+            param_list = [(k, v) for k, v in params.items()]
+            for f in fields:
+                param_list.append(("fields", f))
+            if request.get("totalCount"):
+                param_list.append(("totalCount", "true"))
+            return await _kc.request(
+                "GET", "/k/v1/records.json", app, params=param_list,
+            )
+        if request.get("totalCount"):
+            params["totalCount"] = "true"
+        return await _kc.request(
+            "GET", "/k/v1/records.json", app, params=params,
+        )
+
+
+    @router.post("/core/kintone/records/create")
+    async def kintone_records_create(request: dict):
+        """1 レコード作成 (POST /k/v1/record.json).
+
+        Body:
+            {"app": <int>, "record": {"<fieldCode>": {"value": ...}, ...}}
+        Returns:
+            kintone レスポンス: {"id": "<str>", "revision": "<str>"}
+        """
+        app = request.get("app")
+        record = request.get("record")
+        if app is None or record is None:
+            return {"ok": False, "status_code": 0, "data": None,
+                    "error": "app and record are required"}
+        return await _kc.request(
+            "POST", "/k/v1/record.json", app,
+            body={"app": app, "record": record},
+        )
+
+
+    @router.post("/core/kintone/records/bulk_create")
+    async def kintone_records_bulk_create(request: dict):
+        """複数レコード作成 (POST /k/v1/records.json, max 100).
+
+        Body:
+            {"app": <int>, "records": [{"<field>": {...}}, ...]}
+        Returns:
+            {"ids": ["<str>"...], "revisions": ["<str>"...]}
+        """
+        app = request.get("app")
+        records = request.get("records")
+        if app is None or not isinstance(records, list):
+            return {"ok": False, "status_code": 0, "data": None,
+                    "error": "app and records (list) are required"}
+        if not records:
+            return {"ok": False, "status_code": 0, "data": None,
+                    "error": "records is empty"}
+        if len(records) > _KINTONE_MAX_BULK:
+            return {"ok": False, "status_code": 0, "data": None,
+                    "error": f"records exceeds kintone limit ({_KINTONE_MAX_BULK})"}
+        return await _kc.request(
+            "POST", "/k/v1/records.json", app,
+            body={"app": app, "records": records},
+        )
+
+
+    @router.post("/core/kintone/records/update")
+    async def kintone_records_update(request: dict):
+        """1 レコード更新 (PUT /k/v1/record.json).
+
+        Body:
+            {
+              "app":       <int>,
+              "id":        <int>,                       # id か updateKey のどちらか
+              "updateKey": {"field": "...", "value": "..."},
+              "record":    {"<fieldCode>": {"value": ...}, ...},
+              "revision":  <int>                        # 任意 (楽観ロック)
+            }
+        Returns:
+            {"revision": "<str>"}
+        """
+        app = request.get("app")
+        record = request.get("record")
+        if app is None:
+            return {"ok": False, "status_code": 0, "data": None,
+                    "error": "app is required"}
+        if record is None:
+            return {"ok": False, "status_code": 0, "data": None,
+                    "error": "record is required"}
+        body = {"app": app, "record": record}
+        if request.get("id") is not None:
+            body["id"] = request["id"]
+        elif request.get("updateKey") is not None:
+            body["updateKey"] = request["updateKey"]
+        else:
+            return {"ok": False, "status_code": 0, "data": None,
+                    "error": "id or updateKey is required"}
+        if request.get("revision") is not None:
+            body["revision"] = request["revision"]
+        return await _kc.request(
+            "PUT", "/k/v1/record.json", app, body=body,
+        )
+
+
+    @router.post("/core/kintone/records/bulk_update")
+    async def kintone_records_bulk_update(request: dict):
+        """複数レコード更新 (PUT /k/v1/records.json, max 100).
+
+        Body:
+            {"app": <int>, "records": [{"id":..., "record":..., "revision":...}, ...]}
+            または updateKey を使う場合は {"updateKey":..., "record":..., "revision":...}
+        Returns:
+            {"records": [{"id":..., "revision":...}, ...]}
+        """
+        app = request.get("app")
+        records = request.get("records")
+        if app is None or not isinstance(records, list):
+            return {"ok": False, "status_code": 0, "data": None,
+                    "error": "app and records (list) are required"}
+        if not records:
+            return {"ok": False, "status_code": 0, "data": None,
+                    "error": "records is empty"}
+        if len(records) > _KINTONE_MAX_BULK:
+            return {"ok": False, "status_code": 0, "data": None,
+                    "error": f"records exceeds kintone limit ({_KINTONE_MAX_BULK})"}
+        return await _kc.request(
+            "PUT", "/k/v1/records.json", app,
+            body={"app": app, "records": records},
+        )
+
+
+    @router.post("/core/kintone/records/delete")
+    async def kintone_records_delete(request: dict):
+        """複数レコード削除 (DELETE /k/v1/records.json, max 100).
+
+        Body:
+            {"app": <int>, "ids": [<int>...], "revisions": [<int>...] (任意)}
+        Returns:
+            {} (kintone は削除成功時は空オブジェクトを返す)
+        """
+        app = request.get("app")
+        ids = request.get("ids")
+        if app is None or not isinstance(ids, list) or not ids:
+            return {"ok": False, "status_code": 0, "data": None,
+                    "error": "app and ids (non-empty list) are required"}
+        if len(ids) > _KINTONE_MAX_BULK:
+            return {"ok": False, "status_code": 0, "data": None,
+                    "error": f"ids exceeds kintone limit ({_KINTONE_MAX_BULK})"}
+        body = {"app": app, "ids": ids}
+        revisions = request.get("revisions")
+        if isinstance(revisions, list) and revisions:
+            body["revisions"] = revisions
+        return await _kc.request(
+            "DELETE", "/k/v1/records.json", app, body=body,
+        )

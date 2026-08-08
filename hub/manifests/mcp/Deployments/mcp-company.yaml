@@ -1,0 +1,163 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-company1
+  namespace: mcp
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: mcp-company1
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: mcp-company1
+      namespace: mcp
+      annotations:
+        restarted-at: "2026-07-03T00:03:45Z"
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: rag-type
+                    operator: In
+                    values:
+                      - milvus
+      containers:
+        - env:
+            - name: TENANT_NAME
+              value: company1
+            - name: RAG_BACKEND_URL
+              value: http://rag-backend.rag-company1.svc.cluster.local:8000
+            - name: KERNEL_URL
+              value: http://rag-backend-kernel.rag-company1.svc.cluster.local:8000
+            - name: MCP_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: api-key
+                  name: mcp-api-key
+            - name: MCP_AUTH_ENABLED
+              value: 'true'
+            - name: KEYCLOAK_URL
+              value: https://keycloak.example.com
+            - name: KEYCLOAK_REALM
+              value: rag
+            - name: KEYCLOAK_CLIENT_ID
+              value: mcp-server
+            - name: KEYCLOAK_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  key: client-secret
+                  name: keycloak-client-secret
+            - name: MCP_OAUTH_ENABLED
+              value: 'true'
+            - name: BOOTSTRAP_ADMINS
+              # Phase 1 user_acl bootstrap: comma-separated list of Keycloak
+              # preferred_username values granted the openspoke_admin role
+              # until the JWT claim path is verified end-to-end. Customize
+              # for your deployment (e.g., "admin,admin@example.com").
+              value: 'admin'
+            - name: KEYCLOAK_INTERNAL_URL
+              value: https://keycloak.example.com
+            - name: KNOWLEDGE_MIGRATE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: knowledge-migrate-token
+                  key: token
+                  optional: true
+          image: rag-mcp-server:latest
+          imagePullPolicy: IfNotPresent
+          name: mcp-server
+          ports:
+            - containerPort: 8000
+              name: 8000tcp
+              protocol: TCP
+          readinessProbe:
+            failureThreshold: 3
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            successThreshold: 1
+            tcpSocket:
+              port: 8000
+            timeoutSeconds: 1
+          resources:
+            limits:
+              cpu: 500m
+              memory: 256Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+            - mountPath: /app/mcp_server.py
+              name: code
+              subPath: mcp_server.py
+            - mountPath: /app/github_tools.py
+              name: github-tools
+              subPath: github_tools.py
+            - mountPath: /app/github_checkpoint.py
+              name: github-checkpoint
+              subPath: github_checkpoint.py
+            - mountPath: /app/github_outline.py
+              name: github-outline
+              subPath: github_outline.py
+            - mountPath: /app/hub_tools.py
+              name: hub-tools
+              subPath: hub_tools.py
+            - mountPath: /app/knowledge_migrate_tool.py
+              name: knowledge-migrate
+              subPath: knowledge_migrate_tool.py
+            - mountPath: /app/opensearch_migrate_tool.py
+              name: opensearch-migrate
+              subPath: opensearch_migrate_tool.py
+            - mountPath: /app/memgraph_migrate_tool.py
+              name: memgraph-migrate
+              subPath: memgraph_migrate_tool.py
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
+      volumes:
+        - configMap:
+            defaultMode: 420
+            name: mcp-server-code
+          name: code
+        - configMap:
+            defaultMode: 420
+            name: mcp-github-tools
+          name: github-tools
+        - configMap:
+            defaultMode: 420
+            name: mcp-github-checkpoint
+          name: github-checkpoint
+        - configMap:
+            defaultMode: 420
+            name: mcp-github-outline
+          name: github-outline
+        - configMap:
+            defaultMode: 420
+            name: mcp-hub-tools
+          name: hub-tools
+        - configMap:
+            defaultMode: 420
+            name: mcp-knowledge-migrate
+          name: knowledge-migrate
+        - configMap:
+            defaultMode: 420
+            name: mcp-opensearch-migrate
+          name: opensearch-migrate
+        - configMap:
+            defaultMode: 420
+            name: mcp-memgraph-migrate
+          name: memgraph-migrate

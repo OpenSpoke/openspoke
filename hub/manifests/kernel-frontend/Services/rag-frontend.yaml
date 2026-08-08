@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: rag-frontend
+  namespace: rag-company1
+spec:
+  externalTrafficPolicy: Cluster
+  internalTrafficPolicy: Cluster
+  ipFamilies:
+    - IPv4
+  ipFamilyPolicy: SingleStack
+  ports:
+    - nodePort: 30852
+      port: 8501
+      protocol: TCP
+      targetPort: 8501
+  selector:
+    app: rag-frontend
+  sessionAffinity: None
+  type: NodePort

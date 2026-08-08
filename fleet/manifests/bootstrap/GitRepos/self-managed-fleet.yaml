@@ -1,0 +1,23 @@
+apiVersion: fleet.cattle.io/v1alpha1
+kind: GitRepo
+metadata:
+  name: self-managed-fleet
+  # fleet-local namespace は fleet-controller が立ち上がった時に
+  # 自動作成される。 ここに置いた GitRepo は「自クラスタ (= fleet-cluster
+  # 自身)」を target にできる。
+  namespace: fleet-local
+spec:
+  repo: https://github.com/your-org/your-repo.git
+  branch: main
+  paths:
+    - OpenSpoke/Core/fleet/manifests/managed
+  # private repo なので PAT を持つ Secret を参照する。
+  # bootstrap/Secrets/fleet-git-credentials.yaml で定義。
+  clientSecretName: fleet-git-credentials
+  # 自クラスタ (fleet-local workspace の local cluster) を target にする。
+  targets:
+    - clusterName: local
+  # 万が一 GitRepo が削除されても downstream リソース (= managed/ 配下で
+  # 作られた fleet-ui, cloudflared, GitRepo 群等) は消さない。 standalone
+  # Fleet 自身の継続稼働を守るための安全装置。
+  keepResources: true

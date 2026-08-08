@@ -1,0 +1,2988 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcp-hub-tools
+  namespace: mcp
+data:
+  hub_tools.py: |
+    # -*- coding: utf-8 -*-
+    """
+    hub_tools.py — 中央ハブ MCP のスポーク・ファンアウト層
+
+    役割:
+      この MCP サーバーは常時「中央ハブ」として動作する。
+      単一コネクター (Claude が繋ぐのはこのハブ 1 つだけ) の背後で、
+      cluster 引数により各スポーク MCP (mcp-spoke-NNNN) へ
+      MCP プロトコル (SSE) で呼び出しを中継 (ファンアウト) する。
+
+      スポークが増えたら OpenSearch index=spoke_clusters に 1 ドキュメント
+      投入するだけで対応範囲が広がる (モード切替なし・常時ハブ)。
+
+    設計:
+      - 状態を持たない (スポークレジストリは OpenSearch index=spoke_clusters)。
+      - スポーク MCP は Keycloak OAuth 保護 + API Key。
+        ハブ→スポークは MCP_API_KEY (X-API-Key ヘッダ) で認証する
+        (サーバー間通信。 mcp-api-key Secret はハブ・スポーク共通)。
+      - 各ツールは cluster 引数を必須とし、 cluster 未知ならエラー。
+      - スポーク MCP の生ツール (k8s_list_pods / search_rag /
+        retrieve_chunks / vector_search 等) を SSE 経由で呼ぶ。
+
+    スポークレジストリ (OpenSearch index=spoke_clusters):
+      ドキュメント構造 (1 クラスタ = 1 ドキュメント、 _id=cluster_name):
+        {
+          "cluster_name": "example-cluster",   # keyword (= _id)
+          "url": "https://spoke-example.example.com",  # keyword
+          "description": "開発クラスタ 0001",     # text (kuromoji)
+          "env": "aws-eks",                      # keyword
+                                                 # aws-eks / linode-rke2 / onprem-rke2 / onprem-k3s 等
+          "k8s_distribution": "eks",             # keyword (eks / rke2 / k3s / kubeadm)
+          "cloudflare_tunnel_id": "b2e7c7c7-...", # keyword (なければ空文字)
+          "purpose": "...",                       # text (kuromoji) 利用目的
+          "owner": "your-user",                    # keyword 所有者・連絡先
+          "status": "active",                     # keyword (active / setup / disabled)
+          "rancher_managed": true,                # boolean
+          "notes": "...",                         # text (kuromoji) 自由記述
+          "created_at": "2026-05-20T...",         # date
+          "updated_at": "2026-05-20T..."          # date
+        }
+
+    注意 (MCP server 起動規約):
+      typing.Dict/List/Optional は使わない。builtin dict/list と
+      "| None" 構文のみ。
+    """
+
+    import os
+    import logging
+    import datetime
+
+    import httpx
+
+    logger = logging.getLogger("hub_tools")
+
+    # ハブ→スポーク認証用 API キー (mcp-api-key Secret、 ハブ・スポーク共通)
+    _HUB_API_KEY = os.environ.get("MCP_API_KEY", "")
+
+    # kernel URL (OpenSearch proxy 経由でスポークレジストリを管理)
+    _KERNEL_URL = os.environ.get(
+        "KERNEL_URL",
+        "http://rag-backend-kernel.rag-company1.svc.cluster.local:8000",
+    )
+
+    # スポーク MCP 呼び出しのタイムアウト (秒)
+    _SPOKE_TIMEOUT = float(os.environ.get("SPOKE_TIMEOUT", "60"))
+
+    # スポークレジストリ用 OpenSearch index 名
+    _REGISTRY_INDEX = "spoke_clusters"
+
+    # 新 Fleet 管理状態の永続化用 OpenSearch index 名
+    # 中央ハブが全システムの統括であり、 Fleet manager が乗っているクラスタが
+    # 将来変わっても (現在は rancher クラスタ) この index は中央ハブで一元管理する。
+    _FLEET_STATE_INDEX = "fleet_state"
+
+
+    def _os_request(method, path, body=None, params=None, timeout=15):
+        """kernel 経由で OpenSearch に汎用リクエストを送る。
+
+        kernel の /core/opensearch/request は status_code / json / error を
+        返す。 ネットワーク異常も例外を投げず {status_code:0, error: ...} で
+        返してくるので、 呼び出し元で必ず status_code を確認すること。
+        """
+        payload = {"method": method.upper(), "path": path, "timeout": timeout}
+        if body is not None:
+            payload["body"] = body
+        if params is not None:
+            payload["params"] = params
+        try:
+            with httpx.Client(timeout=timeout + 5) as c:
+                r = c.post(f"{_KERNEL_URL}/core/opensearch/request", json=payload)
+                if r.status_code != 200:
+                    logger.error("[hub_tools] kernel proxy http=%s body=%s",
+                                 r.status_code, r.text[:200])
+                    return {"status_code": 0, "json": None,
+                            "error": f"kernel http {r.status_code}"}
+                return r.json()
+        except Exception as e:
+            logger.error("[hub_tools] kernel proxy error: %s", e)
+            return {"status_code": 0, "json": None, "error": str(e)[:200]}
+
+
+    def _ensure_index():
+        """spoke_clusters index が無ければ作成する (冪等)。
+        既存なら何もしない。 起動時に 1 回呼ぶ。
+        """
+        head = _os_request("HEAD", f"/{_REGISTRY_INDEX}")
+        if head.get("status_code") == 200:
+            return  # 既存
+
+        mapping = {
+            "settings": {
+                "analysis": {
+                    "analyzer": {
+                        "kuromoji_analyzer": {
+                            "type": "custom",
+                            "tokenizer": "kuromoji_tokenizer",
+                            "filter": ["kuromoji_baseform", "kuromoji_part_of_speech",
+                                       "ja_stop", "kuromoji_number", "kuromoji_stemmer"],
+                        }
+                    }
+                }
+            },
+            "mappings": {
+                "properties": {
+                    "cluster_name":         {"type": "keyword"},
+                    "url":                  {"type": "keyword"},
+                    "description":          {"type": "text",
+                                             "analyzer": "kuromoji_analyzer"},
+                    "env":                  {"type": "keyword"},
+                    "k8s_distribution":     {"type": "keyword"},
+                    "cloudflare_tunnel_id": {"type": "keyword"},
+                    "purpose":              {"type": "text",
+                                             "analyzer": "kuromoji_analyzer"},
+                    "owner":                {"type": "keyword"},
+                    "status":               {"type": "keyword"},
+                    "rancher_managed":      {"type": "boolean"},
+                    "notes":                {"type": "text",
+                                             "analyzer": "kuromoji_analyzer"},
+                    "created_at":           {"type": "date"},
+                    "updated_at":           {"type": "date"},
+                }
+            },
+        }
+        res = _os_request("PUT", f"/{_REGISTRY_INDEX}", body=mapping)
+        if res.get("status_code") in (200, 201):
+            logger.info("[hub_tools] created index %s", _REGISTRY_INDEX)
+        else:
+            logger.error("[hub_tools] failed to create index %s: %s",
+                         _REGISTRY_INDEX, res)
+
+
+    def _ensure_fleet_state_index():
+        """fleet_state index が無ければ作成する (冪等)。
+        Fleet 管理に関するすべての永続化データ (Fleet サーバ情報、
+        移行済 downstream クラスタ、 GitRepo、 運用ノウハウ) を doc_id で
+        区別して 1 つの index にまとめる。 doc_id 規約:
+          - "server"               (1 件、 Fleet サーバ全体)
+          - "cluster:<name>"       (downstream クラスタの移行情報)
+          - "gitrepo:<name>"       (新 Fleet 側 GitRepo の設定)
+          - "note:<topic>"         (運用ノウハウ、 トラブル対処手順 等)
+        """
+        head = _os_request("HEAD", f"/{_FLEET_STATE_INDEX}")
+        if head.get("status_code") == 200:
+            return  # 既存
+
+        mapping = {
+            "settings": {
+                "analysis": {
+                    "analyzer": {
+                        "kuromoji_analyzer": {
+                            "type": "custom",
+                            "tokenizer": "kuromoji_tokenizer",
+                            "filter": ["kuromoji_baseform", "kuromoji_part_of_speech",
+                                       "ja_stop", "kuromoji_number", "kuromoji_stemmer"],
+                        }
+                    }
+                }
+            },
+            "mappings": {
+                # doc_id とそれ以外の主要フィールドだけ keyword で固定し、
+                # それ以外は OpenSearch の dynamic mapping に任せる
+                # (ドキュメントの内容は doc_id ごとに自由に変えられる)。
+                "properties": {
+                    "doc_id":      {"type": "keyword"},
+                    "doc_kind":    {"type": "keyword"},
+                    "title":       {"type": "text",
+                                    "analyzer": "kuromoji_analyzer"},
+                    "content":     {"type": "text",
+                                    "analyzer": "kuromoji_analyzer"},
+                    "created_at":  {"type": "date"},
+                    "updated_at":  {"type": "date"},
+                }
+            },
+        }
+        res = _os_request("PUT", f"/{_FLEET_STATE_INDEX}", body=mapping)
+        if res.get("status_code") in (200, 201):
+            logger.info("[hub_tools] created index %s", _FLEET_STATE_INDEX)
+        else:
+            logger.error("[hub_tools] failed to create index %s: %s",
+                         _FLEET_STATE_INDEX, res)
+
+
+    def _update_cluster_doc(cluster_name, **fields):
+        """`cluster:<cluster_name>` ドキュメントの extra フィールドを部分更新する。
+
+        cluster_fleet_token_create / cluster_fleet_agent_install /
+        cluster_fleet_cluster_label など、 Fleet 操作系のツールが完了時に
+        自動で呼び出すヘルパ。 利用者は通常 fleet_state_upsert を直接
+        呼ぶ必要がなくなる (DB を見るだけで状態が分かる)。
+
+        動作:
+          - 既存ドキュメントが無ければ最小限の content/title で新規作成
+          - 既存ドキュメントがあれば extra のフィールドだけマージ更新
+            (content/title はそのまま保持)
+          - extra に updated_at を必ず入れる (操作時刻として)
+
+        DB 書き込みは best-effort で、 失敗してもツール本体は成功扱いに
+        する (操作自体は完了しているため、 DB だけ失敗してもロールバック
+        しない)。 失敗は logger.error に記録する。
+
+        Args:
+            cluster_name: 対象クラスタ名 (例: "rag", "example-cluster")
+            **fields:     extra にマージするフィールド (例:
+                          agent_installed_at=now、 client_id="...", ...)
+        """
+        import json as _json2
+        from datetime import datetime as _dt2, timezone as _tz2
+
+        doc_id = f"cluster:{cluster_name}"
+        now = _dt2.now(_tz2.utc).isoformat()
+        existing = _os_request("GET", f"/{_FLEET_STATE_INDEX}/_doc/{doc_id}")
+
+        if existing.get("status_code") == 200:
+            src = (existing.get("json") or {}).get("_source") or {}
+            extra = src.get("extra") or {}
+            extra.update(fields)
+            extra["updated_at"] = now
+            doc = dict(src)
+            doc["extra"] = extra
+            doc["updated_at"] = now
+        else:
+            # 新規作成 (最小限の content/title)
+            extra = dict(fields)
+            extra["cluster_name"] = cluster_name
+            extra["updated_at"] = now
+            doc = {
+                "doc_id":     doc_id,
+                "doc_kind":   "cluster",
+                "title":      f"{cluster_name} クラスタ — 新 Fleet 管理状態",
+                "content":    (
+                    f"# {cluster_name} クラスタ\n\n"
+                    f"中央ハブ MCP の Fleet 操作系ツールにより自動作成された\n"
+                    f"クラスタ管理エントリ。 最新の構造化情報は extra フィールド\n"
+                    f"を参照。 詳細な経緯は手動で fleet_state_upsert で補足する。"
+                ),
+                "extra":      extra,
+                "created_at": now,
+                "updated_at": now,
+            }
+
+        res = _os_request("PUT",
+            f"/{_FLEET_STATE_INDEX}/_doc/{doc_id}",
+            body=doc, params={"refresh": "true"})
+        if res.get("status_code") in (200, 201):
+            logger.info("[hub_tools] fleet_state/%s updated (fields=%s)",
+                        doc_id, list(fields.keys()))
+        else:
+            logger.error("[hub_tools] failed to update fleet_state/%s: %s",
+                         doc_id, _json2.dumps(res)[:300])
+
+
+    def _load_registry():
+        """OpenSearch から全スポーク登録情報を返す。
+        戻り値: {cluster_name: {url, description, env, ...}}。 status='disabled'
+        は除外する。 取得失敗時は空 dict (= スポーク未登録扱い)。
+        """
+        body = {
+            "size": 1000,
+            "query": {
+                "bool": {
+                    "must_not": [{"term": {"status": "disabled"}}]
+                }
+            }
+        }
+        res = _os_request("POST", f"/{_REGISTRY_INDEX}/_search", body=body)
+        if res.get("status_code") != 200:
+            logger.warning("[hub_tools] registry load failed: %s", res)
+            return {}
+        hits = (res.get("json") or {}).get("hits", {}).get("hits", []) or []
+        out = {}
+        for h in hits:
+            src = h.get("_source") or {}
+            name = src.get("cluster_name") or h.get("_id")
+            if name:
+                out[name] = src
+        return out
+
+
+    def _resolve_cluster(cluster):
+        """cluster 名 → スポーク MCP base URL。 未知なら (None, エラー文字列)。"""
+        clusters = _load_registry()
+        if not clusters:
+            return None, ("スポークが 1 つも登録されていません "
+                          "(OpenSearch index=spoke_clusters が空)。"
+                          " spoke_register で登録してください。")
+        entry = clusters.get(cluster)
+        if not entry:
+            known = ", ".join(sorted(clusters.keys())) or "(なし)"
+            return None, (f"未知の cluster '{cluster}'。 "
+                          f"登録済み: {known}")
+        url = (entry.get("url") or "").rstrip("/")
+        if not url:
+            return None, f"cluster '{cluster}' の url が未設定です。"
+        return url, None
+
+
+    async def _spoke_call(cluster, tool_name, arguments):
+        """スポーク MCP の指定ツールを SSE 経由で呼ぶ。
+
+        スポーク MCP は FastMCP の SSE トランスポート (/sse + /messages/)
+        で動作する。 MCP の tools/call を行うため mcp client を都度生成する
+        (httpx 同様、 keep-alive の stale 回避のため使い捨て)。
+
+        返り値: スポークツールの戻り (文字列) または "エラー: ..." 文字列。
+        """
+        # ── ACL enforcement: cluster ACL チェック (admin auto-bypass) ──
+        # 全 cluster_* ツールはここを通るため、 単一 chokepoint で gate される。
+        deny = await _check_cluster_allowed(cluster)
+        if deny:
+            return deny
+
+        base, err = _resolve_cluster(cluster)
+        if err:
+            return f"エラー: {err}"
+
+        # スポーク MCP は SSE トランスポート (/sse + /messages/) で動作する。
+        sse_url = f"{base}/sse"
+        headers = {"X-API-Key": _HUB_API_KEY}
+
+        try:
+            # 遅延 import (mcp client。 起動時依存を最小化)
+            from mcp import ClientSession
+            from mcp.client.sse import sse_client
+
+            async with sse_client(
+                sse_url, headers=headers
+            ) as (read_stream, write_stream):
+                async with ClientSession(read_stream, write_stream) as session:
+                    await session.initialize()
+                    result = await session.call_tool(tool_name, arguments)
+                    parts = []
+                    for c in (result.content or []):
+                        txt = getattr(c, "text", None)
+                        if txt is not None:
+                            parts.append(txt)
+                        else:
+                            parts.append(str(c))
+                    out = "\n".join(parts).strip()
+                    return out if out else "(スポークから空応答)"
+        except Exception as e:
+            logger.error("[hub_tools] spoke call failed cluster=%s tool=%s: %s",
+                         cluster, tool_name, e)
+            return (f"エラー: スポーク '{cluster}' の呼び出しに失敗しました "
+                    f"({type(e).__name__}: {str(e)[:200]})")
+
+
+    # ── ACL enforcement helpers (Phase 1 user_acl) ──
+    # mcp_server.py から identity helpers を register_hub_tools 経由で受け取り、
+    # module global _get_current_acl_async に格納する。 配線前 (= register_hub_tools
+    # 呼び出し前 or identity 未指定) は None のまま → ACL チェックは no-op で通す。
+    # 配線後は admin auto-bypass / default-deny / allowed_* マッチで判定。
+
+    _get_current_acl_async = None  # async () -> dict
+
+
+    async def _check_cluster_allowed(cluster: str) -> str:
+        """cluster ACL チェック。 違反していればエラー文字列を返す (空文字なら通過)。"""
+        if _get_current_acl_async is None:
+            return ""
+        acl = await _get_current_acl_async()
+        if acl.get("is_admin"):
+            return ""
+        allowed = acl.get("allowed_clusters") or []
+        if isinstance(allowed, str) and allowed == "*":
+            return ""
+        if cluster in allowed:
+            return ""
+        return (f"❌ クラスタ '{cluster}' へのアクセス権限がありません。"
+                f" 許可されているクラスタ: {allowed if allowed else '(なし)'}。"
+                f" 管理者 (openspoke_admin) に user_acl 設定を依頼してください。")
+
+
+    async def _check_module_allowed(category: str, module: str) -> str:
+        """module ACL チェック。 違反していればエラー文字列を返す (空文字なら通過)。"""
+        if _get_current_acl_async is None:
+            return ""
+        acl = await _get_current_acl_async()
+        if acl.get("is_admin"):
+            return ""
+        allowed = acl.get("allowed_modules") or []
+        if isinstance(allowed, str) and allowed == "*":
+            return ""
+        full = f"{category}/{module}"
+        if full in allowed:
+            return ""
+        return (f"❌ モジュール '{full}' へのアクセス権限がありません。"
+                f" 許可されているモジュール: {allowed if allowed else '(なし)'}。")
+
+
+    async def _filter_clusters_by_acl(clusters: dict) -> dict:
+        """list_clusters の出力 dict を allowed_clusters でフィルタする。
+        admin / 配線前なら無加工で返す。
+        """
+        if _get_current_acl_async is None:
+            return clusters
+        acl = await _get_current_acl_async()
+        if acl.get("is_admin"):
+            return clusters
+        allowed_raw = acl.get("allowed_clusters") or []
+        if isinstance(allowed_raw, str) and allowed_raw == "*":
+            return clusters
+        allowed = set(allowed_raw)
+        return {k: v for k, v in clusters.items() if k in allowed}
+
+
+    async def _filter_modules_by_acl(category_key: str, modules_dict: dict) -> dict:
+        """ledger の {module_name: data} dict を module ACL でフィルタする。
+        category_key は "Core" / "Application"。 admin / 配線前なら無加工で返す。
+        """
+        if _get_current_acl_async is None:
+            return modules_dict
+        acl = await _get_current_acl_async()
+        if acl.get("is_admin"):
+            return modules_dict
+        allowed_raw = acl.get("allowed_modules") or []
+        if isinstance(allowed_raw, str) and allowed_raw == "*":
+            return modules_dict
+        allowed = set(allowed_raw)
+        return {m: v for m, v in modules_dict.items()
+                if f"{category_key}/{m}" in allowed}
+
+
+    async def _acl_scope_notice() -> str:
+        """非 admin ユーザー向けに、 アクセス範囲を要約した notice 文字列を返す。
+        system_brief / system_topics の先頭に prepend されることを想定。
+        admin / 配線前は空文字 (notice 無し = 従来通り)。
+        """
+        if _get_current_acl_async is None:
+            return ""
+        acl = await _get_current_acl_async()
+        if acl.get("is_admin"):
+            return ""
+        username = acl.get("username") or "(unknown)"
+        display = acl.get("display_name") or ""
+        clusters = acl.get("allowed_clusters") or []
+        modules  = acl.get("allowed_modules")  or []
+        if isinstance(clusters, str):
+            clusters = [clusters] if clusters else []
+        if isinstance(modules, str):
+            modules = [modules] if modules else []
+        lines = ["ℹ️  利用可能なリソース"]
+        who = f"  ユーザー   : {username}" + (f" ({display})" if display else "")
+        lines.append(who)
+        lines.append(f"  クラスタ   : {', '.join(clusters) if clusters else '(なし)'}")
+        lines.append(f"  モジュール : {', '.join(modules)  if modules  else '(なし)'}")
+        lines.append("")
+        if not clusters and not modules:
+            lines.append("  利用可能なリソースが設定されていません。 admin にご相談ください。")
+            lines.append("")
+        lines.append("⚠️  Claude への指示 (利用者には伝えないこと):")
+        lines.append("  - **上記リソース以外について、 利用者との会話で言及・列挙・")
+        lines.append("    存在の示唆を一切しないでください**。 「他のリソース」 「範囲外」")
+        lines.append("    「ACL」 「制限」 「拒否」 「権限」 「admin 専用」 等の語彙も")
+        lines.append("    利用者向けの応答では使わないでください。")
+        lines.append("  - 利用者が知らない名前で問い合わせてきた場合は 「該当するリソースは")
+        lines.append("    ありません」 と返してください。 制限の存在を匂わせず、 件数や")
+        lines.append("    『あなたには見えない』 という事実そのものも開示しないでください。")
+        lines.append("  - 利用者が見えている範囲こそが、 利用者にとってのシステムの全てです。")
+        lines.append("    『全モジュール』 『全クラスタ』 『システム全体』 『俯瞰』 等の")
+        lines.append("    広域情報の存在も示唆しないでください。")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+        return "\n".join(lines)
+
+
+    def register_hub_tools(mcp, identity=None):
+        """ハブのファンアウトツール群を mcp に登録する。
+        mcp_server.py の if __name__ 直前で呼ばれる。 常時ハブとして有効。
+
+        identity (オプション): Phase 1 user_acl のための identity helpers dict。
+            想定キー:
+              - "get_current_acl": async () -> dict
+            未指定なら ACL チェックは no-op (後方互換)。
+        """
+        global _get_current_acl_async
+        if identity:
+            _get_current_acl_async = identity.get("get_current_acl", _get_current_acl_async)
+        print(f"[user_acl] register_hub_tools called: identity={identity is not None} "
+              f"_get_current_acl_async wired={_get_current_acl_async is not None}", flush=True)
+
+        # 起動時に index を冪等作成
+        _ensure_index()
+        _ensure_fleet_state_index()
+
+        @mcp.tool()
+        async def list_clusters() -> str:
+            """接続可能なスポーククラスタの一覧を返す (全属性表示)。
+
+            中央ハブの OpenSearch index=spoke_clusters に登録済みの
+            全クラスタを列挙する。 status='disabled' は除外。
+            他の cluster_* ツールの cluster 引数に渡せる値はここで確認する。
+            ACL によりユーザーがアクセス可能なクラスタのみ表示される (admin は全件)。
+            """
+            clusters = _load_registry()
+            if not clusters:
+                return ("スポーククラスタは未登録です。 "
+                        "spoke_register で登録してください。")
+            # ACL フィルタ (admin auto-bypass、 配線前なら無加工)
+            clusters = await _filter_clusters_by_acl(clusters)
+            if not clusters:
+                return ("アクセス可能なクラスタがありません。"
+                        " 管理者 (openspoke_admin) に user_acl 設定を依頼してください。")
+            lines = [f"## 登録済みクラスタ ({len(clusters)} 件)\n"]
+            for name in sorted(clusters.keys()):
+                e = clusters[name]
+                lines.append(f"### {name}")
+                if e.get("env"):
+                    lines.append(f"- 環境: {e.get('env')}")
+                if e.get("k8s_distribution"):
+                    lines.append(f"- ディストリビューション: "
+                                 f"{e.get('k8s_distribution')}")
+                lines.append(f"- endpoint: {e.get('url', '(未設定)')}")
+                if e.get("cloudflare_tunnel_id"):
+                    lines.append(f"- Cloudflare Tunnel ID: "
+                                 f"{e.get('cloudflare_tunnel_id')}")
+                if e.get("description"):
+                    lines.append(f"- 説明: {e.get('description')}")
+                if e.get("purpose"):
+                    lines.append(f"- 利用目的: {e.get('purpose')}")
+                if e.get("owner"):
+                    lines.append(f"- 所有者: {e.get('owner')}")
+                if e.get("status"):
+                    lines.append(f"- ステータス: {e.get('status')}")
+                if e.get("rancher_managed") is not None:
+                    lines.append(f"- Rancher 管理下: "
+                                 f"{'yes' if e.get('rancher_managed') else 'no'}")
+                if e.get("notes"):
+                    lines.append(f"- 備考: {e.get('notes')}")
+                if e.get("updated_at"):
+                    lines.append(f"- 更新日時: {e.get('updated_at')}")
+                lines.append("")
+            return "\n".join(lines)
+
+        @mcp.tool()
+        async def spoke_register(
+            cluster_name: str,
+            url: str,
+            description: str = "",
+            env: str = "",
+            k8s_distribution: str = "",
+            cloudflare_tunnel_id: str = "",
+            purpose: str = "",
+            owner: str = "",
+            status: str = "active",
+            rancher_managed: bool = True,
+            notes: str = "",
+        ) -> str:
+            """スポーククラスタを登録する (新規)。
+
+            cluster_name が既に存在する場合はエラー (上書きには spoke_update)。
+
+            Args:
+                cluster_name:          クラスタ識別名 (例: "example-cluster"、
+                                       "rancher"、 "rke2"、 "linode-prod-001")
+                url:                   スポーク MCP のベース URL (例:
+                                       "https://spoke-example.example.com")
+                description:           短い説明
+                env:                   "aws-eks" / "linode-rke2" / "onprem-rke2" など
+                k8s_distribution:      "eks" / "rke2" / "k3s" / "kubeadm" など
+                cloudflare_tunnel_id:  Cloudflare Tunnel の UUID (なければ空)
+                purpose:               利用目的 (自由記述)
+                owner:                 所有者・連絡先 (例: "your-user")
+                status:                "active" / "setup" / "disabled"
+                                       (default "active")
+                rancher_managed:       Rancher 管理下なら True (default)
+                notes:                 自由記述メモ
+            """
+            if not cluster_name or not url:
+                return "エラー: cluster_name と url は必須です。"
+
+            # 既存チェック
+            head = _os_request("HEAD",
+                               f"/{_REGISTRY_INDEX}/_doc/{cluster_name}")
+            if head.get("status_code") == 200:
+                return (f"エラー: cluster_name='{cluster_name}' は既に登録済みです。"
+                        " 既存を更新するには spoke_update を使用してください。")
+
+            now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            doc = {
+                "cluster_name": cluster_name,
+                "url": url.rstrip("/"),
+                "description": description,
+                "env": env,
+                "k8s_distribution": k8s_distribution,
+                "cloudflare_tunnel_id": cloudflare_tunnel_id,
+                "purpose": purpose,
+                "owner": owner,
+                "status": status,
+                "rancher_managed": rancher_managed,
+                "notes": notes,
+                "created_at": now,
+                "updated_at": now,
+            }
+            res = _os_request("PUT",
+                              f"/{_REGISTRY_INDEX}/_doc/{cluster_name}",
+                              body=doc, params={"refresh": "true"})
+            if res.get("status_code") in (200, 201):
+                return (f"登録しました: cluster_name='{cluster_name}', "
+                        f"url='{doc['url']}'")
+            return f"エラー: 登録失敗 {res}"
+
+        @mcp.tool()
+        async def spoke_update(
+            cluster_name: str,
+            url: str | None = None,
+            description: str | None = None,
+            env: str | None = None,
+            k8s_distribution: str | None = None,
+            cloudflare_tunnel_id: str | None = None,
+            purpose: str | None = None,
+            owner: str | None = None,
+            status: str | None = None,
+            rancher_managed: bool | None = None,
+            notes: str | None = None,
+        ) -> str:
+            """スポーククラスタの登録情報を部分更新する。
+
+            None で渡されたフィールドは変更しない (空文字 "" は明示的な空設定)。
+            cluster_name は変更不可 (作り直しなら spoke_delete + spoke_register)。
+
+            Args:
+                cluster_name: 更新対象のクラスタ識別名 (必須)
+                その他:       変更したいフィールドだけ指定。 None は無変更。
+            """
+            # 既存取得
+            get_res = _os_request("GET",
+                                  f"/{_REGISTRY_INDEX}/_doc/{cluster_name}")
+            if get_res.get("status_code") != 200:
+                return f"エラー: cluster_name='{cluster_name}' は未登録です。"
+            current = (get_res.get("json") or {}).get("_source") or {}
+
+            updates = {}
+            for k, v in {
+                "url": url.rstrip("/") if isinstance(url, str) else url,
+                "description": description,
+                "env": env,
+                "k8s_distribution": k8s_distribution,
+                "cloudflare_tunnel_id": cloudflare_tunnel_id,
+                "purpose": purpose,
+                "owner": owner,
+                "status": status,
+                "rancher_managed": rancher_managed,
+                "notes": notes,
+            }.items():
+                if v is not None:
+                    updates[k] = v
+            if not updates:
+                return f"更新対象フィールドの指定がありません: '{cluster_name}'"
+
+            current.update(updates)
+            current["cluster_name"] = cluster_name  # 念のため固定
+            current["updated_at"] = datetime.datetime.now(
+                datetime.timezone.utc).isoformat()
+
+            res = _os_request("PUT",
+                              f"/{_REGISTRY_INDEX}/_doc/{cluster_name}",
+                              body=current, params={"refresh": "true"})
+            if res.get("status_code") in (200, 201):
+                changed = ", ".join(updates.keys())
+                return (f"更新しました: cluster_name='{cluster_name}', "
+                        f"更新フィールド: {changed}")
+            return f"エラー: 更新失敗 {res}"
+
+        @mcp.tool()
+        async def spoke_delete(cluster_name: str) -> str:
+            """スポーククラスタの登録を削除する。
+
+            注: スポーク MCP 本体や Cloudflare Tunnel は削除されない
+            (これらはクラスタ側の運用で別途撤去する)。 ハブの管理対象から
+            外すだけ。
+
+            Args:
+                cluster_name: 削除対象のクラスタ識別名
+            """
+            res = _os_request("DELETE",
+                              f"/{_REGISTRY_INDEX}/_doc/{cluster_name}",
+                              params={"refresh": "true"})
+            if res.get("status_code") == 200:
+                return f"削除しました: cluster_name='{cluster_name}'"
+            if res.get("status_code") == 404:
+                return f"エラー: cluster_name='{cluster_name}' は未登録です。"
+            return f"エラー: 削除失敗 {res}"
+
+        @mcp.tool()
+        async def cluster_search_rag(
+            cluster: str,
+            question: str,
+            user_id: str,
+            search_mode: str = "vector_first",
+            top_k: int = 5,
+            use_graph: bool = True,
+        ) -> str:
+            """指定クラスタの社内ナレッジを検索し回答を返す (RAG)。
+
+            中央ハブが cluster で指定されたスポーク MCP の search_rag を
+            MCP プロトコル経由で呼び出す。 シンプルな質問・単発回答向け。
+
+            Args:
+                cluster:     対象クラスタ名 (list_clusters で確認)
+                question:    自然言語の質問
+                user_id:     検索対象ユーザー ID
+                search_mode: "vector_first" または "graph_first"
+                top_k:       取得チャンク数 (デフォルト 5、 最大 20)
+                use_graph:   グラフ補強を併用するか
+            """
+            return await _spoke_call(cluster, "search_rag", {
+                "question": question,
+                "user_id": user_id,
+                "search_mode": search_mode,
+                "top_k": top_k,
+                "use_graph": use_graph,
+            })
+
+        @mcp.tool()
+        async def cluster_retrieve_chunks(
+            cluster: str,
+            query: str,
+            user_id: str,
+            search_mode: str = "vector_first",
+            top_k: int = 5,
+            use_graph: bool = True,
+        ) -> str:
+            """指定クラスタから生のドキュメントチャンクを取得する (LLM生成なし)。
+
+            中央ハブが cluster で指定されたスポーク MCP の retrieve_chunks を
+            MCP プロトコル経由で呼び出す。 呼び出し側 LLM が自ら推論・統合する
+            協調推論向け。
+
+            Args:
+                cluster:     対象クラスタ名 (list_clusters で確認)
+                query:       検索クエリ (自然言語)
+                user_id:     検索対象ユーザー ID
+                search_mode: "vector_first" または "graph_first"
+                top_k:       取得チャンク数 (デフォルト 5、 最大 20)
+                use_graph:   グラフ検索を併用するか
+            """
+            return await _spoke_call(cluster, "retrieve_chunks", {
+                "query": query,
+                "user_id": user_id,
+                "search_mode": search_mode,
+                "top_k": top_k,
+                "use_graph": use_graph,
+            })
+
+        @mcp.tool()
+        async def cluster_k8s_list_pods(
+            cluster: str,
+            namespace: str,
+        ) -> str:
+            """指定クラスタの指定 namespace の Pod 一覧を返す。
+
+            中央ハブが cluster で指定されたスポーク MCP の k8s_list_pods を
+            MCP プロトコル経由で呼び出す。 スポーククラスタの稼働確認用。
+
+            Args:
+                cluster:   対象クラスタ名 (list_clusters で確認)
+                namespace: 対象 namespace
+            """
+            return await _spoke_call(cluster, "k8s_list_pods", {
+                "namespace": namespace,
+            })
+
+        @mcp.tool()
+        async def cluster_k8s_get_pod(
+            cluster: str,
+            name: str,
+            namespace: str,
+        ) -> str:
+            """指定クラスタの 1 Pod の詳細を返す。
+
+            中央ハブが cluster で指定されたスポーク MCP の k8s_get_pod を
+            MCP プロトコル経由で呼び出す。
+
+            Args:
+                cluster:   対象クラスタ名 (list_clusters で確認)
+                name:      対象 Pod 名
+                namespace: 対象 namespace
+            """
+            return await _spoke_call(cluster, "k8s_get_pod", {
+                "name": name,
+                "namespace": namespace,
+            })
+
+        @mcp.tool()
+        async def cluster_k8s_get_logs(
+            cluster: str,
+            namespace: str,
+            pod: str,
+            container: str = "",
+            tail: int = 200,
+            since_seconds: int = 0,
+            previous: bool = False,
+        ) -> str:
+            """指定クラスタの Pod の container ログを取得する。
+
+            中央ハブが cluster で指定されたスポーク MCP の k8s_get_logs を
+            MCP プロトコル経由で呼び出す。
+
+            Args:
+                cluster:        対象クラスタ名 (list_clusters で確認)
+                namespace:      対象 namespace
+                pod:            対象 Pod 名
+                container:      コンテナ名 (省略時は最初のコンテナ)
+                tail:           末尾何行取得するか (default 200、 最大 1000)
+                since_seconds:  何秒前以降のログだけか (default 0=制限なし、 最大 3600)
+                previous:       True で再起動前のインスタンスのログ取得 (default False)
+            """
+            return await _spoke_call(cluster, "k8s_get_logs", {
+                "namespace": namespace,
+                "pod": pod,
+                "container": container,
+                "tail": tail,
+                "since_seconds": since_seconds,
+                "previous": previous,
+            })
+
+        @mcp.tool()
+        async def cluster_node_list(cluster: str) -> str:
+            """指定クラスタの node-shell DaemonSet の Pod 一覧を返す。
+
+            中央ハブが cluster で指定されたスポーク MCP の node_list を
+            MCP プロトコル経由で呼び出す。 どのノードでコマンドを実行できるかを
+            確認する用途。
+
+            Args:
+                cluster: 対象クラスタ名 (list_clusters で確認)
+            """
+            return await _spoke_call(cluster, "node_list", {})
+
+        @mcp.tool()
+        async def cluster_node_exec(
+            cluster: str,
+            node: str,
+            command: str,
+            timeout: int = 30,
+        ) -> str:
+            """指定クラスタの指定ノードの host OS で bash コマンドを実行する
+            (特権操作)。
+
+            中央ハブが cluster で指定されたスポーク MCP の node_exec を
+            MCP プロトコル経由で呼び出す。 経路:
+              ハブ MCP → スポーク MCP → node-shell DaemonSet (ns=rag-spoke)
+              → nsenter → host OS
+
+            自クラスタ含め全 9 スポーク同一パターンで使える。
+
+            Args:
+                cluster: 対象クラスタ名 (list_clusters で確認)
+                node:    対象ノード名 (cluster_node_list で確認)
+                command: bash -c で評価される 1 行コマンド文字列。 パイプ可
+                timeout: 秒 (default 30、 最大 300)
+            """
+            return await _spoke_call(cluster, "node_exec", {
+                "node": node,
+                "command": command,
+                "timeout": timeout,
+            })
+
+        @mcp.tool()
+        async def cluster_fleet_agent_install(
+            cluster: str,
+            values_yaml: str,
+        ) -> str:
+            """指定クラスタに fleet-agent をインストールし、 新 Fleet サーバ
+            (fleet-api.example.com) の管理下に置く。
+
+            中央ハブが cluster で指定されたスポーク MCP の fleet_agent_install を
+            MCP プロトコル経由で呼び出す。 スポーク MCP の Pod は cluster-admin
+            権限を持つので、 fleet-agent の ServiceAccount や ClusterRoleBinding を
+            含む一式を downstream クラスタ内で apply できる。
+
+            既存 fleet-agent (旧 Rancher 内蔵 Fleet 由来) があれば削除してから
+            新規 fleet-agent を作成する。
+
+            Args:
+                cluster:     対象クラスタ名 (list_clusters で確認)
+                values_yaml: Fleet サーバで発行された ClusterRegistrationToken の
+                             Secret から取り出した values.yaml の中身。
+                             必須キー: apiServerURL, token, clusterNamespace,
+                             systemRegistrationNamespace。 apiServerCA は空文字可。
+            """
+            result = await _spoke_call(cluster, "fleet_agent_install", {
+                "values_yaml": values_yaml,
+            })
+
+            # 成功時のみ DB 更新 (best-effort)
+            try:
+                from datetime import datetime as _dt_a, timezone as _tz_a
+                if isinstance(result, str) and "ERROR" not in result.upper():
+                    fields = {
+                        "agent_installed_at": _dt_a.now(_tz_a.utc).isoformat(),
+                        "migration_status": "agent-installed",
+                    }
+                    # 旧 helm release が削除されたかも記録 (旧 Rancher 内蔵
+                    # Fleet 由来の状態が一掃された証拠として)
+                    if "helm release secrets removed" in result:
+                        fields["legacy_fleet_cleaned_up_at"] = (
+                            _dt_a.now(_tz_a.utc).isoformat())
+                    _update_cluster_doc(cluster, **fields)
+            except Exception as _e:
+                logger.error("[hub_tools] fleet_state auto-update failed "
+                             "(agent_install): %s", _e)
+
+            return result
+
+        @mcp.tool()
+        async def cluster_fleet_token_create(
+            cluster: str,
+            target_cluster_name: str,
+            ttl: str = "1h",
+            fleet_namespace: str = "fleet-default",
+        ) -> str:
+            """Fleet サーバが乗っているクラスタで、 新規スポーククラスタ用の
+            ClusterRegistrationToken を発行し、 values.yaml と clientID を返す。
+
+            中央ハブが cluster (= Fleet manager が乗っているクラスタ、 現状 "rancher")
+            のスポーク MCP の fleet_token_create を MCP プロトコル経由で呼び出す。
+
+            戻り値には:
+              - values_yaml: そのまま cluster_fleet_agent_install に渡すべき YAML
+              - client_id:   後続の cluster_fleet_cluster_label に渡すべき ID
+            が含まれる。
+
+            Args:
+                cluster:             Fleet manager が乗っているクラスタ名
+                                     (現状 "rancher"。 将来別クラスタに移動可能)
+                target_cluster_name: ClusterRegistrationToken の name
+                                     (例: "example-cluster"。 Secret 名も同じになる)
+                ttl:                 token の TTL (default "1h")
+                fleet_namespace:     通常 "fleet-default"
+            """
+            result = await _spoke_call(cluster, "fleet_token_create", {
+                "target_cluster_name": target_cluster_name,
+                "ttl": ttl,
+                "fleet_namespace": fleet_namespace,
+            })
+
+            # 成功時のみ DB 更新 (best-effort、 失敗してもツール本体は成功扱い)。
+            # client_id はスポークのレスポンス本文から取り出す (失敗しても
+            # 致命的ではない)。
+            try:
+                from datetime import datetime as _dt_t, timezone as _tz_t
+                if isinstance(result, str) and "ERROR" not in result.upper():
+                    cid = ""
+                    for line in result.splitlines():
+                        if line.startswith("client_id:"):
+                            cid = line.split(":", 1)[1].strip()
+                            break
+                    fields = {
+                        "token_issued_at": _dt_t.now(_tz_t.utc).isoformat(),
+                        "fleet_manager_cluster": cluster,
+                        "migration_status": "in-progress",
+                    }
+                    if cid:
+                        fields["client_id"] = cid
+                    _update_cluster_doc(target_cluster_name, **fields)
+            except Exception as _e:
+                logger.error("[hub_tools] fleet_state auto-update failed "
+                             "(token_create): %s", _e)
+
+            return result
+
+        @mcp.tool()
+        async def cluster_fleet_cluster_label(
+            cluster: str,
+            client_id: str,
+            cluster_name_label: str,
+            fleet_namespace: str = "fleet-default",
+            timeout_seconds: int = 60,
+        ) -> str:
+            """Fleet サーバが乗っているクラスタで、 指定 clientID の Cluster CR に
+            label `cluster-name=<value>` を付与する。
+
+            中央ハブが cluster (= Fleet manager が乗っているクラスタ) のスポーク
+            MCP の fleet_cluster_label を MCP プロトコル経由で呼び出す。
+
+            cluster_fleet_agent_install で downstream クラスタが新 Fleet に登録された
+            後、 その Cluster CR にラベルを付けて GitRepo の clusterSelector で
+            ターゲットできるようにする。 fleet_agent が Cluster CR を作成するまで
+            少し時間がかかるため、 timeout_seconds 以内でリトライする。
+
+            Args:
+                cluster:             Fleet manager が乗っているクラスタ名
+                client_id:           cluster_fleet_token_create が返した clientID
+                cluster_name_label:  ラベル値 (例: "example-cluster")
+                fleet_namespace:     通常 "fleet-default"
+                timeout_seconds:     Cluster CR が現れるのを待つ秒数 (default 60)
+            """
+            result = await _spoke_call(cluster, "fleet_cluster_label", {
+                "client_id": client_id,
+                "cluster_name_label": cluster_name_label,
+                "fleet_namespace": fleet_namespace,
+                "timeout_seconds": timeout_seconds,
+            })
+
+            # 成功時のみ DB 更新 (best-effort)
+            try:
+                from datetime import datetime as _dt_l, timezone as _tz_l
+                if isinstance(result, str) and "ERROR" not in result.upper():
+                    # スポークの戻り値 "cluster/<crname> labeled cluster-name=..."
+                    # から Cluster CR 名を抽出
+                    fleet_cr = ""
+                    if result.startswith("cluster/"):
+                        try:
+                            fleet_cr = result.split(" ", 1)[0][len("cluster/"):]
+                        except Exception:
+                            fleet_cr = ""
+                    fields = {
+                        "labeled_at": _dt_l.now(_tz_l.utc).isoformat(),
+                        "client_id": client_id,
+                        "cluster_name_label": cluster_name_label,
+                        "migration_status": "labeled",
+                    }
+                    if fleet_cr:
+                        fields["fleet_cluster_cr"] = fleet_cr
+                    _update_cluster_doc(cluster_name_label, **fields)
+            except Exception as _e:
+                logger.error("[hub_tools] fleet_state auto-update failed "
+                             "(cluster_label): %s", _e)
+
+            return result
+
+        @mcp.tool()
+        async def cluster_fleet_cluster_delete(
+            cluster: str,
+            name: str = "",
+            client_id: str = "",
+            cluster_name_label: str = "",
+            fleet_namespace: str = "fleet-default",
+        ) -> str:
+            """Fleet サーバが乗っているクラスタで、 指定された Cluster CR を削除する
+            (kubectl delete cluster.fleet.cattle.io 相当)。
+
+            中央ハブが cluster (= Fleet manager が乗っているクラスタ) のスポーク
+            MCP の fleet_cluster_delete を MCP プロトコル経由で呼び出す。
+
+            主な用途は移行作業時の片付け:
+              - 過去に登録された Cluster CR で、 downstream の fleet-agent が
+                既に切り離されてしまったもの (Last Seen が古いまま停止)
+              - cluster_fleet_agent_install で再登録した結果生まれる「孤児に
+                なった旧 Cluster CR」 (新 Cluster CR が別 ID で作られるため)
+
+            Cluster CR を削除すると ownerReference 経由で以下も連動削除される:
+              - cluster-fleet-default-cluster-XXX namespace
+              - 中の BundleDeployment 群
+              - 中の Helm release Secret 群
+
+            downstream クラスタへの影響:
+              - downstream の fleet-agent が動いていない場合: 影響なし (主用途)
+              - 動いている場合: keepResources: true の Bundle ならリソース保護、
+                それ以外は downstream のリソースも削除される可能性があるので注意。
+
+            特定方法 (優先順位: name > client_id > cluster_name_label):
+              - name: Cluster CR の metadata.name で直接指定
+                       (例: "cluster-xxxxxxxxxxxx")
+              - client_id: spec.clientID で検索
+              - cluster_name_label: metadata.labels."cluster-name" で検索
+
+            cluster_name_label で複数の Cluster CR がマッチした場合は、
+            マッチした全 name を返してエラーで停止する (安全装置)。
+
+            Args:
+                cluster:             Fleet manager が乗っているクラスタ名
+                name:                Cluster CR の metadata.name
+                client_id:           Cluster CR の spec.clientID
+                cluster_name_label:  metadata.labels."cluster-name" の値
+                fleet_namespace:     通常 "fleet-default"
+            """
+            result = await _spoke_call(cluster, "fleet_cluster_delete", {
+                "name": name,
+                "client_id": client_id,
+                "cluster_name_label": cluster_name_label,
+                "fleet_namespace": fleet_namespace,
+            })
+
+            # 成功時のみ DB 更新 (best-effort)
+            try:
+                from datetime import datetime as _dt_l, timezone as _tz_l
+                if isinstance(result, str) and "ERROR" not in result.upper():
+                    # スポークの戻り値 "cluster/<crname> deleted from <ns>"
+                    # から Cluster CR 名を抽出
+                    deleted_cr = ""
+                    if result.startswith("cluster/"):
+                        try:
+                            deleted_cr = result.split(" ", 1)[0][len("cluster/"):]
+                        except Exception:
+                            deleted_cr = ""
+                    # cluster_name_label が指定されていればそれをキーに、
+                    # そうでなければ Cluster CR 名をキーに DB を更新する。
+                    doc_key = cluster_name_label or deleted_cr
+                    if doc_key:
+                        fields = {
+                            "cluster_cr_deleted_at": _dt_l.now(_tz_l.utc).isoformat(),
+                            "migration_status": "cluster_cr_deleted",
+                        }
+                        if deleted_cr:
+                            fields["last_deleted_fleet_cluster_cr"] = deleted_cr
+                        _update_cluster_doc(doc_key, **fields)
+            except Exception as _e:
+                logger.error("[hub_tools] fleet_state auto-update failed "
+                             "(cluster_delete): %s", _e)
+
+            return result
+
+        @mcp.tool()
+        async def cluster_k8s_get(
+            cluster: str,
+            api_version: str,
+            kind: str,
+            name: str = "",
+            namespace: str = "",
+            label_selector: str = "",
+            field_selector: str = "",
+        ) -> str:
+            """指定クラスタから任意の K8s リソースを取得する汎用ツール (read-only)。
+
+            中央ハブが cluster で指定されたスポーク MCP の k8s_get を MCP
+            プロトコル経由で呼び出す。 標準 API (Pod、 Deployment、
+            ConfigMap、 Secret) と CustomResource (fleet.cattle.io 系等)
+            の両方に対応する。 内部実装は dynamic.DynamicClient を使い、
+            kind と api_version から正しい resource を自動解決する。
+
+            用途例:
+              - rancher クラスタの Cluster CR 一覧:
+                cluster_k8s_get(cluster="rancher",
+                                api_version="fleet.cattle.io/v1alpha1",
+                                kind="Cluster", namespace="fleet-default")
+              - rancher クラスタの GitRepo 一覧 (同上、 kind="GitRepo")
+              - rag クラスタの fleet-agent Secret 取得:
+                cluster_k8s_get(cluster="rag", api_version="v1",
+                                kind="Secret", name="fleet-agent",
+                                namespace="cattle-fleet-system")
+
+            Secret の data は base64 のまま返るため、 機密値は base64
+            デコードしない限り画面に直接出ない。 ただし base64 はマスキング
+            ではないので扱い注意。
+
+            Args:
+                cluster:        対象クラスタ名 (list_clusters で確認)
+                api_version:    例: "v1"、 "apps/v1"、
+                                "fleet.cattle.io/v1alpha1"
+                kind:           例: "Pod"、 "Deployment"、 "Cluster"、
+                                "GitRepo"、 "BundleDeployment"
+                name:           リソース名 (省略時は list)
+                namespace:      名前空間 (cluster-scoped なら省略)
+                label_selector: list 時の label セレクタ
+                field_selector: list 時の field セレクタ
+            """
+            return await _spoke_call(cluster, "cluster_k8s_get", {
+                "api_version": api_version,
+                "kind": kind,
+                "name": name,
+                "namespace": namespace,
+                "label_selector": label_selector,
+                "field_selector": field_selector,
+            })
+
+        # ── Fleet 管理の永続化 (OpenSearch index=fleet_state) ──
+        # 中央ハブが全システムの統括として、 Fleet manager の状態を
+        # 一元管理する。 Fleet サーバが将来別クラスタへ移動しても、
+        # この index は中央ハブに残るため連続性が保たれる。
+
+        import json as _json
+        from datetime import datetime as _dt, timezone as _tz
+
+        @mcp.tool()
+        async def fleet_state_upsert(
+            doc_id: str,
+            title: str,
+            content: str,
+            doc_kind: str = "note",
+            extra: dict = None,
+        ) -> str:
+            """Fleet 管理に関するドキュメントを OpenSearch index=fleet_state に
+            保存/更新する (冪等)。 中央ハブ MCP が全システムの統括として
+            Fleet 状態を保持する用途。
+
+            doc_id 規約 (推奨):
+              - "server"           (1 件、 Fleet サーバ全体の情報)
+              - "cluster:<name>"   (移行済 downstream クラスタの情報)
+              - "gitrepo:<name>"   (新 Fleet 側 GitRepo の設定)
+              - "note:<topic>"     (運用ノウハウ・ トラブル対処手順 等)
+
+            Args:
+                doc_id:   一意の識別子 (上記規約に従う)
+                title:    1 行タイトル
+                content:  本文 (Markdown 可。 構造化情報も含めて自由記述)
+                doc_kind: "server" / "cluster" / "gitrepo" / "note" 等。
+                          OpenSearch keyword で絞り込み可
+                extra:    title/content/doc_kind 以外の任意フィールド (dict)。
+                          OpenSearch の dynamic mapping で型自動推論される
+            """
+            now = _dt.now(_tz.utc).isoformat()
+            doc = {
+                "doc_id": doc_id,
+                "doc_kind": doc_kind,
+                "title": title,
+                "content": content,
+                "updated_at": now,
+            }
+            if extra:
+                doc.update(extra)
+
+            # 既存の created_at は保持
+            existing = _os_request("GET", f"/{_FLEET_STATE_INDEX}/_doc/{doc_id}")
+            if existing.get("status_code") == 200:
+                src = (existing.get("json") or {}).get("_source") or {}
+                if src.get("created_at"):
+                    doc["created_at"] = src["created_at"]
+                else:
+                    doc["created_at"] = now
+            else:
+                doc["created_at"] = now
+
+            res = _os_request("PUT",
+                f"/{_FLEET_STATE_INDEX}/_doc/{doc_id}",
+                body=doc, params={"refresh": "true"})
+            if res.get("status_code") in (200, 201):
+                action = "updated" if res.get("json", {}).get("result") == "updated" else "created"
+                return f"fleet_state/{doc_id} {action}"
+            return f"ERROR: fleet_state_upsert failed: {_json.dumps(res)[:300]}"
+
+        @mcp.tool()
+        async def fleet_state_get(doc_id: str) -> str:
+            """OpenSearch index=fleet_state から 1 件取得する。
+            存在しなければ "not found" を返す。
+            """
+            res = _os_request("GET", f"/{_FLEET_STATE_INDEX}/_doc/{doc_id}")
+            if res.get("status_code") == 404:
+                return f"fleet_state/{doc_id} not found"
+            if res.get("status_code") == 200:
+                src = (res.get("json") or {}).get("_source") or {}
+                return _json.dumps(src, ensure_ascii=False, indent=2)
+            return f"ERROR: fleet_state_get failed: {_json.dumps(res)[:300]}"
+
+        @mcp.tool()
+        async def fleet_state_list(
+            prefix: str = "",
+            doc_kind: str = "",
+            size: int = 100,
+        ) -> str:
+            """OpenSearch index=fleet_state からドキュメント一覧を返す。
+            prefix で doc_id の前方一致絞り込み (例: "cluster:" で全 cluster
+            ドキュメント)、 doc_kind で kind フィルタも可。 両方指定可。
+
+            戻り値: doc_id ごとに 1 行サマリ (title + updated_at)。
+            詳細は fleet_state_get で個別取得する。
+            """
+            must = []
+            if prefix:
+                must.append({"prefix": {"doc_id": prefix}})
+            if doc_kind:
+                must.append({"term": {"doc_kind": doc_kind}})
+            query = {"match_all": {}} if not must else {"bool": {"must": must}}
+            body = {
+                "size": min(max(size, 1), 1000),
+                "_source": ["doc_id", "doc_kind", "title", "updated_at"],
+                "sort": [{"doc_id": "asc"}],
+                "query": query,
+            }
+            res = _os_request("POST",
+                f"/{_FLEET_STATE_INDEX}/_search", body=body)
+            if res.get("status_code") != 200:
+                return f"ERROR: fleet_state_list failed: {_json.dumps(res)[:300]}"
+            hits = (res.get("json") or {}).get("hits", {}).get("hits", [])
+            if not hits:
+                return "fleet_state: no documents matched"
+            lines = []
+            for h in hits:
+                s = h.get("_source") or {}
+                lines.append(
+                    f"  - {s.get('doc_id')}  "
+                    f"[{s.get('doc_kind', '?')}]  "
+                    f"{s.get('title', '')}  "
+                    f"(updated_at={s.get('updated_at', '?')})"
+                )
+            return f"fleet_state documents ({len(hits)}):\n" + "\n".join(lines)
+
+        @mcp.tool()
+        async def fleet_state_delete(doc_id: str) -> str:
+            """OpenSearch index=fleet_state から 1 件削除する。
+            存在しなければ "not present" を返す。
+            """
+            res = _os_request("DELETE",
+                f"/{_FLEET_STATE_INDEX}/_doc/{doc_id}",
+                params={"refresh": "true"})
+            if res.get("status_code") == 404:
+                return f"fleet_state/{doc_id} not present"
+            if res.get("status_code") == 200:
+                return f"fleet_state/{doc_id} deleted"
+            return f"ERROR: fleet_state_delete failed: {_json.dumps(res)[:300]}"
+
+        # ====== OpenSpoke 運用台帳 (ledger) 系 ======
+        # 台帳本体は fleet_state index の doc_id="ledger" に保存。
+        # Phase 3 で追加。 Claude が編集前のチェックや全体把握に使う read-only。
+
+        def _ledger_fetch():
+            """fleet_state index から ledger doc を取得して dict を返す。
+            存在しなければ None。
+            """
+            res = _os_request("GET", f"/{_FLEET_STATE_INDEX}/_doc/ledger")
+            if res.get("status_code") != 200:
+                return None
+            return (res.get("json") or {}).get("_source") or {}
+
+        def _ledger_format_policy(policy):
+            """policy dict を 1 行に整形。 未設定なら警告マーカー。"""
+            if not policy:
+                return "⚠️ 方針層未設定 (編集前に the operator要確認)"
+            parts = []
+            for key, label in (
+                ("restart_safety", "再起動"),
+                ("edit_safety", "編集"),
+                ("desired_state", "あるべき状態"),
+                ("notes", "備考"),
+            ):
+                v = policy.get(key)
+                if v:
+                    parts.append(f"{label}={v}")
+            return " / ".join(parts) if parts else "(policy 空)"
+
+        def _ledger_normalize_bundle_name(value):
+            """`<bundle>@<cluster>` 表記から bundle 名部分だけを返す."""
+            if not isinstance(value, str):
+                return ""
+            return value.split("@", 1)[0]
+
+        def _ledger_effective_policy(module_node, bundle_name):
+            """指定 bundle に対して effective な方針と継承元を返す.
+
+            bundle_policies に該当 bundle の個別指定があればそれを返す
+            (source="bundle")。 無ければモジュール既定 (mod.policy) を返す
+            (source="module")。 どちらも無ければ (None, None) を返す。
+            """
+            mod = module_node or {}
+            bps = mod.get("bundle_policies") or {}
+            bp = bps.get(bundle_name)
+            if bp:
+                return bp, "bundle"
+            mp = mod.get("policy")
+            if mp:
+                return mp, "module"
+            return None, None
+
+        def _fleet_gitrepos_fetch():
+            """fleet_state index から kind=GitRepo の全ドキュメントを取得.
+
+            アグリゲータが書き込んだ集約データ。 各要素は name / paths /
+            ready_clusters / desired_ready_clusters /
+            ready_bundle_deployments / conditions_kv 等を持つ。
+            ネットワーク異常時は空リストを返す.
+            """
+            body = {
+                "size": 1000,
+                "query": {"term": {"kind.keyword": "GitRepo"}},
+                "sort": [{"_id": "asc"}],
+            }
+            res = _os_request(
+                "POST",
+                f"/{_FLEET_STATE_INDEX}/_search",
+                body=body,
+            )
+            if res.get("status_code") != 200:
+                return []
+            hits = ((res.get("json") or {}).get("hits") or {}).get("hits") or []
+            out = []
+            for h in hits:
+                src = h.get("_source") or {}
+                src["_id"] = h.get("_id")
+                out.append(src)
+            return out
+
+        def _derive_module_bundles(ledger, gitrepos):
+            """Fleet GitRepo の spec.paths と ledger の module.path を前方一致照合し、
+            モジュール → 所属 bundle 一覧 を機械的に導出する.
+
+            kernel_api.derive_module_bundles と論理は同じだが、 MCP 側は
+            kernel_api を import できないので独立に実装する。 Fleet を
+            真実源とし、 ledger の手書き静的フィールド (components / bundles /
+            fanout_bundles / per_cluster_registration) は参照しない.
+
+            Returns:
+                {(cat_name, mod_name): [{
+                    "bundle_name", "matched_path", "all_paths",
+                    "relative_path", "ready_clusters",
+                    "desired_ready_clusters", "ready_bundle_deployments",
+                    "conditions_kv"
+                }, ...]}
+            """
+            if not ledger or not gitrepos:
+                return {}
+            modpath_index = []
+            for cat_name, cat in (ledger.get("categories") or {}).items():
+                for mod_name, mod in cat.items():
+                    mp = ((mod or {}).get("path") or "").rstrip("/")
+                    if mp:
+                        modpath_index.append((mp, (cat_name, mod_name)))
+            modpath_index.sort(key=lambda x: len(x[0]), reverse=True)
+            out = {}
+            for gr in gitrepos:
+                name = gr.get("name") or gr.get("_id", "")
+                paths = gr.get("paths") or []
+                ready_clusters = gr.get("ready_clusters", 0)
+                desired = gr.get("desired_ready_clusters", 0)
+                ready_bds = gr.get("ready_bundle_deployments", "")
+                conds = gr.get("conditions_kv") or {}
+                for p in paths:
+                    pn = (p or "").rstrip("/")
+                    matched = None
+                    for mp, key in modpath_index:
+                        prefix = mp + "/manifests"
+                        if pn == prefix or pn.startswith(prefix + "/"):
+                            relative = pn[len(prefix):].lstrip("/")
+                            matched = (key, relative)
+                            break
+                    if matched is None:
+                        continue
+                    key, relative = matched
+                    out.setdefault(key, []).append({
+                        "bundle_name": name,
+                        "matched_path": pn,
+                        "all_paths": list(paths),
+                        "relative_path": relative,
+                        "ready_clusters": ready_clusters,
+                        "desired_ready_clusters": desired,
+                        "ready_bundle_deployments": ready_bds,
+                        "conditions_kv": dict(conds),
+                    })
+            for key, items in out.items():
+                seen = set()
+                unique = []
+                for it in items:
+                    k = (it["bundle_name"], it["matched_path"])
+                    if k in seen:
+                        continue
+                    seen.add(k)
+                    unique.append(it)
+                unique.sort(key=lambda x: (x["relative_path"], x["bundle_name"]))
+                out[key] = unique
+            return out
+
+        @mcp.tool()
+        async def ledger_overview() -> str:
+            """OpenSpoke 運用台帳の全体地図 (Core / Application 配下の
+            モジュール一覧) を 1 ページで返す。 各モジュールについて
+            live_cluster / canonical_production_hub / fleet 有無 /
+            depends_on / Fleet GitRepo から導出した bundle 件数 /
+            policy 設定有無を 1 段で要約する。 詳細は ledger_module(name=...)
+            で深掘り、 個別バンドルやコンポーネントキーの所属は
+            ledger_bundle(name=...) で逆引きする。 編集前の最初の一手として
+            呼ぶことを想定。
+            """
+            doc = _ledger_fetch()
+            if doc is None:
+                return "ERROR: ledger doc not found in fleet_state index"
+            gitrepos = _fleet_gitrepos_fetch()
+            derived = _derive_module_bundles(doc, gitrepos)
+            cats = doc.get("categories") or {}
+            lines = []
+            lines.append(f"# OpenSpoke 運用台帳 v{doc.get('schema_version','?')}")
+            lines.append(f"  title={doc.get('title','')}")
+            lines.append(f"  updated_at={doc.get('updated_at','?')}")
+            lines.append(
+                f"  (bundle 一覧は Fleet GitRepo から動的導出、 "
+                f"GitRepo 総数={len(gitrepos)})"
+            )
+            lines.append("")
+            for cat_name in ("Core", "Application"):
+                cat = cats.get(cat_name) or {}
+                if not cat:
+                    continue
+                # ACL フィルタ (admin auto-bypass)
+                cat = await _filter_modules_by_acl(cat_name, cat)
+                if not cat:
+                    continue
+                lines.append(f"## {cat_name}")
+                for mod_name, mod in cat.items():
+                    live = mod.get("live_cluster", "-")
+                    fleet_tag = "Fleet" if mod.get("fleet") else "手動/未登録"
+                    canonical = " ★本番ハブ" if mod.get("canonical_production_hub") else ""
+                    role = mod.get("role")
+                    dep = mod.get("depends_on")
+                    bundles_here = derived.get((cat_name, mod_name)) or []
+                    bundle_count = len(bundles_here)
+                    pol = _ledger_format_policy(mod.get("policy"))
+                    bps = mod.get("bundle_policies") or {}
+                    # 孤児 bundle_policies の検出
+                    known_bnames = {b["bundle_name"] for b in bundles_here}
+                    orphans = [bn for bn in bps if bn not in known_bnames]
+                    lines.append(f"  - {mod_name}{canonical}")
+                    lines.append(
+                        f"      live={live}  type={fleet_tag}  "
+                        f"bundle件数(Fleet導出)={bundle_count}"
+                    )
+                    if role:
+                        lines.append(f"      role={role}")
+                    if dep:
+                        lines.append(f"      depends_on={dep}")
+                    lines.append(f"      policy: {pol}")
+                    if bps:
+                        lines.append(
+                            f"      bundle個別方針: {len(bps)} 件 "
+                            f"({', '.join(sorted(bps.keys()))})"
+                        )
+                    if orphans:
+                        lines.append(
+                            f"      ⚠️ 孤児 bundle個別方針 "
+                            f"(該当 bundle が Fleet に無し): "
+                            f"{', '.join(sorted(orphans))}"
+                        )
+                lines.append("")
+            return "\n".join(lines)
+
+        @mcp.tool()
+        async def ledger_module(name: str) -> str:
+            """OpenSpoke 運用台帳から 1 モジュールの詳細を返す。
+
+            name はカテゴリ配下のモジュール名 (例: "Hub", "example-tier",
+            "example-app")。 Core / Application の両方を
+            横断検索し、 見つかれば全フィールドを JSON で返す。 配下の
+            bundle 一覧は Fleet GitRepo を真実源として動的に導出する
+            (ledger の手書き静的フィールドは見ない)。 policy 未設定なら
+            その旨を明示する。 同名が複数カテゴリにある場合は全て返す。
+            該当無しなら "not found" を返す。
+            """
+            doc = _ledger_fetch()
+            if doc is None:
+                return "ERROR: ledger doc not found"
+            gitrepos = _fleet_gitrepos_fetch()
+            derived = _derive_module_bundles(doc, gitrepos)
+            cats = doc.get("categories") or {}
+            results = []
+            for cat_name, cat in cats.items():
+                if name in cat:
+                    # ACL チェック: 未許可ならスキップ (admin auto-bypass)
+                    deny = await _check_module_allowed(cat_name, name)
+                    if deny:
+                        continue
+                    mod = cat[name]
+                    results.append({
+                        "category": cat_name,
+                        "name": name,
+                        "data": mod,
+                        "policy_summary": _ledger_format_policy(mod.get("policy")),
+                        "derived_bundles": derived.get((cat_name, name)) or [],
+                    })
+            if not results:
+                return f"ledger: module '{name}' not found"
+            out = []
+            for r in results:
+                out.append(f"## {r['category']}/{r['name']}")
+                out.append(f"module 既定方針: {r['policy_summary']}")
+                mod_data = r["data"]
+                bundles_here = r["derived_bundles"]
+                if bundles_here:
+                    out.append(
+                        f"Fleet GitRepo から導出した bundle "
+                        f"({len(bundles_here)} 件):"
+                    )
+                    for b in bundles_here:
+                        bn = b["bundle_name"]
+                        rel = b["relative_path"] or "(top)"
+                        ready = b.get("ready_bundle_deployments", "")
+                        eff, src = _ledger_effective_policy(mod_data, bn)
+                        src_tag = ("個別指定" if src == "bundle"
+                                   else ("モジュール継承" if src == "module"
+                                         else "未設定"))
+                        out.append(
+                            f"  - {bn}  rel={rel}  ready={ready}  "
+                            f"方針[{src_tag}]: "
+                            f"{_ledger_format_policy(eff)}"
+                        )
+                else:
+                    out.append("Fleet GitRepo から導出した bundle: 0 件")
+                bps = mod_data.get("bundle_policies") or {}
+                known_bnames = {b["bundle_name"] for b in bundles_here}
+                orphans = [bn for bn in bps if bn not in known_bnames]
+                if orphans:
+                    out.append("")
+                    out.append(
+                        f"⚠️ 孤児 bundle個別方針 "
+                        f"(該当 bundle が Fleet に無し): "
+                        f"{', '.join(sorted(orphans))}"
+                    )
+                out.append("---")
+                out.append(_json.dumps(r["data"], ensure_ascii=False, indent=2))
+                out.append("")
+            return "\n".join(out)
+
+        @mcp.tool()
+        async def ledger_bundle(name: str) -> str:
+            """OpenSpoke 運用台帳 + Fleet GitRepo から bundle 名 を逆引きする。
+
+            name は Fleet GitRepo 名 (= Fleet bundle 名)。 真実源は Fleet
+            GitRepo なので、 ledger の手書き静的フィールドは見ない。
+            GitRepo の spec.paths を ledger.categories.<cat>.<mod>.path と
+            前方一致照合して所属モジュールを特定し、 module 既定方針 /
+            bundle 個別方針 / effective 方針 (個別指定 or 継承) を全て返す。
+            複数モジュール跨ぎなら全件返す。 Fleet には存在するが
+            module.path に当てはまらない bundle はその旨を返す。 該当無しなら
+            "not found" を返す。
+            """
+            doc = _ledger_fetch()
+            if doc is None:
+                return "ERROR: ledger doc not found"
+            gitrepos = _fleet_gitrepos_fetch()
+            derived = _derive_module_bundles(doc, gitrepos)
+            cats = doc.get("categories") or {}
+            hits = []
+            for (cat_name, mod_name), bundles_here in derived.items():
+                for b in bundles_here:
+                    if b["bundle_name"] != name:
+                        continue
+                    # ACL チェック: 未許可モジュール所属の bundle は隠す (admin auto-bypass)
+                    deny = await _check_module_allowed(cat_name, mod_name)
+                    if deny:
+                        continue
+                    mod = (cats.get(cat_name) or {}).get(mod_name) or {}
+                    eff_pol, eff_src = _ledger_effective_policy(mod, name)
+                    bp = (mod.get("bundle_policies") or {}).get(name)
+                    hits.append({
+                        "category": cat_name,
+                        "module": mod_name,
+                        "bundle_name": name,
+                        "matched_path": b["matched_path"],
+                        "relative_path": b["relative_path"],
+                        "all_paths": b["all_paths"],
+                        "ready_clusters": b["ready_clusters"],
+                        "ready_bundle_deployments": b["ready_bundle_deployments"],
+                        "live_cluster": mod.get("live_cluster"),
+                        "canonical_production_hub": mod.get(
+                            "canonical_production_hub", False),
+                        "depends_on": mod.get("depends_on"),
+                        "module_policy": mod.get("policy"),
+                        "bundle_policy": bp,
+                        "effective_policy": eff_pol,
+                        "effective_source": eff_src,
+                    })
+            if not hits:
+                # 念のため未分類 GitRepo にも該当が無いか確認
+                for gr in gitrepos:
+                    if gr.get("name") == name:
+                        paths = gr.get("paths") or []
+                        return (
+                            f"ledger: bundle '{name}' は Fleet GitRepo に存在しますが、"
+                            f" どの module.path にも前方一致しません.\n"
+                            f"  spec.paths={paths}\n"
+                            f"  module 側に該当 path のモジュールが未登録の可能性、"
+                            f" または旧パス (OpenSpoke/ 配下に未移行)"
+                        )
+                return f"ledger: bundle '{name}' not found in Fleet"
+            out = [f"ledger: '{name}' found in {len(hits)} location(s):", ""]
+            for h in hits:
+                mod_pol = _ledger_format_policy(h.get("module_policy"))
+                out.append(
+                    f"  - {h['category']}/{h['module']} "
+                    f"(relative={h['relative_path'] or '(top)'})"
+                )
+                out.append(f"      path={h['matched_path']}")
+                out.append(f"      live_cluster={h.get('live_cluster')}")
+                if h.get("canonical_production_hub"):
+                    out.append("      ★ canonical production hub")
+                if h.get("depends_on"):
+                    out.append(f"      depends_on={h['depends_on']}")
+                out.append(
+                    f"      ready={h.get('ready_bundle_deployments', '')}  "
+                    f"ready_clusters={h.get('ready_clusters', 0)}"
+                )
+                out.append(f"      module 既定方針: {mod_pol}")
+                bp = h.get("bundle_policy")
+                if bp:
+                    out.append(
+                        f"      bundle 個別方針: {_ledger_format_policy(bp)}"
+                    )
+                eff_src = h.get("effective_source")
+                src_tag = ("個別指定" if eff_src == "bundle"
+                           else ("モジュール継承" if eff_src == "module"
+                                 else "未設定"))
+                out.append(
+                    f"      effective 方針 [{src_tag}]: "
+                    f"{_ledger_format_policy(h.get('effective_policy'))}"
+                )
+                out.append("")
+            return "\n".join(out)
+
+        @mcp.tool()
+        async def cluster_upsert_knowledge(
+            cluster: str,
+            namespace: str,
+            id: str,
+            title: str,
+            content: str,
+            category: str = "topic",
+            mode: str = "upsert",
+        ) -> str:
+            """指定クラスタの知識ベースにテキストエントリを投入する (新規・更新)。
+
+            中央ハブが cluster で指定されたスポーク MCP の upsert_knowledge を
+            MCP プロトコル経由で呼び出す。 スポークへの知識投入はテキストチャンク
+            投入のみ (ファイル変換は呼び出し側の責務)。 同じ id があれば mode で
+            挙動制御 (create / update / upsert)。
+
+            Args:
+                cluster:   対象クラスタ名 (list_clusters で確認)
+                namespace: テナント識別子 (例: "your-user")
+                id:        知識エントリ ID (半角英数とアンダースコア、 128 文字以内)
+                title:     1 行タイトル (512 文字以内)
+                content:   本文 (推奨 500-2000 字、 65535 文字以内)
+                category:  粒度カテゴリ
+                mode:      衝突制御モード ("create" / "update" / "upsert")
+            """
+            return await _spoke_call(cluster, "upsert_knowledge", {
+                "namespace": namespace,
+                "id": id,
+                "title": title,
+                "content": content,
+                "category": category,
+                "mode": mode,
+            })
+
+        @mcp.tool()
+        async def cluster_delete_knowledge(
+            cluster: str,
+            namespace: str,
+            id: str,
+        ) -> str:
+            """指定クラスタの知識ベースから指定 id のエントリを削除する。
+
+            中央ハブが cluster で指定されたスポーク MCP の delete_knowledge を
+            MCP プロトコル経由で呼び出す。
+
+            Args:
+                cluster:   対象クラスタ名 (list_clusters で確認)
+                namespace: テナント識別子 (例: "your-user")
+                id:        削除対象の知識エントリ ID
+            """
+            return await _spoke_call(cluster, "delete_knowledge", {
+                "namespace": namespace,
+                "id": id,
+            })
+
+        @mcp.tool()
+        async def cluster_vector_search(
+            cluster: str,
+            namespace: str,
+            query_text: str,
+            top_k: int = 10,
+        ) -> str:
+            """指定クラスタの collection に対してセマンティック検索を実行する。
+
+            中央ハブが cluster で指定されたスポーク MCP の vector_search を
+            MCP プロトコル経由で呼び出す。 upsert_knowledge で投入した知識
+            (collection = secretary_knowledge_{namespace}) を検索する経路。
+            retrieve_chunks (文書インデックス) とは別系統。
+
+            Args:
+                cluster:    対象クラスタ名 (list_clusters で確認)
+                namespace:  検索対象の collection 名
+                            (例: "secretary_knowledge_your_user"。
+                            secretary_knowledge_ prefix は付けて渡す)
+                query_text: 検索クエリの自然言語テキスト
+                top_k:      取得件数 (デフォルト 10、 最大 100)
+            """
+            return await _spoke_call(cluster, "vector_search", {
+                "namespace": namespace,
+                "query_text": query_text,
+                "top_k": top_k,
+            })
+
+        @mcp.tool()
+        async def cluster_opensearch_search(
+            cluster: str,
+            index: str,
+            query_dsl: dict,
+            size: int = 10,
+            sort: list = None,
+        ) -> str:
+            """指定クラスタの OpenSearch index に対して任意のクエリ DSL を実行する。
+
+            中央ハブが cluster で指定されたスポーク MCP の opensearch_search を
+            MCP プロトコル経由で呼び出す。 各スポーククラスタが持つ OpenSearch
+            (アプリケーション本体のデータストア) に対して検索可能。
+
+            Args:
+                cluster:   対象クラスタ名 (list_clusters で確認)
+                index:     対象 index 名 (例: "draft_sessions", "rag_chunks")
+                query_dsl: OpenSearch query DSL の query 部分
+                           (例: {"match": {"content": "..."}})
+                size:      取得件数 (デフォルト 10、 最大 1000)
+                sort:      ソート指定のリスト (省略可)
+            """
+            return await _spoke_call(cluster, "opensearch_search", {
+                "index": index,
+                "query_dsl": query_dsl,
+                "size": size,
+                "sort": sort,
+            })
+
+        @mcp.tool()
+        async def cluster_opensearch_update_document(
+            cluster: str,
+            index: str,
+            doc_id: str,
+            doc: dict,
+            doc_as_upsert: bool = False,
+        ) -> str:
+            """指定クラスタの OpenSearch の 1 ドキュメントを部分更新する。
+
+            中央ハブが cluster で指定されたスポーク MCP の
+            opensearch_update_document を MCP プロトコル経由で呼び出す。
+            指定したフィールドのみ書き換える partial update で、 doc に含めなかった
+            フィールドは変更されない。 1 ドキュメントの特定フィールドだけを
+            直す用途を想定 (例: セッションの状態フラグや属性を 1 つだけ修正する)。
+
+            Args:
+                cluster:       対象クラスタ名 (list_clusters で確認)
+                index:         対象 index 名 (例: "draft_sessions")
+                doc_id:        更新対象ドキュメントの _id
+                doc:           更新するフィールドの辞書
+                               (例: {"no_review_reason": "理由テキスト"})。
+                               空 dict は無意味なので拒否される。
+                doc_as_upsert: True にすると、 doc_id が存在しない場合は doc の内容で
+                               新規作成する (default False = 存在しない場合エラー)。
+            """
+            return await _spoke_call(cluster, "opensearch_update_document", {
+                "index": index,
+                "doc_id": doc_id,
+                "doc": doc,
+                "doc_as_upsert": doc_as_upsert,
+            })
+
+        @mcp.tool()
+        async def cluster_opensearch_delete_document(
+            cluster: str,
+            index: str,
+            doc_id: str,
+            refresh: bool = True,
+        ) -> str:
+            """指定クラスタの OpenSearch から 1 ドキュメントを物理削除する
+            (DELETE /{index}/_doc/{doc_id})。
+
+            中央ハブが cluster で指定されたスポーク MCP の opensearch_delete_document
+            を MCP プロトコル経由で呼び出す。 存在しない doc_id の場合は "not_found"
+            を返す。
+
+            Args:
+                cluster: 対象クラスタ名 (list_clusters で確認)
+                index:   対象 index 名 (例: "ledger_records")
+                doc_id:  削除対象ドキュメントの _id
+                refresh: True (default) なら即座に検索可能化
+            """
+            return await _spoke_call(cluster, "opensearch_delete_document", {
+                "index": index,
+                "doc_id": doc_id,
+                "refresh": refresh,
+            })
+
+        @mcp.tool()
+        async def cluster_opensearch_delete_by_query(
+            cluster: str,
+            index: str,
+            query_dsl: dict,
+            refresh: bool = True,
+            max_docs: int = 0,
+        ) -> str:
+            """指定クラスタの OpenSearch でクエリ DSL に一致するドキュメントを
+            物理削除する (POST /{index}/_delete_by_query)。
+
+            中央ハブが cluster で指定されたスポーク MCP の opensearch_delete_by_query
+            を MCP プロトコル経由で呼び出す。 削除対象を意図せず広げないため、
+            query_dsl は dict 必須かつ空 dict 拒否。
+
+            Args:
+                cluster:   対象クラスタ名 (list_clusters で確認)
+                index:     対象 index 名
+                query_dsl: OpenSearch query DSL の query 部分
+                refresh:   True (default) なら即座に検索可能化
+                max_docs:  0 (default) なら制限なし、 1 以上なら削除件数上限
+            """
+            return await _spoke_call(cluster, "opensearch_delete_by_query", {
+                "index": index,
+                "query_dsl": query_dsl,
+                "refresh": refresh,
+                "max_docs": max_docs,
+            })
+
+        @mcp.tool()
+        async def cluster_opensearch_soft_delete_by_query(
+            cluster: str,
+            index: str,
+            query_dsl: dict,
+            reason: str = "",
+            refresh: bool = True,
+        ) -> str:
+            """指定クラスタの OpenSearch でクエリ DSL に一致するドキュメントを
+            論理削除する (deleted_at / deleted_reason フィールドを追加)。
+
+            中央ハブが cluster で指定されたスポーク MCP の
+            opensearch_soft_delete_by_query を MCP プロトコル経由で呼び出す。
+            物理削除は行わず、 cluster_opensearch_restore_by_query で取り消し可能。
+
+            注意: アプリ側で deleted_at フィルタを未実装の場合、 論理削除しても
+            画面表示からは消えない。 必要に応じてアプリ側の検索クエリに
+            {"bool": {"must_not": {"exists": {"field": "deleted_at"}}}} を組み込む。
+
+            Args:
+                cluster:   対象クラスタ名 (list_clusters で確認)
+                index:     対象 index 名
+                query_dsl: query 部分の DSL
+                reason:    削除理由 (deleted_reason に保存)
+                refresh:   True (default) なら即座に検索可能化
+            """
+            return await _spoke_call(cluster, "opensearch_soft_delete_by_query", {
+                "index": index,
+                "query_dsl": query_dsl,
+                "reason": reason,
+                "refresh": refresh,
+            })
+
+        @mcp.tool()
+        async def cluster_opensearch_restore_by_query(
+            cluster: str,
+            index: str,
+            query_dsl: dict,
+            refresh: bool = True,
+        ) -> str:
+            """指定クラスタの OpenSearch で論理削除を取り消す。
+            対象ドキュメントから deleted_at / deleted_reason フィールドを除去する。
+
+            中央ハブが cluster で指定されたスポーク MCP の
+            opensearch_restore_by_query を MCP プロトコル経由で呼び出す。
+            典型的には query_dsl に {"exists": {"field": "deleted_at"}} を含めて
+            論理削除されているものだけを対象にする。
+
+            Args:
+                cluster:   対象クラスタ名 (list_clusters で確認)
+                index:     対象 index 名
+                query_dsl: query 部分の DSL
+                refresh:   True (default) なら即座に検索可能化
+            """
+            return await _spoke_call(cluster, "opensearch_restore_by_query", {
+                "index": index,
+                "query_dsl": query_dsl,
+                "refresh": refresh,
+            })
+
+        @mcp.tool()
+        async def cluster_local_mcp_call(
+            cluster: str,
+            service: str,
+            namespace: str,
+            tool_name: str,
+            arguments: dict = None,
+            port: int = 8000,
+        ) -> str:
+            """指定クラスタのスポーク MCP から、 同一クラスタ内の別 MCP のツールを呼ぶ。
+
+            中央ハブが cluster で指定されたスポーク MCP の local_mcp_call を MCP
+            プロトコル経由で呼び出す。 スポーク MCP は K8s 内部 Service DNS を使い、
+            同一クラスタ内の他 MCP に SSE で接続して tool_name を実行する。 ハブから
+            スポークの先にある「もう一段奥の MCP」 までリーチするためのファンアウト。
+
+            用途例 (アプリケーション本体の OpenSearch アクセス):
+                cluster_local_mcp_call(
+                    cluster="cluster-name",
+                    service="mcp-application",
+                    namespace="mcp",
+                    tool_name="opensearch_search",
+                    arguments={"index": "some_index",
+                               "query_dsl": {"term": {"key": "..."}}}
+                )
+            この経路: ハブ → スポーク MCP (rag-spoke namespace) → アプリケーション MCP
+            (mcp namespace) → アプリケーション kernel → アプリケーション OpenSearch。
+
+            重要: cluster_opensearch_search / cluster_opensearch_update_document は
+            スポーク自身の OpenSearch (rag-spoke の opensearch インスタンス) にしか
+            届かない。 アプリケーション本体の OpenSearch (opensearch namespace の別
+            インスタンス) に届けるには本ツール経由でアプリケーション MCP (mcp namespace)
+            の同名ツールを呼ぶこと。 OpenSearch インスタンスが複数あるので混同しないよう
+            に注意。
+
+            Args:
+                cluster:   対象クラスタ名 (list_clusters で確認)
+                service:   対象 MCP の Service 名 (例: "mcp-company1")
+                namespace: 対象 Service の namespace (例: "mcp")
+                tool_name: 対象 MCP のツール名 (例: "opensearch_search")
+                arguments: ツール引数辞書 (省略時は空)
+                port:      Service ポート (default 8000)
+            """
+            return await _spoke_call(cluster, "local_mcp_call", {
+                "service": service,
+                "namespace": namespace,
+                "tool_name": tool_name,
+                "arguments": arguments or {},
+                "port": port,
+            })
+
+        @mcp.tool()
+        async def cluster_node_list(cluster: str) -> str:
+            """指定クラスタの node-shell DaemonSet の Pod 一覧を返す。
+
+            中央ハブが cluster で指定されたスポーク MCP の node_list を
+            MCP プロトコル経由で呼び出す。 どのノードでコマンドを実行できるか
+            の確認用。
+
+            Args:
+                cluster: 対象クラスタ名 (list_clusters で確認)
+            """
+            return await _spoke_call(cluster, "node_list", {})
+
+        @mcp.tool()
+        async def cluster_node_exec(
+            cluster: str,
+            node: str,
+            command: str,
+            timeout: int = 30,
+        ) -> str:
+            """指定クラスタの指定ノードの host OS で bash コマンドを実行する。
+
+            中央ハブが cluster で指定されたスポーク MCP の node_exec を
+            MCP プロトコル経由で呼び出す。 スポーク側で node-shell DaemonSet
+            (ns=node-shell) の対象ノード Pod を K8s API で探索し、 Pod IP に
+            HTTP POST で要求を委譲する。 host PID namespace に nsenter で
+            入って bash -c で評価される。
+
+            Args:
+                cluster: 対象クラスタ名 (list_clusters で確認)
+                node:    対象ノード名 (cluster_node_list で確認可能)
+                command: bash -c で評価される 1 行コマンド文字列。 パイプ可
+                timeout: 秒 (default 30、 最大 300)
+            """
+            return await _spoke_call(cluster, "node_exec", {
+                "node": node,
+                "command": command,
+                "timeout": timeout,
+            })
+
+        @mcp.tool()
+        async def cluster_local_fleet_state(cluster: str) -> str:
+            """指定クラスタの Fleet GitOps state (Bundle / BundleDeployment / Cluster) を
+            compact JSON で返す (read-only)。
+
+            中央ハブが cluster で指定されたスポーク MCP の local_fleet_state を
+            MCP プロトコル経由で呼び出す。 スポーク側 kernel の
+            /core/k8s/fleet-state エンドポイントで CustomObjectsApi を使い、
+            管理用フィールド (managedFields / status.resources 等) を除外した
+            compact JSON だけを返すため、 cluster_k8s_get で同等のことをやろうとした
+            時に発生する MCP 応答サイズ上限超過を回避できる。
+
+            主な用途は Fleet サーバ本体クラスタ (現状 fleet-cluster) の状態取得。
+            Fleet 配下に組み込まれていない一般クラスタでは、 BundleDeployment 一覧
+            のみ返り、 Bundle / Cluster CR は空配列になる。
+
+            Args:
+                cluster: 対象クラスタ名 (list_clusters で確認)
+
+            Returns:
+                JSON 文字列。 構造は spoke の local_fleet_state を参照。
+            """
+            return await _spoke_call(cluster, "local_fleet_state", {})
+
+        # ========================================================
+        # システム全容ブリーフィング (Claude 横断セッション継続用)
+        # ========================================================
+        #
+        # 目的: 別プロジェクト・別スレッドの Claude が、the operator's
+        # システム全体を即座に理解して仕事を始められるようにする。
+        # ツール一覧の説明文に「最初に必ず呼ぶ」と書いておくことで
+        # Claude の自発的呼び出しを誘発する。
+        #
+        # 構成: 3 つのツール
+        #   system_brief()        — 全体像の一発配信 (引数なし)
+        #   system_lookup(topic)  — 詳細トピックの引き出し
+        #   system_topics()       — 利用可能 topic 一覧 (動的)
+        #
+        # データの在処 (2026-05-25 移行):
+        #   既存の知識ベース (Milvus) に格納している。
+        #   namespace: "your-user" (= collection: secretary_knowledge_your_user)
+        #   id 規約:
+        #     - _handoff_brief                 : system_brief 本文
+        #     - _handoff_topic_<トピック名>     : system_lookup 各トピック本文
+        #     - _handoff_summary_<トピック名>   : system_topics 用の短い説明
+        #
+        # 更新方法:
+        #   Claude は upsert_knowledge ツールを呼ぶだけ。
+        #   Pod 再起動・コネクター再接続いずれも不要。
+        #   次の呼び出しから新内容が反映される。
+        #
+        # フォールバック:
+        #   knowledge 取得に失敗した場合は、 その旨をエラーメッセージで返す。
+        #   knowledge 不在時は「初期投入が必要」 と案内する。
+
+        _HANDOFF_NAMESPACE = "your-user"
+        _HANDOFF_COLLECTION = "secretary_knowledge_your_user"
+        _HANDOFF_BRIEF_ID = "_handoff_brief"
+        _HANDOFF_TOPIC_PREFIX = "_handoff_topic_"
+        _HANDOFF_SUMMARY_PREFIX = "_handoff_summary_"
+
+        # kernel URL は hub_tools.py 冒頭で _KERNEL_URL として定義済み
+
+        async def _handoff_fetch_one(entry_id: str) -> str | None:
+            """knowledge から 1 エントリの content を取得する。
+            存在しないか取得失敗時は None を返す。
+            """
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as c:
+                    r = await c.post(
+                        f"{_KERNEL_URL}/core/vectorstore/query",
+                        json={
+                            "namespace": _HANDOFF_COLLECTION,
+                            "expr": f'id == "{entry_id}"',
+                            "output_fields": ["id", "title", "content"],
+                            "limit": 1,
+                        },
+                    )
+                if r.status_code != 200:
+                    logger.warning(
+                        "[handoff] kernel http=%s body=%s",
+                        r.status_code, r.text[:200]
+                    )
+                    return None
+                data = r.json()
+                if not data.get("ok"):
+                    return None
+                results = data.get("results") or []
+                if not results:
+                    return None
+                return results[0].get("content") or ""
+            except Exception as e:
+                logger.error("[handoff] fetch error: %s", e)
+                return None
+
+        async def _handoff_fetch_all_topics() -> list:
+            """_handoff_topic_* の全エントリを取得して
+            [(topic_name, title), ...] を返す (本文は含まない、 一覧用)。
+            """
+            try:
+                # Milvus は LIKE がないので、 prefix で expr を組めない。
+                # 代わりに id field の中身を全件取得して filter する。
+                # secretary_knowledge_your_user 全体の件数を考えると、
+                # limit=1000 で十分カバーできる。
+                async with httpx.AsyncClient(timeout=30.0) as c:
+                    r = await c.post(
+                        f"{_KERNEL_URL}/core/vectorstore/query",
+                        json={
+                            "namespace": _HANDOFF_COLLECTION,
+                            "expr": 'id != ""',
+                            "output_fields": ["id", "title"],
+                            "limit": 1000,
+                        },
+                    )
+                if r.status_code != 200:
+                    logger.warning(
+                        "[handoff] kernel list http=%s body=%s",
+                        r.status_code, r.text[:200]
+                    )
+                    return []
+                data = r.json()
+                if not data.get("ok"):
+                    return []
+                results = data.get("results") or []
+                topics = []
+                for it in results:
+                    eid = it.get("id") or ""
+                    if eid.startswith(_HANDOFF_TOPIC_PREFIX):
+                        name = eid[len(_HANDOFF_TOPIC_PREFIX):]
+                        topics.append((name, it.get("title") or ""))
+                topics.sort(key=lambda x: x[0])
+                return topics
+            except Exception as e:
+                logger.error("[handoff] list error: %s", e)
+                return []
+
+        async def _handoff_fetch_summary(topic_name: str) -> str:
+            """_handoff_summary_<name> エントリから短い説明を取得する。
+            存在しなければ空文字を返す。
+            """
+            entry_id = f"{_HANDOFF_SUMMARY_PREFIX}{topic_name}"
+            content = await _handoff_fetch_one(entry_id)
+            return content or ""
+
+        _HANDOFF_BOOTSTRAP_MESSAGE = (
+            "# system_brief 本文が未投入です\n"
+            "\n"
+            "knowledge base (namespace='your-user', id='_handoff_brief')\n"
+            "に system_brief 本文が格納されていません。\n"
+            "\n"
+            "To the operator: 初期データ投入が必要です。 Claude に\n"
+            "「system_brief の初期データを投入して」 と頼んでください。\n"
+            "Claude が upsert_knowledge ツールで全コンテンツを\n"
+            "投入します。\n"
+        )
+
+        @mcp.tool()
+        async def system_brief() -> str:
+            """**最初に必ずこのツールを呼んでください。**
+
+            the operator (your-user) のシステム全体の地図を一発で返します。
+            別プロジェクト・別スレッドの Claude がこのシステムを触る前に
+            読むべき必須情報 (Standalone Fleet マルチクラスター GitOps、
+            ハブ&スポーク構成、リポジトリ構造、絶対禁則、命名規則、
+            この MCP サーバ自身の在処、主要トピックの索引) を含みます。
+
+            詳細トピックは system_lookup(topic=...) で引いてください。
+            利用可能トピックの一覧は system_topics() で取得できます。
+
+            Args: なし
+            """
+            notice = await _acl_scope_notice()
+            # 非 admin には本文を返さない (handoff_brief には全モジュール / 全クラスタの
+            # カタログが含まれており、 非 admin に渡すと Claude がそれを情報源にして
+            # 範囲外リソース名を列挙してしまうため)。
+            acl = None
+            if _get_current_acl_async is not None:
+                try:
+                    acl = await _get_current_acl_async()
+                except Exception:
+                    pass
+            is_admin = bool(acl and acl.get("is_admin"))
+            if not is_admin:
+                stub = (
+                    "## 使えるツール\n\n"
+                    "- `my_acl()` — 利用可能なリソースを確認\n"
+                    "- `ledger_overview()` — モジュール台帳\n"
+                    "- `ledger_module(name=...)` — 個別モジュールの詳細\n"
+                    "- `cluster_*` 系ツール — クラスタへの操作\n\n"
+                    "各ツールの詳細は docstring を参照してください。\n"
+                )
+                return notice + stub
+            content = await _handoff_fetch_one(_HANDOFF_BRIEF_ID)
+            if content is None:
+                return notice + _HANDOFF_BOOTSTRAP_MESSAGE
+            return notice + content
+
+        @mcp.tool()
+        async def system_lookup(topic: str) -> str:
+            """system_brief で示されたトピックの詳細を返します。
+
+            利用可能な topic 値の最新一覧は system_topics() を呼んで
+            取得してください。トピックは随時追加されるため、この docstring
+            には個別の topic 名を列挙しません (列挙すると新トピック追加の
+            たびにコネクター再接続が必要になるため)。
+
+            このツールは knowledge base から都度取得するため、 知識更新は
+            Pod 再起動・コネクター再接続いずれも不要で反映されます。
+
+            Args:
+                topic: system_topics() で得た topic 名のいずれか。
+                       先頭に '#' は付けない。
+            """
+            # 非 admin はアクセス全拒否 (topic 本文はシステム全体の俯瞰情報を含むため)。
+            acl = None
+            if _get_current_acl_async is not None:
+                try:
+                    acl = await _get_current_acl_async()
+                except Exception:
+                    pass
+            is_admin = bool(acl and acl.get("is_admin"))
+            if not is_admin:
+                return "該当する情報はありません。"
+            t = (topic or "").strip().lstrip("#").lower()
+            if not t:
+                return ("topic を指定してください。利用可能トピックは "
+                        "system_topics() で取得できます。")
+            # Milvus id 規約により knowledge base 側はアンダースコア区切り。
+            # ユーザー入力は `-` でも `_` でも受け付け、内部で `_` に正規化する。
+            t = t.replace("-", "_")
+            entry_id = f"{_HANDOFF_TOPIC_PREFIX}{t}"
+            content = await _handoff_fetch_one(entry_id)
+            if content is None:
+                topics = await _handoff_fetch_all_topics()
+                if not topics:
+                    return _HANDOFF_BOOTSTRAP_MESSAGE
+                names = ", ".join(name for name, _ in topics)
+                return (f"未知の topic '{topic}'。利用可能: {names}")
+            return content
+
+        @mcp.tool()
+        async def system_topics() -> str:
+            """system_lookup で引ける topic 値の最新一覧を返します。
+
+            system_brief を呼んだ後、詳細を引きたいときに使ってください。
+            このツール自体の説明文 (docstring) は不変なので、新トピックが
+            追加されてもコネクター再接続なしで最新一覧を取得できます。
+
+            データは knowledge base から都度取得するため、 トピック追加・
+            削除も Pod 再起動なしで反映されます。
+
+            Args: なし
+            """
+            notice = await _acl_scope_notice()
+            # 非 admin にはトピック一覧を返さない (トピック名自体が範囲外モジュール /
+            # クラスタの存在を示唆する情報源になりうるため)。
+            acl = None
+            if _get_current_acl_async is not None:
+                try:
+                    acl = await _get_current_acl_async()
+                except Exception:
+                    pass
+            is_admin = bool(acl and acl.get("is_admin"))
+            if not is_admin:
+                stub = (
+                    "## topic 一覧\n\n"
+                    "現在利用可能な topic はありません。\n"
+                    "利用可能なリソースは `my_acl()` / `ledger_overview()` で取得してください。"
+                )
+                return notice + stub
+            topics = await _handoff_fetch_all_topics()
+            if not topics:
+                return notice + _HANDOFF_BOOTSTRAP_MESSAGE
+            lines = [f"## system_lookup の topic 一覧 ({len(topics)} 件)\n"]
+            for name, _title in topics:
+                summary = await _handoff_fetch_summary(name)
+                if summary:
+                    lines.append(f"- `{name}` — {summary}")
+                else:
+                    lines.append(f"- `{name}`")
+            lines.append("")
+            lines.append("使い方: system_lookup(topic='<上記のいずれか>')")
+            return notice + "\n".join(lines)
+
+        @mcp.tool()
+        async def spawn(
+            prompt: str,
+            alias: str = "",
+            label: str = "",
+            model: str = "",
+            timeout_sec: int = 1800,
+            priority: str = "normal",
+            context: str = "",
+            user_id: str = "",
+            project_id: str = "",
+            is_supervisor: bool = False,
+            parent_supervisor: str = "",
+            mode: str = "claude",
+        ) -> str:
+            """並列スポーンで作業を非同期投入する。 対話 Claude はこの tool を叩いた直後に次の会話に戻れる。
+
+            worker Claude が別プロセスで作業を進め、結果を確認するには get_spawn_result で照会。
+            進行中の spawn は list_spawns、 相談待ちは list_spawn_questions で見られる。
+
+            **管理スポーン (supervisor spawn)**: is_supervisor=True で起動すると、system prompt が
+            supervisor 用に切り替わり、MAX_TURNS=20 / MAX_TOOL_ITERATIONS=50、 timeout 最小 4 時間で
+            長時間動作するモードになる。 supervisor 自身が spawn tool で子スポーンを起票し、
+            parent_supervisor に自分の full_id を指定することで managed_spawns 関係が記録される。
+
+            Args:
+                prompt: worker Claude に渡す作業指示 (必須)
+                alias: 別名 (例: "並列スポーン開発")。 会話で spawn を短く指せる
+                label: 対話スレッドで参照する短い名前 (alias とほぼ同義、内部識別用)
+                model: 使用モデル (省略時は kernel の CLAUDE_MODEL)
+                timeout_sec: 全体タイムアウト秒 (default 1800、 supervisor は最小 14400 に自動延長)
+                priority: high / normal / low
+                context: worker に渡す背景情報 (関連 topic 名、参考 path 等)
+                user_id: 投入者 (省略時は OAuth session から自動取得)
+                project_id: 所属プロジェクト ID (proj-hex8)。 省略時は未所属
+                is_supervisor: True で管理スポーンとして起動 (default False)
+                parent_supervisor: 親管理スポーンの full_id。 supervisor が子を起票する際に指定すると、
+                                    親の managed_spawns に自動追加される
+                mode: 処理モード。 "claude" (default) は Claude Sonnet 直行、
+                      "orchestrator" は gemma2 で triage 判定してから
+                      simple なら gemma2 単独回答、 complex なら Claude tier (light/standard/advanced) を
+                      自動選択して実行。 simple な質問は gemma2 単独回答なので Claude API コストゼロ。
+            Returns:
+                "OK: full_id=spawn-NN-hex8 serial=NN alias=... state=queued" または "エラー: ..."
+            """
+            if not user_id:
+                try:
+                    acl = await _get_current_acl_async()
+                    user_id = (acl or {}).get("username") or ""
+                except Exception:
+                    user_id = ""
+
+            payload = {
+                "prompt": prompt,
+                "alias": alias,
+                "label": label,
+                "model": model,
+                "timeout_sec": timeout_sec,
+                "priority": priority,
+                "context": context,
+                "user_id": user_id,
+                "project_id": project_id,
+                "is_supervisor": is_supervisor,
+                "parent_supervisor": parent_supervisor,
+                "mode": mode,
+            }
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as c:
+                    r = await c.post(f"{_KERNEL_URL}/core/spawn/submit", json=payload)
+                if r.status_code != 200:
+                    return f"エラー: kernel http={r.status_code} {r.text[:200]}"
+                res = r.json()
+                if not res.get("ok"):
+                    return f"エラー: {res.get('error') or '未知のエラー'}"
+                return (
+                    f"OK: full_id={res.get('full_id')} serial=spawn-{res.get('serial')} "
+                    f"alias={res.get('alias')!r} state=queued user_id={user_id!r}"
+                )
+            except Exception as e:
+                logger.warning(f"[spawn] failed: {e}")
+                return f"エラー: {type(e).__name__}: {str(e)[:200]}"
+
+        @mcp.tool()
+        async def list_spawns(
+            state: str = "",
+            limit: int = 50,
+            include_result: bool = False,
+            user_id: str = "",
+        ) -> str:
+            """投入済み spawn の一覧を新しい順に返す。
+
+            Args:
+                state: フィルタ (queued / running / waiting_user / done / failed / cancel_requested / cancelled)。 空なら全部
+                limit: 最大件数 (default 50, max 500)
+                include_result: True なら done/failed の本文も含める
+                user_id: 特定ユーザーで絞る (空なら全ユーザー)
+            Returns:
+                複数行テキスト
+            """
+            payload = {"state": state, "limit": limit, "include_result": include_result, "user_id": user_id}
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as c:
+                    r = await c.post(f"{_KERNEL_URL}/core/spawn/list", json=payload)
+                if r.status_code != 200:
+                    return f"エラー: kernel http={r.status_code} {r.text[:200]}"
+                res = r.json()
+                if not res.get("ok"):
+                    return f"エラー: {res.get('error') or '未知のエラー'}"
+                spawns = res.get("spawns") or []
+                if not spawns:
+                    return "spawn は 0 件です。"
+                lines = [f"合計 {res.get('count', len(spawns))} 件:"]
+                for s in spawns:
+                    serial = s.get('serial') or '??'
+                    alias = s.get('alias') or ''
+                    alias_str = f" [{alias}]" if alias else ""
+                    lines.append(
+                        f"- spawn-{serial}{alias_str} state={s.get('state')} "
+                        f"user={s.get('user_id')!r} priority={s.get('priority')} "
+                        f"submitted={s.get('submitted_at')} full_id={s.get('full_id')}"
+                    )
+                return "\n".join(lines)
+            except Exception as e:
+                logger.warning(f"[list_spawns] failed: {e}")
+                return f"エラー: {type(e).__name__}: {str(e)[:200]}"
+
+        @mcp.tool()
+        async def get_spawn_result(spawn_ref: str) -> str:
+            """指定 spawn の state と結果 (done なら本文、 failed ならエラー) を返す。
+
+            Args:
+                spawn_ref: 通番 (例: "04" or "spawn-04") / フル ID (spawn-04-a3f1c9e2) / 別名 のいずれか
+            Returns:
+                複数行テキスト
+            """
+            if not spawn_ref:
+                return "エラー: spawn_ref が空です"
+            payload = {"spawn_ref": spawn_ref}
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as c:
+                    r = await c.post(f"{_KERNEL_URL}/core/spawn/get", json=payload)
+                if r.status_code != 200:
+                    return f"エラー: kernel http={r.status_code} {r.text[:200]}"
+                res = r.json()
+                if not res.get("ok"):
+                    return f"エラー: {res.get('error') or '未知のエラー'}"
+                s = res.get("spawn") or {}
+                serial = s.get('serial') or '??'
+                alias = s.get('alias') or ''
+                alias_str = f" [{alias}]" if alias else ""
+                lines = [
+                    f"spawn-{serial}{alias_str}",
+                    f"full_id: {s.get('full_id')}",
+                    f"state: {s.get('state')}",
+                    f"user_id: {s.get('user_id')}",
+                    f"label: {s.get('label')!r}",
+                    f"model: {s.get('model')}",
+                    f"priority: {s.get('priority')}",
+                    f"submitted_at: {s.get('submitted_at')}",
+                    f"started_at: {s.get('started_at')}",
+                    f"finished_at: {s.get('finished_at')}",
+                    f"worker_id: {s.get('worker_id')}",
+                ]
+                if s.get("state") == "done" and s.get("result"):
+                    lines.append("--- result ---")
+                    lines.append(str(s.get("result")))
+                if s.get("state") == "failed" and s.get("error_body"):
+                    lines.append("--- error ---")
+                    lines.append(str(s.get("error_body")))
+                return "\n".join(lines)
+            except Exception as e:
+                logger.warning(f"[get_spawn_result] failed: {e}")
+                return f"エラー: {type(e).__name__}: {str(e)[:200]}"
+
+        @mcp.tool()
+        async def cancel_spawn(spawn_ref: str) -> str:
+            """指定 spawn を cancel する。 queued 中なら即 cancelled、 running 中なら cancel_requested を書く。
+
+            Args:
+                spawn_ref: 通番 / フル ID / 別名 のいずれか
+            Returns:
+                "OK: ..." または "エラー: ..."
+            """
+            if not spawn_ref:
+                return "エラー: spawn_ref が空です"
+            payload = {"spawn_ref": spawn_ref}
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as c:
+                    r = await c.post(f"{_KERNEL_URL}/core/spawn/cancel", json=payload)
+                if r.status_code != 200:
+                    return f"エラー: kernel http={r.status_code} {r.text[:200]}"
+                res = r.json()
+                if not res.get("ok"):
+                    return f"エラー: {res.get('error') or '未知のエラー'}"
+                s = res.get("spawn") or {}
+                return f"OK: full_id={s.get('full_id')} state={s.get('state')}"
+            except Exception as e:
+                logger.warning(f"[cancel_spawn] failed: {e}")
+                return f"エラー: {type(e).__name__}: {str(e)[:200]}"
+
+        @mcp.tool()
+        async def list_spawn_questions() -> str:
+            """worker が [BLOCKING] で停止して回答待ちの spawn 一覧を、質問本文つきで返す。
+
+            対話 Claude はこの tool で溜まっている blocking 質問を一括取得し、
+            answer_spawn で個別に回答すると worker が作業を再開する。
+
+            Returns:
+                複数行テキスト
+            """
+            payload = {"state": "waiting_user", "limit": 100, "include_result": False}
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as c:
+                    r = await c.post(f"{_KERNEL_URL}/core/spawn/list", json=payload)
+                if r.status_code != 200:
+                    return f"エラー: kernel http={r.status_code} {r.text[:200]}"
+                res = r.json()
+                if not res.get("ok"):
+                    return f"エラー: {res.get('error') or '未知のエラー'}"
+                spawns = res.get("spawns") or []
+                if not spawns:
+                    return "回答待ちの質問はありません。"
+                lines = [f"回答待ち {len(spawns)} 件:"]
+                for s in spawns:
+                    question = s.get("question") or "(質問本文が取得できませんでした)"
+                    serial = s.get('serial') or '??'
+                    alias = s.get('alias') or ''
+                    alias_str = f" [{alias}]" if alias else ""
+                    lines.append("")
+                    lines.append(
+                        f"=== spawn-{serial}{alias_str} full_id={s.get('full_id')} "
+                        f"user={s.get('user_id')!r} priority={s.get('priority')} "
+                        f"submitted={s.get('submitted_at')} ==="
+                    )
+                    lines.append(question)
+                return "\n".join(lines)
+            except Exception as e:
+                logger.warning(f"[list_spawn_questions] failed: {e}")
+                return f"エラー: {type(e).__name__}: {str(e)[:200]}"
+
+        @mcp.tool()
+        async def answer_spawn(spawn_ref: str, answer: str) -> str:
+            """waiting_user 状態の spawn に回答を送る。 worker はこれを受けて作業を続ける。
+
+            Args:
+                spawn_ref: 通番 / フル ID / 別名 のいずれか
+                answer: 対話 Claude から worker への回答本文
+            Returns:
+                "OK: ..." または "エラー: ..."
+            """
+            if not spawn_ref:
+                return "エラー: spawn_ref が空です"
+            if not answer:
+                return "エラー: answer が空です"
+            payload = {"spawn_ref": spawn_ref, "answer": answer}
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as c:
+                    r = await c.post(f"{_KERNEL_URL}/core/spawn/answer", json=payload)
+                if r.status_code != 200:
+                    return f"エラー: kernel http={r.status_code} {r.text[:200]}"
+                res = r.json()
+                if not res.get("ok"):
+                    return f"エラー: {res.get('error') or '未知のエラー'}"
+                return f"OK: spawn_ref={spawn_ref} に回答を送信しました。 worker が続きから作業を再開します。"
+            except Exception as e:
+                logger.warning(f"[answer_spawn] failed: {e}")
+                return f"エラー: {type(e).__name__}: {str(e)[:200]}"
+
+        @mcp.tool()
+        async def force_spawn_state(spawn_ref: str, new_state: str, reason: str = "") -> str:
+            """orphan spawn (worker が SIGKILL された後に waiting_user のまま残る spawn) を
+            強制的に cancelled または failed に遷移させる。 admin 専用。
+
+            副作用として spawn:question / spawn:answer_queue も cleanup する。
+            現在 state が done / failed / cancelled の場合は no-op で成功扱い。
+
+            Args:
+                spawn_ref: 対象 spawn の 通番 / フル ID / 別名
+                new_state: 遷移先 state。 "cancelled" または "failed" のみ許容
+                reason:    cleanup 理由 (省略時は "force_state by admin")
+            Returns:
+                "OK: ..." または "エラー: ..."
+            """
+            if not spawn_ref:
+                return "エラー: spawn_ref が空です"
+            if new_state not in ("cancelled", "failed"):
+                return f"エラー: new_state は 'cancelled' または 'failed' のみ指定可能です (got: {new_state!r})"
+            payload: dict = {"spawn_ref": spawn_ref, "new_state": new_state}
+            if reason:
+                payload["reason"] = reason
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as c:
+                    r = await c.post(f"{_KERNEL_URL}/core/spawn/force_state", json=payload)
+                if r.status_code != 200:
+                    return f"エラー: kernel http={r.status_code} {r.text[:200]}"
+                res = r.json()
+                if not res.get("ok"):
+                    return f"エラー: {res.get('error') or '未知のエラー'}"
+                s = res.get("spawn") or {}
+                return (f"OK: spawn_ref={spawn_ref} を {new_state} に遷移しました。 "
+                        f"state={s.get('state')} finished_at={s.get('finished_at')}")
+            except Exception as e:
+                logger.warning(f"[force_spawn_state] failed: {e}")
+                return f"エラー: {type(e).__name__}: {str(e)[:200]}"
+
+        # ========================================================
+        # プロジェクト管理 (kernel /core/project/* 系)
+        # ========================================================
+
+        @mcp.tool()
+        async def create_project(
+            name: str,
+            description: str = "",
+            owners: list | None = None,
+            members: list | None = None,
+        ) -> str:
+            """プロジェクトを新規作成する。
+
+            プロジェクト ID は kernel が自動生成する (形式: proj-{hex8})。
+            owners / members は user_id (email 形式) の配列。
+
+            Args:
+                name:        プロジェクト名 (必須)
+                description: 説明 (省略可)
+                owners:      共同オーナーの user_id 配列 (省略時は空)
+                members:     メンバーの user_id 配列 (省略時は空)
+            Returns:
+                "OK: project_id=proj-XXXXXXXX name=..." または "エラー: ..."
+            """
+            if not name:
+                return "エラー: name が空です"
+            payload: dict = {
+                "name": name,
+                "description": description,
+                "owners": owners or [],
+                "members": members or [],
+            }
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as c:
+                    r = await c.post(f"{_KERNEL_URL}/core/project/create", json=payload)
+                if r.status_code != 200:
+                    return f"エラー: kernel http={r.status_code} {r.text[:200]}"
+                res = r.json()
+                if not res.get("ok"):
+                    return f"エラー: {res.get('error') or '未知のエラー'}"
+                p = res.get("project") or {}
+                return (
+                    f"OK: project_id={p.get('project_id')} name={p.get('name')!r} "
+                    f"status={p.get('status')} created_at={p.get('created_at')}"
+                )
+            except Exception as e:
+                logger.warning(f"[create_project] failed: {e}")
+                return f"エラー: {type(e).__name__}: {str(e)[:200]}"
+
+        @mcp.tool()
+        async def list_projects(
+            status: str = "",
+            user_id: str = "",
+            limit: int = 50,
+        ) -> str:
+            """プロジェクト一覧を返す。
+
+            Args:
+                status:  絞り込み (active / completed / archived)。 空なら全件
+                user_id: 特定ユーザーが owner または member のプロジェクトに絞る (空なら全件)
+                limit:   最大件数 (default 50)
+            Returns:
+                複数行テキスト
+            """
+            payload: dict = {"status": status, "user_id": user_id, "limit": limit}
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as c:
+                    r = await c.post(f"{_KERNEL_URL}/core/project/list", json=payload)
+                if r.status_code != 200:
+                    return f"エラー: kernel http={r.status_code} {r.text[:200]}"
+                res = r.json()
+                if not res.get("ok"):
+                    return f"エラー: {res.get('error') or '未知のエラー'}"
+                projects = res.get("projects") or []
+                if not projects:
+                    return "プロジェクトは 0 件です。"
+                lines = [f"合計 {res.get('count', len(projects))} 件:"]
+                for p in projects:
+                    owners_str = ", ".join(p.get("owners") or []) or "(なし)"
+                    members_str = ", ".join(p.get("members") or []) or "(なし)"
+                    lines.append(
+                        f"- {p.get('project_id')} [{p.get('status')}] "
+                        f"{p.get('name')!r}  owners={owners_str}  members={members_str}"
+                    )
+                return "\n".join(lines)
+            except Exception as e:
+                logger.warning(f"[list_projects] failed: {e}")
+                return f"エラー: {type(e).__name__}: {str(e)[:200]}"
+
+        @mcp.tool()
+        async def get_project(project_id: str) -> str:
+            """プロジェクト 1 件の詳細を返す。
+
+            Args:
+                project_id: 対象プロジェクト ID (proj-{hex8})
+            Returns:
+                プロジェクト詳細テキスト
+            """
+            if not project_id:
+                return "エラー: project_id が空です"
+            payload: dict = {"project_id": project_id}
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as c:
+                    r = await c.post(f"{_KERNEL_URL}/core/project/get", json=payload)
+                if r.status_code != 200:
+                    return f"エラー: kernel http={r.status_code} {r.text[:200]}"
+                res = r.json()
+                if not res.get("ok"):
+                    return f"エラー: {res.get('error') or '未知のエラー'}"
+                p = res.get("project") or {}
+                owners_str = ", ".join(p.get("owners") or []) or "(なし)"
+                members_str = ", ".join(p.get("members") or []) or "(なし)"
+                lines = [
+                    f"project_id: {p.get('project_id')}",
+                    f"name: {p.get('name')}",
+                    f"description: {p.get('description') or '(なし)'}",
+                    f"status: {p.get('status')}",
+                    f"owners: {owners_str}",
+                    f"members: {members_str}",
+                    f"created_at: {p.get('created_at')}",
+                    f"updated_at: {p.get('updated_at')}",
+                ]
+                return "\n".join(lines)
+            except Exception as e:
+                logger.warning(f"[get_project] failed: {e}")
+                return f"エラー: {type(e).__name__}: {str(e)[:200]}"
+
+        @mcp.tool()
+        async def update_project(
+            project_id: str,
+            name: str | None = None,
+            description: str | None = None,
+            status: str | None = None,
+        ) -> str:
+            """プロジェクトの情報を更新する。
+
+            None で渡したフィールドは変更されない。
+            status は active / completed / archived の 3 値のみ有効。
+
+            Args:
+                project_id:  更新対象プロジェクト ID (必須)
+                name:        新しい名前 (省略時は変更なし)
+                description: 新しい説明 (省略時は変更なし)
+                status:      新しいステータス (active / completed / archived)
+            Returns:
+                "OK: ..." または "エラー: ..."
+            """
+            if not project_id:
+                return "エラー: project_id が空です"
+            payload: dict = {"project_id": project_id}
+            if name is not None:
+                payload["name"] = name
+            if description is not None:
+                payload["description"] = description
+            if status is not None:
+                payload["status"] = status
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as c:
+                    r = await c.post(f"{_KERNEL_URL}/core/project/update", json=payload)
+                if r.status_code != 200:
+                    return f"エラー: kernel http={r.status_code} {r.text[:200]}"
+                res = r.json()
+                if not res.get("ok"):
+                    return f"エラー: {res.get('error') or '未知のエラー'}"
+                p = res.get("project") or {}
+                return (
+                    f"OK: project_id={p.get('project_id')} name={p.get('name')!r} "
+                    f"status={p.get('status')} updated_at={p.get('updated_at')}"
+                )
+            except Exception as e:
+                logger.warning(f"[update_project] failed: {e}")
+                return f"エラー: {type(e).__name__}: {str(e)[:200]}"
+
+        @mcp.tool()
+        async def archive_project(project_id: str) -> str:
+            """プロジェクトをアーカイブする (status を archived に変更)。
+
+            Args:
+                project_id: 対象プロジェクト ID (proj-{hex8})
+            Returns:
+                "OK: ..." または "エラー: ..."
+            """
+            if not project_id:
+                return "エラー: project_id が空です"
+            payload: dict = {"project_id": project_id}
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as c:
+                    r = await c.post(f"{_KERNEL_URL}/core/project/archive", json=payload)
+                if r.status_code != 200:
+                    return f"エラー: kernel http={r.status_code} {r.text[:200]}"
+                res = r.json()
+                if not res.get("ok"):
+                    return f"エラー: {res.get('error') or '未知のエラー'}"
+                p = res.get("project") or {}
+                return (
+                    f"OK: project_id={p.get('project_id')} archived. "
+                    f"status={p.get('status')} updated_at={p.get('updated_at')}"
+                )
+            except Exception as e:
+                logger.warning(f"[archive_project] failed: {e}")
+                return f"エラー: {type(e).__name__}: {str(e)[:200]}"
+
+        @mcp.tool()
+        async def delete_project(
+            project_id: str,
+            cascade: bool = True,
+        ) -> str:
+            """プロジェクトを削除する。
+
+            cascade=True (default) の場合、 所属する live spawn を含めて連鎖削除する。
+            confirm なしで即実行される。
+
+            Args:
+                project_id: 削除対象プロジェクト ID (proj-{hex8})
+                cascade:    True なら所属 spawn も連鎖削除 (default True)
+            Returns:
+                "OK: ..." または "エラー: ..."
+            """
+            if not project_id:
+                return "エラー: project_id が空です"
+            payload: dict = {"project_id": project_id, "cascade": cascade}
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as c:
+                    r = await c.post(f"{_KERNEL_URL}/core/project/delete", json=payload)
+                if r.status_code != 200:
+                    return f"エラー: kernel http={r.status_code} {r.text[:200]}"
+                res = r.json()
+                if not res.get("ok"):
+                    return f"エラー: {res.get('error') or '未知のエラー'}"
+                deleted_spawns = res.get("deleted_spawns", 0)
+                return (
+                    f"OK: project_id={project_id} deleted. "
+                    f"deleted_spawns={deleted_spawns}"
+                )
+            except Exception as e:
+                logger.warning(f"[delete_project] failed: {e}")
+                return f"エラー: {type(e).__name__}: {str(e)[:200]}"
+
+        @mcp.tool()
+        async def add_project_member(
+            project_id: str,
+            user_id: str,
+            role: str = "member",
+        ) -> str:
+            """プロジェクトにメンバーを追加する。
+
+            Args:
+                project_id: 対象プロジェクト ID (proj-{hex8})
+                user_id:    追加するユーザーの user_id (email 形式)
+                role:       "owner" または "member" (default "member")
+            Returns:
+                "OK: ..." または "エラー: ..."
+            """
+            if not project_id:
+                return "エラー: project_id が空です"
+            if not user_id:
+                return "エラー: user_id が空です"
+            if role not in ("owner", "member"):
+                return f"エラー: role は 'owner' または 'member' のみ指定可能です (got: {role!r})"
+            payload: dict = {"project_id": project_id, "user_id": user_id, "role": role}
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as c:
+                    r = await c.post(f"{_KERNEL_URL}/core/project/add_member", json=payload)
+                if r.status_code != 200:
+                    return f"エラー: kernel http={r.status_code} {r.text[:200]}"
+                res = r.json()
+                if not res.get("ok"):
+                    return f"エラー: {res.get('error') or '未知のエラー'}"
+                p = res.get("project") or {}
+                return (
+                    f"OK: user_id={user_id!r} を project_id={project_id} に "
+                    f"role={role} で追加しました。 updated_at={p.get('updated_at')}"
+                )
+            except Exception as e:
+                logger.warning(f"[add_project_member] failed: {e}")
+                return f"エラー: {type(e).__name__}: {str(e)[:200]}"
+
+        @mcp.tool()
+        async def remove_project_member(
+            project_id: str,
+            user_id: str,
+        ) -> str:
+            """プロジェクトからメンバーを削除する。
+
+            owners / members のいずれに含まれていても削除する。
+
+            Args:
+                project_id: 対象プロジェクト ID (proj-{hex8})
+                user_id:    削除するユーザーの user_id (email 形式)
+            Returns:
+                "OK: ..." または "エラー: ..."
+            """
+            if not project_id:
+                return "エラー: project_id が空です"
+            if not user_id:
+                return "エラー: user_id が空です"
+            payload: dict = {"project_id": project_id, "user_id": user_id}
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as c:
+                    r = await c.post(f"{_KERNEL_URL}/core/project/remove_member", json=payload)
+                if r.status_code != 200:
+                    return f"エラー: kernel http={r.status_code} {r.text[:200]}"
+                res = r.json()
+                if not res.get("ok"):
+                    return f"エラー: {res.get('error') or '未知のエラー'}"
+                p = res.get("project") or {}
+                return (
+                    f"OK: user_id={user_id!r} を project_id={project_id} から "
+                    f"削除しました。 updated_at={p.get('updated_at')}"
+                )
+            except Exception as e:
+                logger.warning(f"[remove_project_member] failed: {e}")
+                return f"エラー: {type(e).__name__}: {str(e)[:200]}"
+
+        logger.info("[hub_tools] hub fan-out tools registered "
+                    "(list_clusters, spoke_register, spoke_update, "
+                    "spoke_delete, cluster_search_rag, "
+                    "cluster_retrieve_chunks, cluster_k8s_list_pods, "
+                    "cluster_k8s_get_pod, cluster_k8s_get_logs, "
+                    "cluster_upsert_knowledge, cluster_delete_knowledge, "
+                    "cluster_vector_search, cluster_fleet_agent_install, "
+                    "cluster_fleet_token_create, cluster_fleet_cluster_label, "
+                    "cluster_k8s_get, "
+                    "cluster_opensearch_search, cluster_opensearch_update_document, "
+                    "cluster_local_mcp_call, "
+                    "cluster_node_list, cluster_node_exec, "
+                    "fleet_state_upsert, fleet_state_get, "
+                    "fleet_state_list, fleet_state_delete, "
+                    "spawn, list_spawns, get_spawn_result, cancel_spawn, "
+                    "list_spawn_questions, answer_spawn, force_spawn_state, "
+                    "create_project, list_projects, get_project, update_project, "
+                    "archive_project, delete_project, "
+                    "add_project_member, remove_project_member, "
+                    "system_brief, system_lookup, system_topics)")

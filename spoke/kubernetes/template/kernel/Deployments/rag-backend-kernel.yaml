@@ -1,0 +1,350 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-backend-kernel
+  namespace: rag-spoke
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: rag-backend-kernel
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: rag-backend-kernel
+      namespace: rag-spoke
+      annotations:
+        restarted-at: "2026-06-11T09:25:00Z"
+    spec:
+      serviceAccountName: rag-backend-kernel
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: spoke-node
+                    operator: In
+                    values:
+                      - enable
+      containers:
+        - command:
+            - bash
+            - '-c'
+            - >
+              echo "Starting rag-backend-kernel (spoke / Qdrant backend)"
+
+              export
+              PYTHONPATH=/model-cache/packages:/usr/local/lib/python3.12/site-packages:/app
+
+              export HF_HOME=/model-cache
+
+              export TRANSFORMERS_CACHE=/model-cache
+
+              cd /app
+
+              python3 -c "import main; import uvicorn;
+              uvicorn.run(main.app, host='0.0.0.0', port=8000, workers=1)"
+          env:
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: api-key
+                  name: anthropic-api-key
+            - name: QDRANT_HOST
+              value: 'qdrant.rag-spoke.svc.cluster.local'
+            - name: QDRANT_PORT
+              value: '6333'
+            - name: EMBEDDING_DIM
+              value: '384'
+            - name: OPENSEARCH_URL
+              value: 'http://opensearch.rag-spoke.svc.cluster.local:9200'
+            - name: OPENSEARCH_ENABLED
+              value: 'true'
+            - name: GUARDRAILS_ENABLED
+              value: 'false'
+            - name: CACHE_ENABLED
+              value: 'false'
+            - name: MINIO_ENABLED
+              value: 'false'
+            - name: LLM_MODEL
+              value: 'claude'
+            - name: MILVUS_HOST
+              value: 'qdrant.rag-spoke.svc.cluster.local'
+            - name: MILVUS_PORT
+              value: '6333'
+            - name: PYTHONPATH
+              value: /model-cache/packages:/app
+            - name: HF_HOME
+              value: /model-cache
+            - name: TRANSFORMERS_CACHE
+              value: /model-cache
+            - name: HF_HUB_OFFLINE
+              value: '1'
+            - name: TRANSFORMERS_OFFLINE
+              value: '1'
+            - name: RERANKER_FORCE_CPU
+              value: '1'
+            - name: KV_VALKEY_HOST
+              value: 'valkey.rag-spoke.svc.cluster.local'
+            - name: KV_VALKEY_PORT
+              value: '6379'
+            - name: NEO4J_URI
+              value: 'bolt://memgraph.rag-spoke.svc.cluster.local:7687'
+            - name: KNOWLEDGE_MIGRATE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: knowledge-migrate-token
+                  key: token
+                  optional: true
+          image: rag-backend-gpu-offline:v1.0.3
+          imagePullPolicy: IfNotPresent
+          name: backend
+          ports:
+            - containerPort: 8000
+              name: 8000tcp
+              protocol: TCP
+          resources:
+            limits:
+              cpu: '2'
+              memory: 2Gi
+            requests:
+              cpu: 200m
+              memory: 512Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+            - mountPath: /app/main.py
+              name: backend-kernel
+              subPath: main.py
+              readOnly: true
+            - mountPath: /app/requirements.txt
+              name: backend-kernel
+              subPath: requirements.txt
+              readOnly: true
+            - mountPath: /app/web_content_fetcher.py
+              name: backend-kernel
+              subPath: web_content_fetcher.py
+              readOnly: true
+            - mountPath: /app/milvus_compat.py
+              name: backend-kernel
+              subPath: milvus_compat.py
+              readOnly: true
+            - mountPath: /app/k8s_observer.py
+              name: backend-kernel-k8s-observer
+              subPath: k8s_observer.py
+              readOnly: true
+            - mountPath: /app/github_account.py
+              name: backend-kernel-github-account
+              subPath: github_account.py
+              readOnly: true
+            - mountPath: /app/knowledge_migrate.py
+              name: backend-kernel-knowledge-migrate
+              subPath: knowledge_migrate.py
+              readOnly: true
+            - mountPath: /app/opensearch_migrate.py
+              name: backend-kernel-opensearch-migrate
+              subPath: opensearch_migrate.py
+              readOnly: true
+            - mountPath: /app/memgraph_migrate.py
+              name: backend-kernel-memgraph-migrate
+              subPath: memgraph_migrate.py
+              readOnly: true
+            - mountPath: /model-cache
+              name: model-cache
+      dnsPolicy: ClusterFirst
+      initContainers:
+        - command:
+            - bash
+            - '-c'
+            - >
+              set -e
+
+              echo "Checking cache..."
+
+
+              if [ -d "/model-cache/packages" ] && \
+                 [ -d "/model-cache/hub/models--sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2" ] && \
+                 PYTHONPATH=/model-cache/packages python3 -c "import anthropic" 2>/dev/null && \
+                 PYTHONPATH=/model-cache/packages python3 -c "import redis" 2>/dev/null && \
+                 PYTHONPATH=/model-cache/packages python3 -c "import kubernetes" 2>/dev/null && \
+                 PYTHONPATH=/model-cache/packages python3 -c "import qdrant_client" 2>/dev/null && \
+                 PYTHONPATH=/model-cache/packages HF_HOME=/model-cache TRANSFORMERS_CACHE=/model-cache HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python3 -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')" 2>/dev/null; then
+                echo "Cache found (qdrant-client + embedding model loadable), skipping download"
+                exit 0
+              fi
+
+
+              echo "Starting download..."
+
+              rm -rf /model-cache/packages
+
+              mkdir -p /model-cache/packages
+
+
+              echo "Step 1: Installing PyTorch (CPU only)..."
+
+              pip install --target=/model-cache/packages --no-cache-dir \
+                torch==2.5.1 torchvision \
+                --index-url https://download.pytorch.org/whl/cpu
+
+              echo "Step 2: Installing other packages..."
+
+              pip install --target=/model-cache/packages --no-cache-dir \
+                setuptools \
+                fastapi==0.104.1 \
+                uvicorn==0.24.0 \
+                qdrant-client==1.12.1 \
+                marshmallow==3.20.0 \
+                environs==9.5.0 \
+                requests==2.31.0 \
+                pydantic==2.5.0 \
+                python-multipart==0.0.6 \
+                python-docx==1.1.0 \
+                openpyxl==3.1.2 \
+                python-pptx==0.6.23 \
+                beautifulsoup4==4.12.2 \
+                lxml==4.9.3 \
+                pypdf==3.17.4 \
+                anthropic>=0.45.0 \
+                redis==5.0.0 \
+                kubernetes==31.0.0
+
+              echo "Step 3: Installing sentence-transformers (without
+              overwriting torch)..."
+
+              pip install --target=/model-cache/packages --no-cache-dir \
+                --no-deps sentence-transformers
+
+              echo "Step 4: Installing sentence-transformers dependencies..."
+
+              pip install --target=/model-cache/packages --no-cache-dir \
+                transformers tqdm huggingface-hub tokenizers scikit-learn scipy numpy pillow
+
+              echo "Step 5: Downloading embedding model (CPU)..."
+
+              export PYTHONPATH=/model-cache/packages
+
+              export HF_HOME=/model-cache
+
+              export TRANSFORMERS_CACHE=/model-cache
+
+
+              python3 << 'PYTHON'
+
+              import sys
+
+              sys.path.insert(0, '/model-cache/packages')
+
+              from sentence_transformers import SentenceTransformer
+
+              import os
+
+              os.environ['HF_HOME'] = '/model-cache'
+
+              os.environ['TRANSFORMERS_CACHE'] = '/model-cache'
+
+              print("Downloading embedding model...")
+
+              embedder = SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
+
+              print("Embedding model downloaded!")
+
+              PYTHON
+
+
+              echo "Download complete"
+
+              du -sh /model-cache/packages /model-cache/hub || true
+          image: rag-backend-gpu-offline:v1.0.3
+          imagePullPolicy: IfNotPresent
+          name: download-models
+          resources: {}
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+            - mountPath: /model-cache
+              name: model-cache
+        - command:
+            - bash
+            - '-c'
+            - |
+              QDRANT_HOST="qdrant.rag-spoke.svc.cluster.local"
+              MAX_WAIT=300
+              ELAPSED=0
+
+              check_qdrant() {
+                python3 - << PYEOF
+              import urllib.request, sys
+              host = "qdrant.rag-spoke.svc.cluster.local"
+              try:
+                  res = urllib.request.urlopen("http://{}:6333/readyz".format(host), timeout=5)
+                  if res.status != 200:
+                      sys.exit(1)
+              except Exception as e:
+                  print("readyz failed:", e, file=sys.stderr)
+                  sys.exit(1)
+              sys.exit(0)
+              PYEOF
+              }
+
+              echo "Waiting for Qdrant..."
+              until check_qdrant; do
+                if [ "${ELAPSED}" -ge "${MAX_WAIT}" ]; then
+                  echo "Timeout: Qdrant did not become ready within ${MAX_WAIT}s"
+                  exit 1
+                fi
+                echo "  Qdrant not ready (${ELAPSED}s elapsed), retrying in 5s..."
+                sleep 5
+                ELAPSED=$((ELAPSED + 5))
+              done
+              echo "Qdrant is ready after ${ELAPSED}s."
+          image: rag-backend-gpu-offline:v1.0.3
+          imagePullPolicy: IfNotPresent
+          name: wait-for-qdrant
+          resources:
+            limits:
+              cpu: 200m
+              memory: 128Mi
+            requests:
+              cpu: 100m
+              memory: 64Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext:
+        supplementalGroups:
+          - 991
+      terminationGracePeriodSeconds: 30
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-cache
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel
+          name: backend-kernel
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-k8s-observer
+          name: backend-kernel-k8s-observer
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-github-account
+          name: backend-kernel-github-account
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-knowledge-migrate
+          name: backend-kernel-knowledge-migrate
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-opensearch-migrate
+          name: backend-kernel-opensearch-migrate
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-memgraph-migrate
+          name: backend-kernel-memgraph-migrate

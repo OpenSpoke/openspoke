@@ -1,0 +1,536 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-task-worker
+  namespace: rag-company1
+data:
+  main.py: |
+    """
+    rag-task-worker v0.7 (OpenSearch, no Valkey)
+
+    kernel の /core/spawn/pickup を 1 秒間隔でショートポーリングし、 queued な spawn を
+    running に遷移させて処理する。 kernel の /core/claude/stream-with-mcp を叩いて
+    Claude + MCP tool loop を実行する。 通常スポーンと管理スポーン (supervisor) を
+    is_supervisor フラグで切替。
+
+    v0.6 との差分:
+      - Valkey 直接接続 (redis-py) を全廃止
+      - state / question / answer / result / error 全部 kernel HTTP API 経由に切替
+      - 各 spawn state は kernel が OpenSearch (spawns index) に永続化するので
+        worker 再起動でも spawn は消えない
+
+    supervisor 差分:
+      - system prompt が supervisor 用 (自分の full_id を明示、子スポーン起票の指示)
+      - MAX_TURNS が 20 (通常 5)
+      - kernel への body の max_tool_iterations が 50 (通常 20)
+    """
+
+    import json
+    import os
+    import signal
+    import time
+    import traceback
+    import uuid
+    from datetime import datetime, timezone
+    from threading import Thread
+
+    import httpx
+    from fastapi import FastAPI
+    import uvicorn
+
+    KERNEL_URL = os.environ.get(
+        "KERNEL_URL",
+        "http://rag-backend-kernel.rag-company1.svc.cluster.local:8000",
+    )
+    PICKUP_POLL_SEC = float(os.environ.get("WORKER_PICKUP_POLL_SEC", "1.0"))
+    ANSWER_POLL_SEC = float(os.environ.get("WORKER_ANSWER_POLL_SEC", "1.0"))
+    MAX_TOOL_ITERATIONS = int(os.environ.get("WORKER_MAX_TOOL_ITERATIONS", "30"))
+    MAX_TOOL_ITERATIONS_SUPERVISOR = int(os.environ.get("WORKER_MAX_TOOL_ITERATIONS_SUPERVISOR", "50"))
+
+    # Claude API cost per million tokens (tier 別、 環境変数で差し替え可能)
+    CLAUDE_INPUT_COST_PER_M = float(os.environ.get("CLAUDE_INPUT_COST_PER_M", "3.0"))
+    CLAUDE_OUTPUT_COST_PER_M = float(os.environ.get("CLAUDE_OUTPUT_COST_PER_M", "15.0"))
+    CLAUDE_SONNET_INPUT_COST_PER_M = float(os.environ.get("CLAUDE_SONNET_INPUT_COST_PER_M", "3.0"))
+    CLAUDE_SONNET_OUTPUT_COST_PER_M = float(os.environ.get("CLAUDE_SONNET_OUTPUT_COST_PER_M", "15.0"))
+    CLAUDE_HAIKU_INPUT_COST_PER_M = float(os.environ.get("CLAUDE_HAIKU_INPUT_COST_PER_M", "1.0"))
+    CLAUDE_HAIKU_OUTPUT_COST_PER_M = float(os.environ.get("CLAUDE_HAIKU_OUTPUT_COST_PER_M", "5.0"))
+    CLAUDE_OPUS_INPUT_COST_PER_M = float(os.environ.get("CLAUDE_OPUS_INPUT_COST_PER_M", "15.0"))
+    CLAUDE_OPUS_OUTPUT_COST_PER_M = float(os.environ.get("CLAUDE_OPUS_OUTPUT_COST_PER_M", "75.0"))
+
+    def _cost_per_m(model_name):
+        """model 名から (input_cost_per_M, output_cost_per_M) を返す。
+        prefix match で tier を判定。 未知の model は Sonnet レートに fallback。
+        """
+        m = str(model_name or "").lower()
+        if "opus" in m:
+            return (CLAUDE_OPUS_INPUT_COST_PER_M, CLAUDE_OPUS_OUTPUT_COST_PER_M)
+        if "haiku" in m:
+            return (CLAUDE_HAIKU_INPUT_COST_PER_M, CLAUDE_HAIKU_OUTPUT_COST_PER_M)
+        return (CLAUDE_SONNET_INPUT_COST_PER_M, CLAUDE_SONNET_OUTPUT_COST_PER_M)
+
+    WORKER_ID = os.environ.get("HOSTNAME", f"worker-{uuid.uuid4().hex[:8]}")
+
+    _stop = False
+
+
+    def now_iso() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+
+    def _kernel_post(path: str, body: dict, timeout: float = 15.0):
+        """kernel に POST する。 (ok, json_dict) を返す。 通信エラー時は (False, {"error": "..."})。"""
+        try:
+            r = httpx.post(f"{KERNEL_URL}{path}", json=body, timeout=timeout)
+            if r.status_code != 200:
+                return False, {"error": f"http={r.status_code} {r.text[:200]}"}
+            try:
+                return True, r.json()
+            except Exception as e:
+                return False, {"error": f"json decode failed: {e}"}
+        except Exception as e:
+            return False, {"error": f"{type(e).__name__}: {str(e)[:200]}"}
+
+
+    def _update_spawn(spawn_id: str, updates: dict) -> None:
+        """kernel /core/spawn/update_state で任意フィールドを更新する。"""
+        ok, res = _kernel_post("/core/spawn/update_state", {"full_id": spawn_id, "updates": updates})
+        if not ok or not res.get("ok"):
+            print(f"[{now_iso()}] update_spawn failed: {res.get('error')}", flush=True)
+
+
+    def _pop_answer(spawn_id: str):
+        """kernel /core/spawn/pop_answer で answer_queue 先頭を取得。 (entry|None, state|None) を返す。"""
+        ok, res = _kernel_post("/core/spawn/pop_answer", {"full_id": spawn_id})
+        if not ok or not res.get("ok"):
+            return None, None
+        return res.get("entry"), res.get("state")
+
+
+    app = FastAPI()
+
+
+    @app.get("/healthz")
+    def healthz():
+        try:
+            r = httpx.get(f"{KERNEL_URL}/healthz", timeout=3.0)
+            return {"status": "ok", "worker": WORKER_ID, "kernel": "up" if r.status_code == 200 else f"http={r.status_code}"}
+        except Exception as e:
+            return {"status": "degraded", "worker": WORKER_ID, "kernel_error": str(e)}
+
+
+    def run_http_server():
+        uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")
+
+
+    def build_system_prompt(context_text: str) -> str:
+        base = (
+            "あなたは自律実行 worker です。 対話 Claude がオペレーターとのやり取り中に、あなたに作業を非同期委譲する形で呼び出しました。 目の前にオペレーターはいません。\n\n"
+            "あなたには OpenSpoke ハブ MCP の tool 群が渡されています。 GitHub 操作 (github_get_file / github_grep_file / github_apply_str_replace 等)、 Kubernetes 参照 (cluster_k8s_*, k8s_*)、 OpenSearch / vector store、 upsert_knowledge / search_rag、 system_brief / system_lookup / system_topics などが使えます。 適切に呼び出して作業を進めてください。\n\n"
+            "**着任時の必須手順**: 最初に system_brief() を呼んで、システム全体の構成・絶対禁則・命名規則・追記責任を把握してから作業に入ってください。 詳細が必要なときは system_topics() と system_lookup(topic='...') で個別トピックを引いてください。\n\n"
+            "**質問返しは 2 種類に分類してください**:\n\n"
+            "- **[BLOCKING]**: この質問に答えないと 1 手も進めない (権限確認、不可逆操作の直前、指示と system_brief が矛盾する、実行対象が特定できない等)。 応答に `[BLOCKING]` タグを含めてください (先頭でも中間でも可、tool で調査した結果を踏まえて blocking する形も歓迎)。 タグを含む応答をした時点であなたのターンは終わり、対話 Claude がオペレーターに確認して回答を返してきます。 回答を受け取ってから作業を続けます。\n"
+            "- **[CLARIFYING]**: 好みや細部で、仮定を明示すれば進める。 応答に `[CLARIFYING] 仮定=<仮定内容>` を書き、その仮定で作業を進めてください (待たずに完了させる)。\n\n"
+            "判断に迷ったら安全側 (BLOCKING) に倒してください。 特に本番データの削除・書き換え、Deployment の再起動、Fleet の force sync 等の不可逆・影響大の操作は必ず BLOCKING で確認してください。\n\n"
+            "**新知見を得た場合**は upsert_knowledge で `_handoff_topic_X` と `_handoff_summary_X` の 2 件を追記して、次回スレッドの Claude に引き継いでください (namespace=\"admin\")。\n\n"
+            "作業完了時は、実施した内容・成功したこと・失敗したこと・確認できなかった項目 を明示してください。\n"
+        )
+        if context_text:
+            base += "\n背景情報:\n" + context_text + "\n"
+        return base
+
+
+    def build_supervisor_system_prompt(context_text: str, my_full_id: str, my_alias: str) -> str:
+        base = (
+            f"あなたは **管理スポーン (supervisor spawn)** です。 あなた自身の full_id は `{my_full_id}` "
+            f"(別名: {my_alias or '(なし)'}) です。\n\n"
+            "対話 Claude がオペレーターとのやり取り中に、あなたに **複数の子スポーンの管理** を委譲する形で呼び出しました。 目の前にオペレーターはいません。\n\n"
+            "あなたの役割は、依頼を分析して必要な子スポーンを起票し、それらの完了を待ち、BLOCKING が来たら判断し、全部完了したら結果を統合して報告することです。\n\n"
+            "**利用可能な tool** (すべて MCP tool として存在):\n"
+            f"- `spawn(prompt, alias, priority, project_id, parent_supervisor='{my_full_id}')`: 子スポーンを起票。 parent_supervisor に必ず自分の full_id `{my_full_id}` を指定してください (managed_spawns に自動追加されます)。\n"
+            "- `get_spawn_result(spawn_ref)`: 子スポーンの結果を取得 (state=done を確認)。 spawn_ref は full_id / serial / alias いずれも可\n"
+            "- `list_spawn_questions()`: 全 spawn の BLOCKING を確認 (自分の子だけでなく全体、alias でフィルタして判断)\n"
+            "- `answer_spawn(spawn_ref, answer)`: 子スポーンに回答\n"
+            "- `cancel_spawn(spawn_ref)`: 子スポーンをキャンセル\n"
+            "- その他 MCP tool (system_brief, github_*, cluster_k8s_*, upsert_knowledge など) も普通に使えます\n\n"
+            "**作業パターン**:\n"
+            "1. 依頼を分析、子スポーンをリストアップ\n"
+            "2. 子スポーンを起票 (直列 or 並列)\n"
+            "3. `get_spawn_result` で完了を polling (state=done を確認)\n"
+            "4. BLOCKING が来たら、あなたの権限で判断できるなら `answer_spawn` で回答、判断できないなら自分の応答に `[BLOCKING]` を含めて対話 Claude に相談\n"
+            "5. 全子完了したら、各子の結果を統合して最終応答\n\n"
+            "**重要事項**:\n"
+            "- あなたは長時間 (最大 4 時間程度) 動作します。 途中で end_turn しないでください\n"
+            "- 「〜する予定です」「〜を実行します」といった宣言テキストを出さず、直接 tool を叩いてください\n"
+            "- 子スポーンの done を待つときは、他のことをせず短時間置いて再度 `get_spawn_result` で polling してください (worker は sleep tool を持ちません)\n"
+            "- 対話 Claude が確認した設計判断は絶対的なので、それを子スポーンの prompt に忠実に含めてください\n"
+            "- 判断に迷ったら安全側 (BLOCKING) に倒してください\n"
+            "- 子スポーン起票時は `parent_supervisor` を必ず指定してください、これで frontend で管理関係が可視化されます\n"
+        )
+        if context_text:
+            base += "\n背景情報:\n" + context_text + "\n"
+        return base
+
+
+    def process_job(spawn_id: str, payload: dict):
+        """v0.7: kernel /core/claude/stream-with-mcp を叩いて Claude + MCP tool loop を実行。
+        state / question / answer / result / error は kernel API 経由で更新。
+        """
+        is_supervisor = bool(payload.get("is_supervisor", False))
+        MAX_TURNS = 20 if is_supervisor else 5
+        ANSWER_WAIT_MAX_SEC = 1800
+        max_tool_iters = MAX_TOOL_ITERATIONS_SUPERVISOR if is_supervisor else MAX_TOOL_ITERATIONS
+
+        def _extract_blocking_question(result_text: str):
+            if "[BLOCKING]" in result_text:
+                return result_text.strip()
+            return None
+
+        def _wait_for_answer(spawn_id: str, timeout_sec: int):
+            deadline = time.time() + timeout_sec
+            while time.time() < deadline:
+                entry, current_state = _pop_answer(spawn_id)
+                if entry is not None:
+                    return entry
+                if current_state == "cancel_requested":
+                    return None
+                time.sleep(ANSWER_POLL_SEC)
+            return "__TIMEOUT__"
+
+        # started_at / worker_id / state=running は kernel /core/spawn/pickup 側で更新済み
+
+        prompt = payload.get("prompt", "")
+        label = payload.get("label", "")
+        alias = payload.get("alias", "")
+        model = payload.get("model") or "claude-sonnet-4-6"
+        try:
+            timeout_sec = int(payload.get("timeout_sec", 1800) or 1800)
+        except (TypeError, ValueError):
+            timeout_sec = 1800
+        context_text = payload.get("context", "") or ""
+
+        if is_supervisor:
+            system_prompt = build_supervisor_system_prompt(context_text, spawn_id, alias)
+        else:
+            system_prompt = build_system_prompt(context_text)
+
+        messages = [{"role": "user", "content": prompt}]
+
+        all_text_parts = []
+        all_tool_events = []
+        total_input_tokens = 0
+        total_output_tokens = 0
+        total_tool_calls = 0
+        total_elapsed = 0.0
+        turn_num = 0
+
+        display_ref = alias or label or spawn_id
+
+        def _snapshot_usage():
+            """現在までの Claude 使用量を spawn doc の usage フィールド形式で返す。
+            gemma2 使用量は kernel 側の /core/spawn/finalize_gemma_usage で spawn 完了後に付与される。
+            cost は現在の model 名 (orchestrator で書き換えられた後も含む) から動的に選択。
+            """
+            input_cost, output_cost = _cost_per_m(model)
+            cost = (total_input_tokens / 1_000_000 * input_cost
+                    + total_output_tokens / 1_000_000 * output_cost)
+            return {
+                "claude_input_tokens": total_input_tokens,
+                "claude_output_tokens": total_output_tokens,
+                "claude_cost_usd": round(cost, 6),
+                "tool_calls": total_tool_calls,
+                "turn_count": turn_num,
+                "elapsed_sec": round(total_elapsed, 3),
+                "model": model,
+            }
+
+        # orchestrator mode: まず triage して gemma2 単独 or Claude 分岐 (mode='claude' なら skip)
+        mode = str(payload.get("mode") or "claude").lower()
+        triage_decision = None
+        if mode == "orchestrator":
+            ok_t, res_t = _kernel_post(
+                "/core/orchestrator/triage",
+                {"prompt": prompt, "samples": 1},
+                timeout=30.0,
+            )
+            if ok_t and isinstance(res_t, dict) and res_t.get("ok"):
+                triage_decision = res_t.get("decision")
+                triage_tier = res_t.get("claude_tier")
+                triage_model = res_t.get("claude_model")
+                print(
+                    f"[{now_iso()}] worker={WORKER_ID} spawn_id={spawn_id} "
+                    f"orchestrator triage decision={triage_decision} tier={triage_tier} elapsed={res_t.get('elapsed_sec', 0):.2f}s",
+                    flush=True,
+                )
+                _update_spawn(spawn_id, {"triage_verdict": str(triage_decision or "unknown")})
+                # B 判定: Claude モデルを tier に応じて差し替え
+                if triage_decision == "B" and triage_model:
+                    model = triage_model
+                # C (fallback) / None (票割れ) の場合は payload の model を維持 (kernel 側 default で対応)
+            else:
+                err = res_t.get("error") if isinstance(res_t, dict) else str(res_t)
+                print(
+                    f"[{now_iso()}] worker={WORKER_ID} spawn_id={spawn_id} "
+                    f"orchestrator triage FAILED: {err}. falling back to Claude standard.",
+                    flush=True,
+                )
+                _update_spawn(spawn_id, {"triage_verdict": "fail"})
+
+            # A (simple) → gemma2 単独回答
+            if triage_decision == "A":
+                ok_a, res_a = _kernel_post(
+                    "/core/orchestrator/answer",
+                    {"prompt": prompt, "max_tokens": 2048},
+                    timeout=120.0,
+                )
+                if ok_a and isinstance(res_a, dict) and res_a.get("ok"):
+                    answer_text = res_a.get("answer", "")
+                    total_elapsed = float(res_a.get("elapsed_sec", 0) or 0)
+                    result_text = f"[Orchestrator: gemma2 単独回答]\n\n{answer_text}"
+                    _update_spawn(spawn_id, {
+                        "state": "done",
+                        "finished_at": now_iso(),
+                        "result": result_text,
+                        "usage": _snapshot_usage(),
+                    })
+                    _kernel_post("/core/spawn/finalize_gemma_usage", {"full_id": spawn_id}, timeout=10.0)
+                    return
+                else:
+                    err = res_a.get("error") if isinstance(res_a, dict) else str(res_a)
+                    print(
+                        f"[{now_iso()}] worker={WORKER_ID} spawn_id={spawn_id} "
+                        f"orchestrator gemma2 answer FAILED: {err}. falling back to Claude.",
+                        flush=True,
+                    )
+                    # 下の Claude tool loop へ (fallback)
+
+        while turn_num < MAX_TURNS:
+            turn_num += 1
+            op_label = f"supervisor:{display_ref}:turn{turn_num}" if is_supervisor else f"spawn_worker:{display_ref}:turn{turn_num}"
+            body = {
+                "messages": messages,
+                "system": system_prompt,
+                "max_tokens": 8192,
+                "temperature": 0.5,
+                "max_tool_iterations": max_tool_iters,
+                "op": op_label,
+                "user_id": "admin",
+            }
+            turn_text_parts = []
+            stream_error = None
+            try:
+                resp = httpx.post(
+                    f"{KERNEL_URL}/core/claude/stream-with-mcp",
+                    json=body,
+                    timeout=min(timeout_sec, 900),
+                )
+                if resp.status_code != 200:
+                    stream_error = f"kernel http={resp.status_code}: {resp.text[:200]}"
+                else:
+                    for line in resp.text.splitlines():
+                        if not line:
+                            continue
+                        try:
+                            event = json.loads(line)
+                        except Exception:
+                            continue
+                        etype = event.get("type")
+                        if etype == "token":
+                            turn_text_parts.append(event.get("content", ""))
+                        elif etype == "tool_use":
+                            all_tool_events.append({
+                                "phase": "start",
+                                "turn": turn_num,
+                                "name": event.get("name"),
+                                "input": event.get("input"),
+                            })
+                            total_tool_calls += 1
+                        elif etype == "tool_result":
+                            all_tool_events.append({
+                                "phase": "end",
+                                "turn": turn_num,
+                                "name": event.get("name"),
+                                "ok": event.get("ok"),
+                                "error": event.get("error"),
+                            })
+                        elif etype == "done":
+                            total_elapsed += event.get("elapsed_sec", 0)
+                            total_input_tokens += event.get("input_tokens", 0)
+                            total_output_tokens += event.get("output_tokens", 0)
+                        elif etype == "error":
+                            stream_error = event.get("error", "unknown stream error")
+            except Exception as e:
+                stream_error = f"{type(e).__name__}: {str(e)[:400]}"
+
+            if stream_error is not None:
+                tb = traceback.format_exc()
+                error_body = (
+                    f"stream error at turn {turn_num}: {stream_error}\n"
+                    f"{tb}\n"
+                    f"partial text ({len(''.join(all_text_parts + turn_text_parts))} chars) collected.\n"
+                )
+                _update_spawn(spawn_id, {
+                    "state": "failed",
+                    "finished_at": now_iso(),
+                    "error_body": error_body,
+                    "usage": _snapshot_usage(),
+                })
+                _kernel_post("/core/spawn/finalize_gemma_usage", {"full_id": spawn_id}, timeout=10.0)
+                return
+
+            turn_text = "".join(turn_text_parts)
+            all_text_parts.append(turn_text)
+
+            blocking_question = _extract_blocking_question(turn_text)
+            if blocking_question is None:
+                break
+
+            _update_spawn(spawn_id, {
+                "state": "waiting_user",
+                "question": blocking_question,
+            })
+
+            answer_raw = _wait_for_answer(spawn_id, timeout_sec=ANSWER_WAIT_MAX_SEC)
+
+            if answer_raw is None:
+                result_text = "\n\n---(turn 区切り)---\n\n".join(all_text_parts) + "\n\n(cancelled while waiting for user answer)"
+                _update_spawn(spawn_id, {
+                    "state": "cancelled",
+                    "finished_at": now_iso(),
+                    "result": result_text,
+                    "usage": _snapshot_usage(),
+                })
+                _kernel_post("/core/spawn/finalize_gemma_usage", {"full_id": spawn_id}, timeout=10.0)
+                return
+
+            if answer_raw == "__TIMEOUT__":
+                _update_spawn(spawn_id, {
+                    "state": "failed",
+                    "finished_at": now_iso(),
+                    "error_body": f"answer wait timeout ({ANSWER_WAIT_MAX_SEC} sec) at turn {turn_num}",
+                    "usage": _snapshot_usage(),
+                })
+                _kernel_post("/core/spawn/finalize_gemma_usage", {"full_id": spawn_id}, timeout=10.0)
+                return
+
+            # answer_raw は kernel の pop_answer が entry (dict) を JSON で返すので dict のはず
+            if isinstance(answer_raw, dict):
+                answer_text = answer_raw.get("answer", "")
+            elif isinstance(answer_raw, str):
+                try:
+                    answer_obj = json.loads(answer_raw)
+                    answer_text = answer_obj.get("answer", "")
+                except Exception:
+                    answer_text = answer_raw
+            else:
+                answer_text = str(answer_raw)
+
+            messages.append({"role": "assistant", "content": turn_text})
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"(オペレーターからの回答): {answer_text}\n\n"
+                    "上記の回答をもとに、作業を続けてください。 "
+                    "回答内容で作業を進められるなら [BLOCKING]/[CLARIFYING] のタグを再度付ける必要はありません。"
+                ),
+            })
+
+            _update_spawn(spawn_id, {
+                "state": "running",
+                "question": "",
+            })
+
+        if len(all_text_parts) == 1:
+            result_text = all_text_parts[0]
+        else:
+            result_text = "\n\n---(turn 区切り)---\n\n".join(all_text_parts)
+
+        if all_tool_events:
+            result_text += "\n\n--- tool call log ---\n"
+            for entry in all_tool_events:
+                if entry.get("phase") == "start":
+                    inp = entry.get("input") or {}
+                    inp_short = json.dumps(inp, ensure_ascii=False)
+                    if len(inp_short) > 200:
+                        inp_short = inp_short[:200] + "..."
+                    result_text += f"[turn{entry.get('turn')}][tool] {entry['name']}({inp_short})\n"
+                elif entry.get("phase") == "end":
+                    status = "OK" if entry.get("ok") else "FAILED"
+                    err = f" error={entry.get('error')}" if entry.get("error") else ""
+                    result_text += f"       -> {status}{err}\n"
+
+        result_text += (
+            f"\n\n--- usage (total across {turn_num} turns) ---\n"
+            f"elapsed_sec={total_elapsed} input_tokens={total_input_tokens} "
+            f"output_tokens={total_output_tokens} tool_calls={total_tool_calls} model={model} "
+            f"is_supervisor={is_supervisor}"
+        )
+
+        _update_spawn(spawn_id, {
+            "state": "done",
+            "finished_at": now_iso(),
+            "result": result_text,
+            "usage": _snapshot_usage(),
+        })
+        _kernel_post("/core/spawn/finalize_gemma_usage", {"full_id": spawn_id}, timeout=10.0)
+
+
+    def worker_loop():
+        print(
+            f"[{now_iso()}] worker={WORKER_ID} starting; "
+            f"kernel={KERNEL_URL} poll={PICKUP_POLL_SEC}s",
+            flush=True,
+        )
+        while not _stop:
+            try:
+                ok, res = _kernel_post("/core/spawn/pickup", {"worker_id": WORKER_ID}, timeout=10.0)
+                if not ok or not res.get("ok"):
+                    err = res.get("error") if isinstance(res, dict) else str(res)
+                    print(f"[{now_iso()}] pickup call failed: {err}; sleep 2s", flush=True)
+                    time.sleep(2)
+                    continue
+                spawn = res.get("spawn")
+                if spawn is None:
+                    time.sleep(PICKUP_POLL_SEC)
+                    continue
+                spawn_id = spawn.get("full_id") or f"spawn-XX-{uuid.uuid4().hex[:8]}"
+                is_supervisor = bool(spawn.get("is_supervisor", False))
+                print(
+                    f"[{now_iso()}] worker={WORKER_ID} picked spawn_id={spawn_id} "
+                    f"is_supervisor={is_supervisor}",
+                    flush=True,
+                )
+                try:
+                    process_job(spawn_id, spawn)
+                    print(f"[{now_iso()}] worker={WORKER_ID} done spawn_id={spawn_id}", flush=True)
+                except Exception as e:
+                    tb = traceback.format_exc()
+                    print(
+                        f"[{now_iso()}] worker={WORKER_ID} failed spawn_id={spawn_id}: {e}\n{tb}",
+                        flush=True,
+                    )
+                    _update_spawn(spawn_id, {
+                        "state": "failed",
+                        "finished_at": now_iso(),
+                        "error_body": f"{e}\n{tb}",
+                    })
+            except Exception as e:
+                print(f"[{now_iso()}] loop error: {e}\n{traceback.format_exc()}", flush=True)
+                time.sleep(1)
+
+
+    def handle_shutdown(signum, frame):
+        global _stop
+        print(f"[{now_iso()}] shutdown signal {signum} received", flush=True)
+        _stop = True
+
+
+    def main():
+        signal.signal(signal.SIGTERM, handle_shutdown)
+        signal.signal(signal.SIGINT, handle_shutdown)
+        http_thread = Thread(target=run_http_server, daemon=True)
+        http_thread.start()
+        worker_loop()
+
+
+    if __name__ == "__main__":
+        main()

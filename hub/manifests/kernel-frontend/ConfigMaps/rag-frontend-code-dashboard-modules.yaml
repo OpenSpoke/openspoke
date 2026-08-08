@@ -1,0 +1,376 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-frontend-code-dashboard-modules
+  namespace: rag-company1
+data:
+  view_modules.py: |
+    """モジュール管理ビュー — OpenSpoke 運用台帳 (Core / Application) の表示.
+
+    backend:
+      - 運用台帳 (モジュール定義 + 方針層): ハブ中央 OpenSearch fleet_state index,
+        _id=ledger (kernel_api.get_ledger 経由)
+      - 配下バンドル一覧: Fleet GitRepo を真実源として動的導出
+        (kernel_api.list_fleet_gitrepos + kernel_api.derive_module_bundles)
+
+    分類は git の OpenSpoke/Core, OpenSpoke/Application ツリーを正とする
+    導出層 + 方針層。 本番判定はディレクトリ名ではなく
+    live_cluster / role / canonical_production_hub フィールドで行う。
+
+    方針層 (policy) は各モジュールに対して UI から宣言する属性:
+    restart_safety / edit_safety / desired_state / notes。
+    さらにモジュール配下のバンドルごとに個別方針 (bundle override) を
+    持てる。 個別指定があればそれが優先、 無ければモジュール既定方針を
+    継承する。 保存先は ledger 本体の categories.<cat>.<mod>.policy または
+    categories.<cat>.<mod>.bundle_policies.<bundle_name>
+    (kernel_api.set_ledger_policy 経由で merge upsert)。
+
+    バンドル一覧は ledger には保存しない (Fleet GitRepo が唯一の真実源)。
+    bundle 個別方針の参照先 bundle が Fleet から消えると 「孤児」 として
+    UI が警告を出し、 削除 (継承に戻す) で片付けできる。
+    """
+    import streamlit as st
+    import kernel_api
+    import user_scope
+
+
+    _RESTART_OPTS = ["", "safe", "needs_confirmation", "do_not_restart"]
+    _EDIT_OPTS = ["", "safe", "needs_confirmation", "do_not_edit"]
+    _STATE_OPTS = ["", "running", "stopped"]
+
+
+    def _fleet_badge(node):
+        f = node.get("fleet")
+        if f is True:
+            return "[Fleet配信]"
+        if f is False:
+            return "[手動/未登録]"
+        return ""
+
+
+    def _safe_index(opts, value):
+        try:
+            return opts.index(value or "")
+        except ValueError:
+            return 0
+
+
+    def _policy_summary(pol):
+        if not pol:
+            return "⚠️ 方針未設定"
+        parts = []
+        for key, label in (
+            ("restart_safety", "再起動"),
+            ("edit_safety", "編集"),
+            ("desired_state", "状態"),
+        ):
+            v = pol.get(key)
+            if v:
+                parts.append(label + "=" + v)
+        return " / ".join(parts) if parts else "(空)"
+
+
+    def _render_policy_form(form_key, target, current_policy, clear_label):
+        """方針編集 form の共通描画.
+
+        保存・クリア時は kernel_api.set_ledger_policy(target, policy) を呼ぶ。
+        """
+        pol = current_policy or {}
+        with st.form(form_key, clear_on_submit=False):
+            r_idx = _safe_index(_RESTART_OPTS, pol.get("restart_safety"))
+            e_idx = _safe_index(_EDIT_OPTS, pol.get("edit_safety"))
+            d_idx = _safe_index(_STATE_OPTS, pol.get("desired_state"))
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                r = st.selectbox(
+                    "再起動 (restart_safety)",
+                    _RESTART_OPTS, index=r_idx,
+                    help="safe=自由に再起動可 / needs_confirmation=確認要 / do_not_restart=再起動禁止",
+                )
+            with col2:
+                e = st.selectbox(
+                    "編集 (edit_safety)",
+                    _EDIT_OPTS, index=e_idx,
+                    help="safe=自由に編集可 / needs_confirmation=確認要 / do_not_edit=編集禁止",
+                )
+            with col3:
+                d = st.selectbox(
+                    "あるべき状態 (desired_state)",
+                    _STATE_OPTS, index=d_idx,
+                    help="running=稼働 / stopped=停止",
+                )
+            notes = st.text_area(
+                "備考 (notes)", value=pol.get("notes", "") or "",
+                placeholder="背景・例外条件・連絡先など",
+                height=80,
+            )
+            col_save, col_clear = st.columns(2)
+            with col_save:
+                saved = st.form_submit_button(
+                    "保存", type="primary", use_container_width=True,
+                )
+            with col_clear:
+                cleared = st.form_submit_button(
+                    clear_label, use_container_width=True,
+                )
+            if saved:
+                new_policy = {}
+                if r:
+                    new_policy["restart_safety"] = r
+                if e:
+                    new_policy["edit_safety"] = e
+                if d:
+                    new_policy["desired_state"] = d
+                if notes:
+                    new_policy["notes"] = notes
+                res = kernel_api.set_ledger_policy(target, new_policy)
+                if "_error" in res:
+                    st.error("保存失敗: " + str(res.get("_error")))
+                else:
+                    st.success("保存しました.")
+                    st.rerun()
+            if cleared:
+                res = kernel_api.set_ledger_policy(target, None)
+                if "_error" in res:
+                    st.error("クリア失敗: " + str(res.get("_error")))
+                else:
+                    st.success("クリアしました.")
+                    st.rerun()
+
+
+    def _render_module_policy(category, modname, node):
+        """モジュール既定方針の表示と編集 form."""
+        st.markdown("---")
+        st.markdown("**モジュール既定方針:**")
+        pol = node.get("policy") or {}
+        st.caption(_policy_summary(pol))
+        if pol.get("notes"):
+            st.caption("備考: " + pol["notes"])
+        if pol.get("updated_at"):
+            st.caption("updated_at=" + pol["updated_at"]
+                       + " by=" + str(pol.get("updated_by", "-")))
+        target = "module:" + category + "/" + modname
+        _render_policy_form(
+            "policy_form_" + category + "_" + modname,
+            target,
+            pol,
+            "クリア (方針削除)",
+        )
+
+
+    def _render_bundle_overrides(category, modname, node, derived_bundles):
+        """モジュール配下の各バンドルに個別方針の表示と編集 form を描画する.
+
+        bundle 一覧は Fleet GitRepo から導出した derived_bundles を使う
+        (ledger の手書き静的フィールドは見ない)。 継承 vs 個別指定をバッジで
+        明示し、 個別方針は checkbox で開閉可能な form で編集する。
+        ledger 側に bundle_policies があって Fleet に該当 bundle が無い場合は
+        「孤児」 として警告し、 個別削除 form を出す.
+        """
+        bps_all = node.get("bundle_policies") or {}
+        module_pol = node.get("policy") or None
+        known_bnames = {b["bundle_name"] for b in derived_bundles}
+        orphan_bps = sorted(bn for bn in bps_all if bn not in known_bnames)
+
+        if not derived_bundles and not orphan_bps:
+            return
+        st.markdown("---")
+        if derived_bundles:
+            st.markdown(
+                "**バンドル別の個別方針 "
+                "(個別指定が無ければモジュール既定方針を継承):**"
+            )
+            for b in derived_bundles:
+                bname = b["bundle_name"]
+                rel = b["relative_path"] or "(top)"
+                ready = b.get("ready_bundle_deployments", "")
+                bp = bps_all.get(bname)
+                if bp:
+                    eff = bp
+                    source_badge = "[個別指定]"
+                elif module_pol:
+                    eff = module_pol
+                    source_badge = "[モジュール既定を継承]"
+                else:
+                    eff = None
+                    source_badge = "[未設定]"
+                head_parts = ["`" + bname + "`"]
+                if rel and rel != "(top)":
+                    head_parts.append("(rel=`" + rel + "`)")
+                if ready:
+                    head_parts.append("ready=" + ready)
+                st.markdown("- " + " ".join(head_parts) + "  " + source_badge)
+                st.caption("方針: " + _policy_summary(eff))
+                if bp and bp.get("updated_at"):
+                    st.caption("個別指定 updated_at=" + bp["updated_at"]
+                               + " by=" + str(bp.get("updated_by", "-")))
+                toggle_key = ("bundle_edit_"
+                              + category + "_" + modname + "_" + bname)
+                expanded = st.checkbox(
+                    "個別方針を編集",
+                    key=toggle_key,
+                    value=bool(bp),
+                )
+                if expanded:
+                    target = ("bundle:" + category + "/" + modname + "/" + bname)
+                    _render_policy_form(
+                        "bundle_form_" + category + "_" + modname + "_" + bname,
+                        target,
+                        bp,
+                        "個別指定をクリア (継承に戻す)",
+                    )
+
+        if orphan_bps:
+            st.markdown("")
+            st.markdown(
+                "**⚠️ 孤児 bundle個別方針 "
+                "(該当 bundle が Fleet GitRepo に存在しません):**"
+            )
+            st.caption(
+                "Fleet 側で bundle が消えた・名前が変わったなどの理由で取り残された"
+                " 個別方針。 削除して片付けてください."
+            )
+            for bn in orphan_bps:
+                bp = bps_all.get(bn) or {}
+                st.markdown(
+                    "- `" + bn + "`  " + _policy_summary(bp)
+                )
+                toggle_key = ("orphan_edit_"
+                              + category + "_" + modname + "_" + bn)
+                expanded = st.checkbox(
+                    "孤児個別方針を確認・削除",
+                    key=toggle_key,
+                    value=False,
+                )
+                if expanded:
+                    target = ("bundle:" + category + "/" + modname + "/" + bn)
+                    _render_policy_form(
+                        "orphan_form_" + category + "_" + modname + "_" + bn,
+                        target,
+                        bp,
+                        "個別指定を削除",
+                    )
+
+
+    def _render_module(category, modname, node, derived_bundles):
+        meta = []
+        cluster = node.get("live_cluster", "")
+        if cluster:
+            meta.append("cluster: " + cluster)
+        badge = _fleet_badge(node)
+        if badge:
+            meta.append(badge)
+        if node.get("canonical_production_hub") is True:
+            meta.append("[本番ハブ canonical]")
+        if node.get("depends_on"):
+            meta.append("depends-> " + node["depends_on"])
+        if node.get("policy"):
+            meta.append("[既定方針 設定済]")
+        else:
+            meta.append("[既定方針 未設定]")
+        bps = node.get("bundle_policies") or {}
+        if bps:
+            meta.append("[個別方針 " + str(len(bps)) + " 件]")
+        meta.append("[bundle " + str(len(derived_bundles)) + " 件 (Fleet導出)]")
+        known_bnames = {b["bundle_name"] for b in derived_bundles}
+        orphan_bps = [bn for bn in bps if bn not in known_bnames]
+        if orphan_bps:
+            meta.append("[⚠️ 孤児個別方針 " + str(len(orphan_bps)) + " 件]")
+        head = "**" + modname + "**"
+        if meta:
+            head = head + "  -  " + " / ".join(meta)
+        with st.expander(head, expanded=False):
+            if node.get("role"):
+                st.caption("role: " + node["role"])
+            if node.get("note"):
+                st.caption("note: " + node["note"])
+            st.caption("path: `" + node.get("path", "-") + "`")
+            if derived_bundles:
+                st.markdown(
+                    "**Fleet GitRepo から導出した bundle ("
+                    + str(len(derived_bundles)) + " 件):**"
+                )
+                for b in derived_bundles:
+                    bname = b["bundle_name"]
+                    rel = b["relative_path"] or "(top)"
+                    ready = b.get("ready_bundle_deployments", "")
+                    rc = b.get("ready_clusters", 0)
+                    dc = b.get("desired_ready_clusters", 0)
+                    parts = ["- `" + bname + "`"]
+                    parts.append("rel=`" + rel + "`")
+                    if ready:
+                        parts.append("ready=" + ready)
+                    if dc:
+                        parts.append("clusters=" + str(rc) + "/" + str(dc))
+                    st.markdown("  ".join(parts))
+            else:
+                st.caption("Fleet GitRepo に該当 bundle 無し")
+            _render_module_policy(category, modname, node)
+            _render_bundle_overrides(category, modname, node, derived_bundles)
+
+
+    def render():
+        st.title("モジュール管理")
+        st.caption(
+            "分類は git の OpenSpoke/Core・OpenSpoke/Application ツリーが正。"
+            " バンドル一覧は Fleet GitRepo を真実源として動的導出 (ledger の"
+            " 手書き静的フィールドは廃止)。"
+            " 本番判定はディレクトリ名でなく属性 (live_cluster/role/canonical) で行う。"
+            " モジュール既定方針 + バンドル個別方針 (override) で運用方針を宣言する。"
+            " 個別指定があるバンドルでは個別方針が優先、 無ければ既定を継承。"
+        )
+        if not kernel_api.hub_healthy():
+            st.error("ハブ OpenSearch に接続できません。")
+            return
+        ledger = kernel_api.get_ledger()
+        if not ledger:
+            st.warning("運用台帳 (fleet_state/_id=ledger) が未投入です。")
+            return
+        gitrepos = kernel_api.list_fleet_gitrepos()
+        derived = kernel_api.derive_module_bundles(ledger, gitrepos)
+
+        st.caption(
+            "schema: " + str(ledger.get("schema_version", "-"))
+            + "  /  Fleet GitRepo 総数: " + str(len(gitrepos))
+        )
+        # Fleet にあるが ledger のどのモジュールにも紐付けできない bundle を検出
+        all_classified = set()
+        for items in derived.values():
+            for it in items:
+                all_classified.add(it["bundle_name"])
+        unclassified = [
+            gr.get("name") for gr in gitrepos
+            if gr.get("name") and gr.get("name") not in all_classified
+        ]
+        if unclassified:
+            st.warning(
+                "Fleet には存在するが module.path に前方一致しない bundle が "
+                + str(len(unclassified)) + " 件あります: "
+                + ", ".join(sorted(unclassified))
+                + " (旧パス残置・モジュール未登録のいずれか)"
+            )
+
+        cats = ledger.get("categories", {})
+        scope = user_scope.get_current_scope()
+        rendered = 0
+        for cat_name in ("Core", "Application"):
+            cat = cats.get(cat_name, {})
+            if not cat:
+                continue
+            allowed_in_cat = []
+            for modname in sorted(cat.keys()):
+                key = cat_name + "/" + modname
+                if user_scope.is_module_allowed(scope, key):
+                    allowed_in_cat.append(modname)
+            if not allowed_in_cat:
+                continue
+            st.header(cat_name)
+            st.caption(str(len(allowed_in_cat)) + " モジュール")
+            for modname in allowed_in_cat:
+                bundles_here = derived.get((cat_name, modname)) or []
+                _render_module(
+                    cat_name, modname, cat[modname] or {}, bundles_here,
+                )
+                rendered += 1
+        if rendered == 0:
+            st.info("表示できるモジュールはありません.")

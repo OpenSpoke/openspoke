@@ -1,0 +1,135 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: memgraph-backup
+  namespace: memgraph
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: memgraph-backup
+  namespace: memgraph
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: memgraph-backup
+  namespace: memgraph
+subjects:
+  - kind: ServiceAccount
+    name: memgraph-backup
+    namespace: memgraph
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: memgraph-backup
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: memgraph-backup
+  namespace: memgraph
+spec:
+  # Phase 0: 直接 EFS への書き込みを廃止し、 MinIO バケットに集約。
+  # minio-mirror (19:30 UTC) が後段で EFS にミラー。
+  schedule: "0 19 * * *"
+  startingDeadlineSeconds: 600
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          serviceAccountName: memgraph-backup
+          restartPolicy: OnFailure
+          terminationGracePeriodSeconds: 30
+          containers:
+            - name: backup
+              image: alpine/k8s:1.33.0
+              imagePullPolicy: IfNotPresent
+              env:
+                - name: NS
+                  value: memgraph
+                - name: BUCKET
+                  value: "memgraph-backups"
+                - name: MC_HOST_dst
+                  value: "http://minioadmin:minioadminpassword@minio.milvus.svc.cluster.local:9000"
+              command:
+                - sh
+                - -c
+                - |
+                  set -e
+                  TS=$(date -u +%Y%m%d-%H%M%S)
+                  echo "[$(date -u +%FT%TZ)] Starting memgraph backup ts=${TS}"
+
+                  # mc が無ければ install
+                  if ! command -v mc >/dev/null 2>&1; then
+                    command -v curl >/dev/null 2>&1 || apk add --no-cache curl
+                    curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc
+                    chmod +x /usr/local/bin/mc
+                  fi
+
+                  # バケット作成 (idempotent)
+                  mc mb --ignore-existing "dst/${BUCKET}"
+
+                  MG_POD=$(kubectl -n "${NS}" get pod -l app=memgraph \
+                    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+                  if [ -z "${MG_POD}" ]; then
+                    echo "[$(date -u +%FT%TZ)] ERROR: memgraph pod not found"
+                    exit 1
+                  fi
+                  echo "[$(date -u +%FT%TZ)] Target pod: ${MG_POD}"
+
+                  # CREATE SNAPSHOT 発行 (失敗しても既存ファイルでフォールバック)
+                  echo "[$(date -u +%FT%TZ)] Issuing CREATE SNAPSHOT"
+                  kubectl -n "${NS}" exec "${MG_POD}" -- sh -c \
+                    "echo 'CREATE SNAPSHOT;' | mgconsole --host=127.0.0.1 --port=7687 --output-format=tabular" \
+                    || echo "[$(date -u +%FT%TZ)] WARN: CREATE SNAPSHOT failed, falling back to existing files"
+
+                  sleep 5
+
+                  echo "[$(date -u +%FT%TZ)] Listing snapshots in pod:"
+                  kubectl -n "${NS}" exec "${MG_POD}" -- ls -la /var/lib/memgraph/snapshots/ \
+                    2>/dev/null || echo "(no snapshots dir)"
+
+                  # snapshots + wal を tar でローカルに収集
+                  LOCAL_TAR="/tmp/memgraph-${TS}.tar"
+                  echo "[$(date -u +%FT%TZ)] Collecting snapshots + wal into ${LOCAL_TAR}"
+                  kubectl -n "${NS}" exec "${MG_POD}" -- sh -c \
+                    "cd /var/lib/memgraph && tar cf - snapshots wal 2>/dev/null || tar cf - snapshots 2>/dev/null" \
+                    > "${LOCAL_TAR}"
+
+                  if [ ! -s "${LOCAL_TAR}" ]; then
+                    echo "[$(date -u +%FT%TZ)] ERROR: tar produced empty file"
+                    exit 1
+                  fi
+
+                  # MinIO に upload
+                  echo "[$(date -u +%FT%TZ)] Uploading to MinIO bucket: ${BUCKET}"
+                  mc cp "${LOCAL_TAR}" "dst/${BUCKET}/memgraph-${TS}.tar"
+
+                  # ローカルクリーンアップ
+                  rm -f "${LOCAL_TAR}"
+
+                  # 30 日より古いバックアップを削除
+                  mc rm --recursive --force --older-than 30d "dst/${BUCKET}/" 2>/dev/null || true
+
+                  echo "[$(date -u +%FT%TZ)] Current bucket contents:"
+                  mc ls "dst/${BUCKET}/" | tail -10
+                  echo "[$(date -u +%FT%TZ)] Done"
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  cpu: 1000m
+                  memory: 1Gi

@@ -1,0 +1,187 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-backend-kernel-opensearch-migrate
+  namespace: rag-company1
+data:
+  opensearch_migrate.py: |
+    """opensearch index 移行モジュール (export + pull、 対称・双方向)。
+
+    knowledge_migrate.py と同じ思想。 OpenSearch index データを kernel 間で
+    直接 HTTP 転送する。 制御側 (Claude / MCP) のコンテキストには載らない。
+
+    公開エンドポイント (cloudflared で対象 path のみ公開、 共有トークン必須):
+    - POST /core/opensearch/migrate_export : 指定 index の 1 バッチ doc を scroll で返す
+    - POST /core/opensearch/migrate_pull   : source の export を pull し自分の OpenSearch に bulk index
+
+    認証: env KNOWLEDGE_MIGRATE_TOKEN (knowledge_migrate と共用) と Authorization: Bearer。
+    未設定時は 503、 不一致は 401。
+
+    main.py から `from opensearch_migrate import router` で取り込む。
+    """
+    import os
+    import json
+    import logging
+    import httpx
+    from fastapi import APIRouter, Header, HTTPException
+
+    logger = logging.getLogger("opensearch_migrate")
+    router = APIRouter()
+
+    _OS_URL = os.environ.get("OPENSEARCH_URL", "http://opensearch.opensearch.svc.cluster.local:9200")
+    _MIGRATE_TOKEN = os.environ.get("KNOWLEDGE_MIGRATE_TOKEN", "")
+    _DEFAULT_BATCH = 1000
+
+
+    def _check_token(authorization):
+        if not _MIGRATE_TOKEN:
+            raise HTTPException(status_code=503, detail="KNOWLEDGE_MIGRATE_TOKEN not configured")
+        if authorization != f"Bearer {_MIGRATE_TOKEN}":
+            raise HTTPException(status_code=401, detail="invalid or missing migrate token")
+
+
+    @router.post("/core/opensearch/migrate_export")
+    async def opensearch_migrate_export(request: dict, authorization: str = Header(None)):
+        """指定 index の全 doc を scroll で 1 バッチずつ返す。
+
+        Body (初回): {"index": "secretary_messages", "batch_size": 1000}
+        Body (継続): {"scroll_id": "..."}
+        Returns: {"ok", "count", "docs":[{"id","source"}], "scroll_id", "error"}
+            count==0 でループ終了 (呼び出し側の責任)。
+        """
+        _check_token(authorization)
+        index = (request.get("index") or "").strip()
+        batch_size = int(request.get("batch_size") or _DEFAULT_BATCH)
+        scroll_id = request.get("scroll_id")
+        if not index and not scroll_id:
+            return {"ok": False, "count": 0, "docs": [], "scroll_id": None,
+                    "error": "index or scroll_id is required"}
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as c:
+                if scroll_id:
+                    r = await c.post(
+                        f"{_OS_URL}/_search/scroll",
+                        json={"scroll": "5m", "scroll_id": scroll_id},
+                        headers={"Content-Type": "application/json"},
+                    )
+                else:
+                    r = await c.post(
+                        f"{_OS_URL}/{index}/_search?scroll=5m",
+                        json={"size": batch_size, "query": {"match_all": {}}},
+                        headers={"Content-Type": "application/json"},
+                    )
+            if r.status_code >= 400:
+                return {"ok": False, "count": 0, "docs": [], "scroll_id": None,
+                        "error": f"HTTP {r.status_code}: {r.text[:200]}"}
+            body = r.json()
+            hits = (body.get("hits") or {}).get("hits") or []
+            new_scroll_id = body.get("_scroll_id")
+            docs = [{"id": h.get("_id"), "source": h.get("_source") or {}} for h in hits]
+            logger.info(f"[OPENSEARCH_MIGRATE] export {index or '<scroll>'}: {len(docs)} docs")
+            return {"ok": True, "count": len(docs), "docs": docs,
+                    "scroll_id": new_scroll_id, "error": None}
+        except Exception as e:
+            logger.error(f"[OPENSEARCH_MIGRATE] export error: {e}", exc_info=True)
+            return {"ok": False, "count": 0, "docs": [], "scroll_id": None,
+                    "error": f"{type(e).__name__}: {str(e)[:200]}"}
+
+
+    @router.post("/core/opensearch/migrate_pull")
+    async def opensearch_migrate_pull(request: dict, authorization: str = Header(None)):
+        """source kernel から指定 indices を pull し、 自分の OpenSearch に bulk index する。
+
+        Body:
+            {
+              "source_base_url": "https://<source-kernel>",  必須
+              "source_token":    "<source の KNOWLEDGE_MIGRATE_TOKEN>",  必須
+              "indices":         ["secretary_messages", "claude_usage", ...],  必須
+              "batch_size":      1000,  任意
+              "dry_run":         false  任意
+            }
+        Returns: {"ok", "summary": {index: {fetched,upserted,failed,...}}, "error"}
+        """
+        _check_token(authorization)
+        source = (request.get("source_base_url") or "").rstrip("/")
+        source_token = request.get("source_token") or ""
+        indices = request.get("indices") or []
+        batch_size = int(request.get("batch_size") or _DEFAULT_BATCH)
+        dry_run = bool(request.get("dry_run"))
+
+        if not source:
+            return {"ok": False, "summary": {}, "error": "source_base_url is required"}
+        if not indices or not isinstance(indices, list):
+            return {"ok": False, "summary": {}, "error": "indices (non-empty list) is required"}
+
+        src_headers = {"Authorization": f"Bearer {source_token}"} if source_token else {}
+        summary = {}
+        try:
+            async with httpx.AsyncClient(timeout=600.0) as c:
+                for idx in indices:
+                    fetched = 0
+                    upserted = 0
+                    failed = 0
+                    scroll_id = None
+                    errors = []
+                    while True:
+                        body = {"scroll_id": scroll_id} if scroll_id else {"index": idx, "batch_size": batch_size}
+                        try:
+                            r = await c.post(
+                                f"{source}/core/opensearch/migrate_export",
+                                json=body,
+                                headers=src_headers,
+                            )
+                            d = r.json()
+                        except Exception as ee:
+                            errors.append(f"export call failed: {type(ee).__name__}: {str(ee)[:120]}")
+                            break
+                        if not d.get("ok"):
+                            errors.append(d.get("error") or "export not ok")
+                            break
+                        docs = d.get("docs") or []
+                        fetched += len(docs)
+                        scroll_id = d.get("scroll_id")
+                        if not docs:
+                            break
+                        if dry_run:
+                            continue
+                        bulk_lines = []
+                        for doc in docs:
+                            bulk_lines.append(json.dumps({"index": {"_index": idx, "_id": doc["id"]}}))
+                            bulk_lines.append(json.dumps(doc["source"], ensure_ascii=False))
+                        bulk_body = "\n".join(bulk_lines) + "\n"
+                        try:
+                            rr = await c.post(
+                                f"{_OS_URL}/_bulk",
+                                content=bulk_body,
+                                headers={"Content-Type": "application/x-ndjson"},
+                            )
+                            if rr.status_code >= 400:
+                                failed += len(docs)
+                                if len(errors) < 5:
+                                    errors.append(f"bulk HTTP {rr.status_code}: {rr.text[:150]}")
+                            else:
+                                bd = rr.json()
+                                items = bd.get("items") or []
+                                for it in items:
+                                    op = it.get("index") or it.get("create") or {}
+                                    if op.get("status", 0) >= 400:
+                                        failed += 1
+                                        if len(errors) < 5:
+                                            errors.append(f"{op.get('_id')}: {op.get('error')}")
+                                    else:
+                                        upserted += 1
+                        except Exception as ee:
+                            failed += len(docs)
+                            if len(errors) < 5:
+                                errors.append(f"bulk: {type(ee).__name__}: {str(ee)[:100]}")
+                    res = {"fetched": fetched, "upserted": upserted, "failed": failed}
+                    if dry_run:
+                        res["dry_run"] = True
+                    if errors:
+                        res["sample_errors"] = errors[:5]
+                    summary[idx] = res
+                    logger.info(f"[OPENSEARCH_MIGRATE] pull {idx}: fetched={fetched} upserted={upserted} failed={failed}")
+            return {"ok": True, "summary": summary, "error": None}
+        except Exception as e:
+            logger.error(f"[OPENSEARCH_MIGRATE] pull error: {e}", exc_info=True)
+            return {"ok": False, "summary": summary, "error": f"{type(e).__name__}: {str(e)[:200]}"}

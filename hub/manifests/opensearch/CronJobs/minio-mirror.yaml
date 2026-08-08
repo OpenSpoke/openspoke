@@ -1,0 +1,94 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: minio-mirror
+  namespace: milvus
+spec:
+  # 毎日 19:00 UTC (= 04:00 JST)。 OpenSearch snapshot daily=18:00, mirror=18:30,
+  # その更に 30 分後に MinIO 全体を EFS にミラー。
+  schedule: "30 19 * * *"
+  startingDeadlineSeconds: 600
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: OnFailure
+          terminationGracePeriodSeconds: 30
+          volumes:
+            - name: mirror-efs
+              persistentVolumeClaim:
+                claimName: minio-mirror-efs
+          containers:
+            - name: mirror
+              image: minio/mc:RELEASE.2024-10-08T09-37-26Z
+              imagePullPolicy: IfNotPresent
+              env:
+                # MinIO 認証は既存 Deployment と同じ直書き方式
+                - name: MC_HOST_source
+                  value: "http://minioadmin:minioadminpassword@minio.milvus.svc.cluster.local:9000"
+                - name: DEST_DIR
+                  value: "/efs/minio-all"
+              command:
+                - sh
+                - -c
+                - |
+                  set -e
+                  echo "[$(date -u +%FT%TZ)] Starting full MinIO -> EFS mirror"
+                  mkdir -p "${DEST_DIR}"
+
+                  # 全バケット一覧 (mc/Alpine には awk/sed 不要、 mc ls --json で取得)
+                  echo "[$(date -u +%FT%TZ)] Source buckets:"
+                  mc ls source/ || {
+                    echo "[$(date -u +%FT%TZ)] ERROR: cannot list source buckets"
+                    exit 1
+                  }
+
+                  # --json は 1 行 1 オブジェクトで {"key":"bucket-name/", ...} を返す。
+                  # シェル組み込みだけでバケット名を抽出 (awk/sed 不要)。
+                  BUCKETS=""
+                  for LINE in $(mc ls --json source/); do
+                    # LINE は JSON 1 行。 "key":"name/" 部分を抽出
+                    case "${LINE}" in
+                      *'"key":"'*)
+                        # "key":"NAME/" → NAME を取り出す
+                        NAME="${LINE##*\"key\":\"}"
+                        NAME="${NAME%%\"*}"
+                        NAME="${NAME%/}"
+                        [ -n "${NAME}" ] && BUCKETS="${BUCKETS} ${NAME}"
+                        ;;
+                    esac
+                  done
+
+                  if [ -z "${BUCKETS}" ]; then
+                    echo "[$(date -u +%FT%TZ)] WARN: no buckets found"
+                    exit 0
+                  fi
+
+                  # 各バケットごとに EFS の同名サブディレクトリにミラー
+                  # --overwrite で同名は上書き、 --remove なしで EFS は積み上げ
+                  for B in ${BUCKETS}; do
+                    echo "[$(date -u +%FT%TZ)] Mirroring bucket: ${B}"
+                    mkdir -p "${DEST_DIR}/${B}"
+                    mc mirror --overwrite "source/${B}" "${DEST_DIR}/${B}"
+                  done
+
+                  echo "[$(date -u +%FT%TZ)] EFS usage:"
+                  du -sh "${DEST_DIR}" 2>/dev/null || true
+                  for B in ${BUCKETS}; do
+                    du -sh "${DEST_DIR}/${B}" 2>/dev/null || true
+                  done
+                  echo "[$(date -u +%FT%TZ)] Done"
+              volumeMounts:
+                - name: mirror-efs
+                  mountPath: /efs
+              resources:
+                requests:
+                  cpu: 200m
+                  memory: 256Mi
+                limits:
+                  cpu: 1000m
+                  memory: 1Gi

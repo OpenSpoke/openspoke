@@ -1,0 +1,161 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-frontend-code-dashboard-nodes
+  namespace: rag-company1
+data:
+  view_nodes.py: |
+    """Node Inventory view.
+
+    nodes-aggregator CronJob (5 分間隔) が各 spoke の node_inventory を集計し
+    nodes_aggregated index に書き込む。 ここはそれを読んで表示する。
+
+    集計内容: OS pretty_name / kernel.release / arch / cpu / memory / kubelet /
+    container_runtime / node_role / IP / cloud (EKS のみ) / gpu (GPU ノードのみ)。
+    フィルタ可: cluster / OS / kernel / arch / node_role / GPU 有無。
+    """
+    import streamlit as st
+
+    import kernel_api
+    import user_scope
+
+
+    def _flatten(node: dict) -> dict:
+        """nested dict をフラットな表示用 dict に整形."""
+        os_info = node.get("os") or {}
+        kernel_info = node.get("kernel") or {}
+        cpu = node.get("cpu") or {}
+        mem = node.get("memory") or {}
+        kubelet = node.get("kubelet") or {}
+        gpu = node.get("gpu") or {}
+        cloud = node.get("cloud") or {}
+        memory_gb = ""
+        kb = mem.get("total_kb")
+        if isinstance(kb, (int, float)):
+            memory_gb = f"{kb/1024/1024:.1f}"
+        return {
+            "cluster": node.get("cluster_name", ""),
+            "node": node.get("node_name", ""),
+            "spoke_status": node.get("_spoke_status", ""),
+            "os": os_info.get("pretty_name", ""),
+            "kernel": kernel_info.get("release", ""),
+            "arch": node.get("arch", ""),
+            "role": node.get("node_role", ""),
+            "cpu": cpu.get("count", ""),
+            "mem_GiB": memory_gb,
+            "kubelet": kubelet.get("version", ""),
+            "runtime": node.get("container_runtime", ""),
+            "internal_ip": node.get("internal_ip", ""),
+            "external_ip": node.get("external_ip", ""),
+            "gpu": (f"{gpu.get('count','')}x {gpu.get('vendor','')}"
+                    if gpu else ""),
+            "cloud_instance": cloud.get("instance_type", "") if cloud else "",
+            "ami_id": cloud.get("ami_id", "") if cloud else "",
+            "collected_at": node.get("collected_at", ""),
+            "aggregated_at": node.get("_aggregated_at", ""),
+        }
+
+
+    def render():
+        st.title("Nodes")
+
+        col1, col2 = st.columns([6, 1])
+        with col2:
+            if st.button("Refresh", key="nodes_refresh"):
+                kernel_api.clear_caches()
+                st.rerun()
+
+        if not kernel_api.hub_healthy():
+            st.error("hub OpenSearch (opensearch.opensearch.svc:9200) に接続できません")
+            return
+
+        raw_nodes = kernel_api.list_nodes_aggregated()
+        if not raw_nodes:
+            st.info(
+                "**nodes_aggregated index にまだデータがありません**\n\n"
+                "CronJob `nodes-aggregator` (5 分間隔) が初回完了するまで "
+                "数分お待ちください。 完了済なら集計エラーの可能性があります — "
+                "`kubectl -n rag-company1 logs -l app=nodes-aggregator --tail=50` を確認。"
+            )
+            return
+
+        # ACL: 許可されたクラスタの node のみ表示
+        scope = user_scope.get_current_scope()
+        allowed_nodes = user_scope.filter_clusters(
+            scope, raw_nodes, key_func=lambda n: n.get("cluster_name", "")
+        )
+        rows = [_flatten(n) for n in allowed_nodes]
+
+        st.caption(
+            f"{len(rows)} ノード / 集計元: nodes_aggregated index "
+            f"(nodes-aggregator CronJob、 5 分間隔)"
+        )
+        if not rows:
+            st.info("表示できるノードはありません.")
+            return
+
+        # フィルタ
+        with st.expander("フィルタ", expanded=False):
+            fc1, fc2, fc3, fc4 = st.columns(4)
+            clusters = sorted({r["cluster"] for r in rows if r["cluster"]})
+            oses = sorted({r["os"] for r in rows if r["os"]})
+            kernels = sorted({r["kernel"] for r in rows if r["kernel"]})
+            roles = sorted({r["role"] for r in rows if r["role"]})
+            with fc1:
+                sel_clusters = st.multiselect("cluster", clusters, default=[])
+            with fc2:
+                sel_oses = st.multiselect("OS", oses, default=[])
+            with fc3:
+                sel_kernels = st.multiselect("kernel", kernels, default=[])
+            with fc4:
+                sel_roles = st.multiselect("role", roles, default=[])
+            gpu_only = st.checkbox("GPU ノードのみ", value=False)
+
+        def matches(r: dict) -> bool:
+            if sel_clusters and r["cluster"] not in sel_clusters:
+                return False
+            if sel_oses and r["os"] not in sel_oses:
+                return False
+            if sel_kernels and r["kernel"] not in sel_kernels:
+                return False
+            if sel_roles and r["role"] not in sel_roles:
+                return False
+            if gpu_only and not r["gpu"]:
+                return False
+            return True
+
+        filtered = [r for r in rows if matches(r)]
+
+        # サマリ統計
+        if filtered:
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("ノード数", len(filtered))
+            c2.metric("クラスタ数", len({r["cluster"] for r in filtered}))
+            c3.metric("OS 種類", len({r["os"] for r in filtered if r["os"]}))
+            c4.metric("GPU ノード", len([r for r in filtered if r["gpu"]]))
+
+        st.dataframe(
+            filtered,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        # 集計タブ
+        if filtered:
+            st.subheader("集計")
+            tab1, tab2, tab3, tab4 = st.tabs(["OS 別", "kernel 別", "role 別", "cluster 別"])
+            with tab1:
+                _show_count_table(filtered, "os")
+            with tab2:
+                _show_count_table(filtered, "kernel")
+            with tab3:
+                _show_count_table(filtered, "role")
+            with tab4:
+                _show_count_table(filtered, "cluster")
+
+
+    def _show_count_table(rows: list, key: str):
+        from collections import Counter
+        c = Counter(r[key] for r in rows if r.get(key))
+        data = [{key: k, "ノード数": v} for k, v in c.most_common()]
+        st.dataframe(data, use_container_width=True, hide_index=True)

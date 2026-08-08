@@ -1,0 +1,289 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fleet-state-publisher-code
+  namespace: rag-company1
+data:
+  publish.py: |
+    """Fleet State Publisher.
+
+    fleet-cluster の Fleet CRDs を hub OpenSearch `fleet_state` index に集約。
+
+    取得方式 (シンプル版):
+      hub MCP `cluster_local_fleet_state(cluster="fleet-cluster")` を 1 回呼ぶ。
+      スポーク kernel の /core/k8s/fleet-state エンドポイントが
+      CustomObjectsApi で必要 field だけ抽出した compact JSON を返すので、
+      node-shell や cluster_k8s_get のサイズ制約を完全に回避できる。
+
+    GitRepo は cluster_k8s_get(kind="GitRepo") で取得 (こちらはサイズ収まる)。
+
+    doc_id 規約:
+      cluster:{name}
+      gitrepo:{name}
+      bundle:{name}
+      bd:{ns}__{name}
+
+    delete_stale は kind.keyword + _aggregated_at で実行
+    (OpenSearch は _id への prefix クエリ非対応)。
+    """
+    import asyncio
+    import json
+    import os
+    import urllib.request
+    from datetime import datetime, timezone
+
+    from mcp import ClientSession
+    from mcp.client.sse import sse_client
+
+
+    HUB_OS_URL = os.environ.get(
+        "HUB_OS_URL",
+        "http://opensearch.opensearch.svc.cluster.local:9200",
+    )
+    HUB_MCP_URL = os.environ.get(
+        "HUB_MCP_URL",
+        "http://mcp-company1.mcp.svc.cluster.local:8000/sse",
+    )
+    MCP_API_KEY = os.environ.get("MCP_API_KEY", "")
+    FLEET_CLUSTER = os.environ.get("FLEET_CLUSTER", "fleet-cluster")
+
+
+    def now_utc() -> str:
+        return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+    def os_request(method, path, payload=None, timeout=15):
+        data = None
+        headers = {"Content-Type": "application/json"}
+        if payload is not None:
+            data = json.dumps(payload).encode()
+        req = urllib.request.Request(
+            f"{HUB_OS_URL}{path}", data=data, headers=headers, method=method
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read())
+
+
+    def upsert(doc_id: str, doc: dict):
+        os_request("PUT", f"/fleet_state/_doc/{doc_id}", doc)
+
+
+    def delete_stale_by_kind(kind: str, aggregated_at: str):
+        try:
+            os_request(
+                "POST",
+                "/fleet_state/_delete_by_query?conflicts=proceed",
+                {
+                    "query": {
+                        "bool": {
+                            "must": [
+                                {"term": {"kind.keyword": kind}},
+                                {"range": {"_aggregated_at": {"lt": aggregated_at}}},
+                            ]
+                        }
+                    }
+                },
+            )
+        except Exception as e:
+            print(f"  delete_stale {kind} failed: {e}")
+
+
+    async def _call_tool_text(session, tool_name: str, args: dict, timeout: float = 60):
+        try:
+            result = await asyncio.wait_for(
+                session.call_tool(tool_name, arguments=args),
+                timeout=timeout,
+            )
+        except Exception as e:
+            print(f"  {tool_name} call failed: {type(e).__name__}: {e}")
+            return ""
+        if getattr(result, "isError", False):
+            text = "".join(getattr(c, "text", "") for c in (result.content or []))
+            print(f"  {tool_name} TOOL ERROR: {text[:300]}")
+            return ""
+        if not result.content:
+            return ""
+        return "".join(getattr(c, "text", "") for c in result.content)
+
+
+    async def fetch_gitrepos(session) -> list:
+        text = await _call_tool_text(session, "cluster_k8s_get", {
+            "cluster": FLEET_CLUSTER,
+            "api_version": "fleet.cattle.io/v1alpha1",
+            "kind": "GitRepo",
+            "namespace": "fleet-default",
+        })
+        if not text:
+            return []
+        try:
+            items = json.loads(text)
+            return items if isinstance(items, list) else [items]
+        except Exception as e:
+            print(f"  fetch_gitrepos parse error: {e}; head: {text[:200]!r}")
+            return []
+
+
+    async def fetch_fleet_state(session) -> dict:
+        text = await _call_tool_text(session, "cluster_local_fleet_state", {
+            "cluster": FLEET_CLUSTER,
+        }, timeout=90)
+        if not text:
+            return {}
+        try:
+            return json.loads(text)
+        except Exception as e:
+            print(f"  fetch_fleet_state parse error: {e}; head: {text[:200]!r}")
+            return {}
+
+
+    async def main():
+        started_at = now_utc()
+        print(f"[{started_at}] publishing Fleet state from {FLEET_CLUSTER}")
+
+        async with sse_client(
+            HUB_MCP_URL,
+            headers={"X-API-Key": MCP_API_KEY} if MCP_API_KEY else None,
+        ) as streams:
+            read_stream, write_stream = streams
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                gitrepos = await fetch_gitrepos(session)
+                fleet_state = await fetch_fleet_state(session)
+
+        clusters = fleet_state.get("clusters", []) if isinstance(fleet_state, dict) else []
+        bundles = fleet_state.get("bundles", []) if isinstance(fleet_state, dict) else []
+        bds = fleet_state.get("bundle_deployments", []) if isinstance(fleet_state, dict) else []
+        fs_errors = fleet_state.get("errors", []) if isinstance(fleet_state, dict) else []
+        if fs_errors:
+            print(f"  fleet_state errors: {fs_errors}")
+
+        aggregated_at = now_utc()
+        cluster_ns_to_name: dict = {}
+        counts = {"cluster": 0, "gitrepo": 0, "bundle": 0, "bd": 0}
+
+        # ── Clusters ──
+        for c in clusters:
+            name = c.get("name", "")
+            ns = c.get("ns_for_bd", "")
+            if ns:
+                cluster_ns_to_name[ns] = c.get("cluster_name") or name
+            doc = {
+                "kind": "Cluster",
+                "name": name,
+                "namespace": c.get("namespace", ""),
+                "cluster_name": c.get("cluster_name", "") or name,
+                "ns_for_bd": ns,
+                "ready_bundles": c.get("ready_bundles", ""),
+                "state": c.get("state", ""),
+                "conditions_kv": c.get("conditions_kv", {}),
+                "_aggregated_at": aggregated_at,
+            }
+            try:
+                upsert(f"cluster:{name}", doc)
+                counts["cluster"] += 1
+            except Exception as e:
+                print(f"  cluster:{name} upsert failed: {e}")
+
+        # ── GitRepos (cluster_k8s_get 直返 JSON、 fleet.cattle.io スキーマそのまま) ──
+        for r in gitrepos:
+            meta = r.get("metadata") or {}
+            spec = r.get("spec") or {}
+            status = r.get("status") or {}
+            display = status.get("display") or {}
+            name = meta.get("name", "")
+            conditions = status.get("conditions") or []
+            doc = {
+                "kind": "GitRepo",
+                "name": name,
+                "namespace": meta.get("namespace", "fleet-default"),
+                "repo": spec.get("repo", ""),
+                "branch": spec.get("branch", ""),
+                "paths": spec.get("paths", []) or [],
+                "polling_interval": spec.get("pollingInterval", ""),
+                "commit": status.get("commit", ""),
+                "ready_clusters": status.get("readyClusters", 0),
+                "desired_ready_clusters": status.get("desiredReadyClusters", 0),
+                "ready_bundle_deployments": display.get("readyBundleDeployments", ""),
+                "conditions_kv": {c.get("type", ""): c.get("status", "") for c in conditions},
+                "ready_message": next((c.get("message", "") for c in conditions if c.get("type") == "Ready"), "")[:500],
+                "_aggregated_at": aggregated_at,
+            }
+            try:
+                upsert(f"gitrepo:{name}", doc)
+                counts["gitrepo"] += 1
+            except Exception as e:
+                print(f"  gitrepo:{name} upsert failed: {e}")
+
+        # ── Bundles ──
+        for b in bundles:
+            name = b.get("name", "")
+            doc = {
+                "kind": "Bundle",
+                "name": name,
+                "namespace": b.get("namespace", "fleet-default"),
+                "gitrepo": b.get("gitrepo", ""),
+                "summary": b.get("summary", {}),
+                "display_state": b.get("display_state", ""),
+                "display_ready_clusters": b.get("display_ready_clusters", ""),
+                "conditions_kv": b.get("conditions_kv", {}),
+                "ready_message": b.get("ready_message", ""),
+                "_aggregated_at": aggregated_at,
+            }
+            try:
+                upsert(f"bundle:{name}", doc)
+                counts["bundle"] += 1
+            except Exception as e:
+                print(f"  bundle:{name} upsert failed: {e}")
+
+        # ── BundleDeployments ──
+        for bd in bds:
+            ns = bd.get("namespace", "")
+            name = bd.get("name", "")
+            cluster_name = cluster_ns_to_name.get(ns, ns)
+            doc = {
+                "kind": "BundleDeployment",
+                "name": name,
+                "namespace": ns,
+                "cluster_name": cluster_name,
+                "bundle": bd.get("bundle", ""),
+                "gitrepo": bd.get("gitrepo", ""),
+                "deployed": bd.get("deployed", False),
+                "ready": bd.get("ready", False),
+                "non_modified": bd.get("non_modified", True),
+                "modified_count": bd.get("modified_count", 0),
+                "non_ready_count": bd.get("non_ready_count", 0),
+                "modified_status": bd.get("modified_status", []),
+                "non_ready_status": bd.get("non_ready_status", []),
+                "display_state": bd.get("display_state", ""),
+                "display_deployed": bd.get("display_deployed", ""),
+                "display_monitored": bd.get("display_monitored", ""),
+                "conditions_kv": bd.get("conditions_kv", {}),
+                "ready_message": bd.get("ready_message", ""),
+                "_aggregated_at": aggregated_at,
+            }
+            doc_id = f"bd:{ns}__{name}"
+            try:
+                upsert(doc_id, doc)
+                counts["bd"] += 1
+            except Exception as e:
+                print(f"  {doc_id} upsert failed: {e}")
+
+        # ── 古い doc を kind 別に掃除 ──
+        # 注意: 取得失敗で 0 件だった kind は掃除しない (前回までの正常データを誤って消さないため)
+        if gitrepos:
+            delete_stale_by_kind("GitRepo", aggregated_at)
+        if clusters:
+            delete_stale_by_kind("Cluster", aggregated_at)
+        if bundles:
+            delete_stale_by_kind("Bundle", aggregated_at)
+        if bds:
+            delete_stale_by_kind("BundleDeployment", aggregated_at)
+
+        finished_at = now_utc()
+        print(f"[{finished_at}] publish complete: clusters={counts['cluster']} "
+              f"gitrepos={counts['gitrepo']} bundles={counts['bundle']} "
+              f"bds={counts['bd']}")
+
+
+    if __name__ == "__main__":
+        asyncio.run(main())

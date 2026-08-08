@@ -1,0 +1,31 @@
+# Example Fleet GitRepo for deploying the v2.0 hub-side tunnel server.
+#
+# Requires a Secret `tunnel-server-spokes` in namespace `mcp` on the hub
+# with a `spokes` key of the form:
+#   "<spoke_id>:<hub_listen_port>:<pre-shared token>[,...]"
+# See docs/installation/reverse-tunnel.md.
+#
+# Adjust:
+#   - spec.repo:    your fork URL or the upstream OpenSpoke repo
+#   - spec.branch:  branch to track
+#   - spec.targets: cluster selector labels for your hub cluster
+apiVersion: fleet.cattle.io/v1alpha1
+kind: GitRepo
+metadata:
+  name: hub-tunnel-server
+  namespace: fleet-default
+spec:
+  repo: https://github.com/OpenSpoke/openspoke.git
+  branch: main
+  # For private forks, create a Secret in the fleet-default namespace and
+  # uncomment the line below:
+  # clientSecretName: fleet-git-credentials
+  paths:
+    - hub/manifests/tunnel-server
+  pollingInterval: 1m0s
+  keepResources: true
+  targets:
+    - name: hub
+      clusterSelector:
+        matchLabels:
+          role: hub

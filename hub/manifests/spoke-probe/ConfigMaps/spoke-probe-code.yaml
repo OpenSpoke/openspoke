@@ -1,0 +1,248 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spoke-probe-code
+  namespace: rag-company1
+data:
+  probe.py: |
+    """Spoke health probe.
+
+    spoke_clusters index から spoke 一覧 + url + admin_stopped を読み、
+    各 spoke の url に HTTP GET (timeout=5s) して reachable 判定。
+    結果は spoke_health index (doc_id=cluster_name) に upsert。
+
+    判定:
+      - HTTP 2xx/3xx/4xx を受信 → active (tunnel + spoke server 応答中)
+      - HTTP 5xx (502/503/504/530 等) → unreachable (Cloudflare/origin 異常)
+      - timeout / connection error / DNS error → unreachable
+      - admin_stopped=true → probe スキップして status=stopped
+
+    中央の hub (rag) は status 無関係に常時 オレンジ。
+
+    加えて、 各 spoke と hub 自身に対し
+    /core/{knowledge,opensearch,memgraph}/migrate_export を空 POST で叩いて
+    kernel-to-kernel データチャンネル状態を判定し、 spoke_health.data_channels
+    に書く:
+
+      - HTTP 401 → "open"    (kernel に KNOWLEDGE_MIGRATE_TOKEN 設定済 &
+                              cloudflared で path 公開済)
+      - HTTP 503 → "closed"  (kernel 到達したが token 未設定)
+      - その他 (404 / 5xx / timeout / connection error) → "unknown"
+
+    hub 自身は spoke_clusters に登録されていないため、 ハードコードで
+    cluster_name="rag", url=HUB_KERNEL_URL (内部 Service) で probe し
+    spoke_health に doc_id="rag" で upsert する。
+
+    依存: 標準ライブラリのみ (urllib / json / os / time / socket / datetime)
+    """
+    import json
+    import os
+    import socket
+    import time
+    import urllib.error
+    import urllib.request
+    from datetime import datetime, timezone
+
+
+    HUB_OS_URL = os.environ.get(
+        "HUB_OS_URL",
+        "http://opensearch.opensearch.svc.cluster.local:9200",
+    )
+    HUB_KERNEL_URL = os.environ.get(
+        "HUB_KERNEL_URL",
+        "http://rag-backend-kernel.rag-company1.svc:8000",
+    )
+    PROBE_TIMEOUT = int(os.environ.get("PROBE_TIMEOUT", "5"))
+
+    DATA_CHANNELS = ("knowledge", "opensearch", "memgraph")
+
+
+    def now_utc() -> str:
+        return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+    def os_request(method: str, path: str, payload=None, timeout: int = 10):
+        data = None
+        headers = {"Content-Type": "application/json"}
+        if payload is not None:
+            data = json.dumps(payload).encode()
+        req = urllib.request.Request(
+            f"{HUB_OS_URL}{path}", data=data, headers=headers, method=method
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read())
+
+
+    def list_spokes() -> list:
+        res = os_request("POST", "/spoke_clusters/_search", {
+            "size": 100,
+            "query": {"match_all": {}},
+            "sort": [{"_id": "asc"}],
+        })
+        return [
+            {**(h.get("_source") or {}), "_id": h.get("_id")}
+            for h in res.get("hits", {}).get("hits", [])
+        ]
+
+
+    def get_last_active_at(cluster_name: str) -> str:
+        try:
+            res = os_request("GET", f"/spoke_health/_doc/{cluster_name}", timeout=3)
+            return (res.get("_source") or {}).get("last_active_at", "") or ""
+        except Exception:
+            return ""
+
+
+    def probe(url: str):
+        """Return (status, http_code, error, duration_ms)."""
+        if not url:
+            return ("unreachable", 0, "no url registered in spoke_clusters", 0)
+        start = time.time()
+        try:
+            req = urllib.request.Request(
+                url,
+                method="GET",
+                headers={"User-Agent": "spoke-probe/1.0"},
+            )
+            with urllib.request.urlopen(req, timeout=PROBE_TIMEOUT) as resp:
+                duration = int((time.time() - start) * 1000)
+                return ("active", resp.status, "", duration)
+        except urllib.error.HTTPError as e:
+            duration = int((time.time() - start) * 1000)
+            if 500 <= e.code < 600:
+                return ("unreachable", e.code, f"http {e.code}: {e.reason}", duration)
+            return ("active", e.code, "", duration)
+        except (urllib.error.URLError, socket.timeout, TimeoutError) as e:
+            duration = int((time.time() - start) * 1000)
+            reason = getattr(e, "reason", None) or str(e)
+            return ("unreachable", 0, f"{type(e).__name__}: {reason}", duration)
+        except Exception as e:
+            duration = int((time.time() - start) * 1000)
+            return ("unreachable", 0, f"{type(e).__name__}: {e}", duration)
+
+
+    def probe_data_channel(base_url: str, channel: str) -> str:
+        """POST <base_url>/core/<channel>/migrate_export with empty body & no auth.
+
+        Return:
+          - "open"    : HTTP 401 (token は設定済、 path も公開済)
+          - "closed"  : HTTP 503 (kernel 到達したが token 未設定)
+          - "unknown" : それ以外 (404 / 5xx / timeout / connection error 等)
+        """
+        if not base_url:
+            return "unknown"
+        url = f"{base_url.rstrip('/')}/core/{channel}/migrate_export"
+        try:
+            req = urllib.request.Request(
+                url,
+                data=b"{}",
+                method="POST",
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "spoke-probe/1.0",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=PROBE_TIMEOUT) as resp:
+                # 2xx は token 必須 path で本来到達しない。 念のため unknown
+                _ = resp.read()
+                return "unknown"
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                return "open"
+            if e.code == 503:
+                return "closed"
+            return "unknown"
+        except Exception:
+            return "unknown"
+
+
+    def probe_data_channels(base_url: str) -> dict:
+        return {ch: probe_data_channel(base_url, ch) for ch in DATA_CHANNELS}
+
+
+    def upsert_health(cluster_name: str, doc: dict):
+        os_request("PUT", f"/spoke_health/_doc/{cluster_name}", doc)
+
+
+    def probe_hub():
+        """ハブ (rag) 自身を内部 Service 経由で probe してデータチャンネル状態を記録。"""
+        probed_at = now_utc()
+        last_active_at = get_last_active_at("rag") or probed_at
+        data_channels = probe_data_channels(HUB_KERNEL_URL)
+        doc = {
+            "cluster_name": "rag",
+            "status": "active",
+            "http_code": 0,
+            "probe_duration_ms": 0,
+            "error": "",
+            "last_probe_at": probed_at,
+            "last_active_at": last_active_at,
+            "url": HUB_KERNEL_URL,
+            "data_channels": data_channels,
+        }
+        try:
+            upsert_health("rag", doc)
+            print(f"  rag (hub)              data_channels={data_channels}")
+        except Exception as e:
+            print(f"  rag (hub)              UPSERT FAILED: {type(e).__name__}: {e}")
+
+
+    def main():
+        started_at = now_utc()
+        try:
+            spokes = list_spokes()
+        except Exception as e:
+            print(f"[{started_at}] failed to list spokes: {e}")
+            raise
+
+        if not spokes:
+            print(f"[{started_at}] no spokes registered")
+        else:
+            print(f"[{started_at}] probing {len(spokes)} spokes (timeout={PROBE_TIMEOUT}s)")
+
+        for s in spokes:
+            cluster_name = s["_id"]
+            url = s.get("url", "") or ""
+            admin_stopped = bool(s.get("admin_stopped"))
+
+            last_active_at = get_last_active_at(cluster_name)
+            probed_at = now_utc()
+
+            if admin_stopped:
+                status, http_code, error, duration = ("stopped", 0, "", 0)
+                data_channels = {ch: "unknown" for ch in DATA_CHANNELS}
+            else:
+                status, http_code, error, duration = probe(url)
+                if status == "active":
+                    data_channels = probe_data_channels(url)
+                else:
+                    data_channels = {ch: "unknown" for ch in DATA_CHANNELS}
+
+            if status == "active":
+                last_active_at = probed_at
+
+            doc = {
+                "cluster_name": cluster_name,
+                "status": status,
+                "http_code": http_code,
+                "probe_duration_ms": duration,
+                "error": (error or "")[:300],
+                "last_probe_at": probed_at,
+                "last_active_at": last_active_at,
+                "url": url,
+                "data_channels": data_channels,
+            }
+            try:
+                upsert_health(cluster_name, doc)
+                ch_summary = "/".join(
+                    (data_channels.get(c, "?") or "?")[0:1] for c in DATA_CHANNELS
+                )
+                print(f"  {cluster_name:<22} status={status:<11} http={http_code:<3} dur={duration:>5}ms ch={ch_summary}")
+            except Exception as e:
+                print(f"  {cluster_name:<22} UPSERT FAILED: {type(e).__name__}: {e}")
+
+        probe_hub()
+
+
+    if __name__ == "__main__":
+        main()

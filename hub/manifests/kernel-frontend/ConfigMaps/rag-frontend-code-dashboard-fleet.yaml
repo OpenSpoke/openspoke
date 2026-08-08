@@ -1,0 +1,1192 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-frontend-code-dashboard-fleet
+  namespace: rag-company1
+data:
+  view_fleet.py: |
+    """Fleet GitOps view.
+
+    fleet-state-publisher CronJob (5 分間隔) が fleet-cluster の Fleet CRDs を
+    hub OpenSearch `fleet_state` index に集約。 ここはそれを視覚的に表示する。
+
+    Bundle / GitRepo の operator メモ書き (purpose 等) は別 index
+    `gitrepo_metadata` に保存される。 マトリックスの bundle 名ヘッダ (列 or 行)
+    をクリック → modal で編集 → 保存で即時反映。
+
+    レイアウト (上から下):
+      1. 全体サマリ (Ready/Modified/ErrApplied/NotReady の metric + Ready 率バー)
+      2. クラスタ別ヘルスカード (9 cluster、 色分け + 状態数表示)
+      3. 問題リスト (非 Ready BD のみ、 重要度順)
+      4. クラスタ × bundle マトリックス
+         - 列 or 行の bundle ヘッダに bundle 名 + purpose + GitHub リンク
+         - bundle 名 / purpose のクリック → 編集 modal を open
+         - tooltip に commit/polling/status 等の補足情報
+         - 行/列スワップ可
+    """
+    import urllib.parse
+    from html import escape
+
+    import streamlit as st
+    import streamlit.components.v1 as components
+
+    import kernel_api
+    import user_scope
+
+
+    # ── 適用状態 → 表示色マッピング ──
+    STATE_COLORS = {
+        "Ready":         "#3aa655",   # 緑
+        "Modified":      "#d4a020",   # 橙
+        "ErrApplied":    "#d23a3a",   # 赤
+        "NotReady":      "#c66a2b",   # 濃橙
+        "WaitApplied":   "#7a7abf",   # 紫 (依存待ち)
+        "OutOfSync":     "#b04a8a",   # マゼンタ
+        "Pending":       "#7a7a7a",   # 灰
+    }
+    # ── 状態名 → 日本語ラベル (UI 表示用) ──
+    # 内部の状態文字列は fleet_state index と一致させる必要があるため
+    # 変えられない。 ここはあくまで表示時の日本語化だけ。
+    STATE_LABELS = {
+        "Ready":         "正常",
+        "Modified":      "差分あり",
+        "ErrApplied":    "適用失敗",
+        "NotReady":      "異常",
+        "WaitApplied":   "適用待ち",
+        "OutOfSync":     "未同期",
+        "Pending":       "保留",
+    }
+    STATE_BG_MISSING = "#2a2a2e"   # 該当配置なし
+    STATE_BG_UNKNOWN = "#5a5a5a"
+    NON_READY_STATES = {"Modified", "ErrApplied", "NotReady", "OutOfSync"}
+
+    PURPOSE_MAXLEN = 400
+    PURPOSE_COLHEAD_TRUNC = 40    # 列ヘッダ (縦書き) の purpose 最大長
+    PURPOSE_ROWHEAD_TRUNC = 60    # 行ヘッダ (横書き) の purpose 最大長
+    PATH_COLHEAD_TRUNC = 32
+    PATH_ROWHEAD_TRUNC = 38
+
+    QP_EDIT = "edit_bundle"        # bundle modal を開く URL クエリパラメータ
+    QP_CLUSTER = "detail_cluster"  # cluster modal を開く URL クエリパラメータ
+
+
+    def _bd_state(bd: dict) -> str:
+        """BD の display.state が空のときの fallback 判定."""
+        s = bd.get("display_state") or ""
+        if s:
+            return s
+        if bd.get("modified_count", 0) > 0:
+            return "Modified"
+        if bd.get("non_ready_count", 0) > 0:
+            return "NotReady"
+        if bd.get("ready"):
+            return "Ready"
+        return "Pending"
+
+
+    def _state_color(state: str) -> str:
+        return STATE_COLORS.get(state, STATE_BG_UNKNOWN)
+
+
+    def _current_user() -> str:
+        """oauth2-proxy が立てるヘッダから user 識別子を取り出す."""
+        try:
+            headers = st.context.headers
+            for key in ("x-auth-request-email", "x-auth-request-user",
+                        "x-forwarded-email", "x-forwarded-user"):
+                v = headers.get(key)
+                if v:
+                    return v
+        except Exception:
+            pass
+        return "anonymous"
+
+
+    def _truncate(s: str, n: int) -> str:
+        if not s:
+            return s
+        if len(s) <= n:
+            return s
+        return s[: n - 1] + "…"
+
+
+    def _gitrepo_url(repo: str, branch: str, path: str) -> str:
+        """GitRepo の spec.repo + branch + paths[0] から GitHub の参照 URL を作る."""
+        if not repo or not path:
+            return ""
+        if not repo.startswith("https://github.com/"):
+            return ""
+        clean = repo.rstrip("/").removesuffix(".git")
+        branch = branch or "main"
+        return f"{clean}/tree/{branch}/{path}"
+
+
+    def _edit_url(bundle_name: str) -> str:
+        """Bundle modal を開く URL.
+
+        #bundle-X アンカーを付けてリロード後に scroll 位置を保持する。
+        _n=<ms timestamp> は cache busting (race で URL に残った古い trigger を
+        無視するため、 session_state に保存した last_n と比較する)。
+        """
+        import time
+        quoted = urllib.parse.quote(bundle_name, safe='')
+        t = int(time.time() * 1000)
+        return f"?view=fleet&{QP_EDIT}={quoted}&_n={t}#bundle-{quoted}"
+
+
+    def _cluster_url(cluster_name: str) -> str:
+        """Cluster modal を開く URL (#cluster-X anchor + _n=timestamp cache buster)."""
+        import time
+        quoted = urllib.parse.quote(cluster_name, safe='')
+        t = int(time.time() * 1000)
+        return f"?view=fleet&{QP_CLUSTER}={quoted}&_n={t}#cluster-{quoted}"
+
+
+    def _clear_edit_qp():
+        """edit_bundle を消し、 view=fleet だけ残す.
+
+        del st.query_params[key] は WebSocket 経由で URL を更新するため、
+        直後に st.rerun() するとレースで間に合わず、 リラン後も edit_bundle が
+        残って modal が閉じないことがある。 clear() + set で atomic に上書きする。
+        """
+        try:
+            st.query_params.clear()
+            st.query_params["view"] = "fleet"
+        except Exception:
+            pass
+
+
+    def _on_save_purpose(gitrepo_name: str):
+        """Save ボタンの on_click callback.
+
+        Streamlit の dialog (fragment) 内で if st.button(...): ... パターンに
+        save 処理を書くと fragment ライフサイクルとの race で modal が閉じきらない
+        ことがある (ログに「fragment does not exist anymore」 警告が連発する)。
+        on_click callback は Streamlit が fragment context の外で実行するので
+        この race を避けられる。
+
+        副作用は全部 session_state に書いて次の rerun で消費する:
+        - "_save_error": HTTP エラー文字列 (表示は render() で st.error)
+        - "_save_success_target": 成功時の gitrepo 名 (toast 表示)
+        - "_needs_cache_clear": cache clear フラグ (render() 入口で実行)
+        - "_dialog_target": "" にして modal を閉じる
+        """
+        purpose = st.session_state.get(f"purpose_text_{gitrepo_name}", "")
+        user = _current_user()
+        res = kernel_api.set_gitrepo_purpose(
+            gitrepo_name, purpose, updated_by=user,
+        )
+        if "_error" in res:
+            st.session_state["_save_error"] = res["_error"]
+        else:
+            st.session_state["_save_success_target"] = gitrepo_name
+            st.session_state["_needs_cache_clear"] = True
+            st.session_state["_dialog_target"] = ""
+
+
+    def _on_cancel_dialog():
+        """Cancel / 閉じる ボタンの on_click callback.
+
+        bundle modal / cluster modal どちらも target を空にして閉じる。
+        """
+        st.session_state["_dialog_target"] = ""
+        st.session_state["_cluster_dialog_target"] = ""
+
+
+    @st.dialog("Bundle プロパティ", width="large")
+    def _purpose_edit_dialog(bundle_name: str, gitrepo_name: str,
+                             gr_record: dict, meta: dict, bds: list):
+        """ヘッダクリックで開く編集 modal.
+
+        ・上部にプロパティを read-only で表示
+        ・続いて各 Cluster での BD 状況を表示
+        ・下部に purpose の text_area + 保存/キャンセル
+        """
+        print(
+            f"[DBG dialog] _purpose_edit_dialog CALLED "
+            f"bundle={bundle_name} gitrepo={gitrepo_name} "
+            f"session_target={st.session_state.get('_dialog_target', '')!r}",
+            flush=True,
+        )
+        # ── 読み取り専用プロパティ ──
+        paths = gr_record.get("paths", []) or []
+        path = paths[0] if paths else ""
+        repo_full = gr_record.get("repo", "") or ""
+        repo_display = repo_full.replace("https://github.com/", "").removesuffix(".git") or "(なし)"
+        branch_display = gr_record.get("branch", "") or "main"
+        commit = (gr_record.get("commit") or "")[:8]
+        polling = gr_record.get("polling_interval", "") or ""
+        gr_status = (gr_record.get("conditions_kv", {}) or {}).get("Ready", "") or ""
+        gh_url = _gitrepo_url(repo_full, branch_display, path)
+
+        prop_rows = [
+            ("Bundle", bundle_name),
+            ("リポジトリ", gitrepo_name),
+            ("repo", repo_display),
+            ("branch", branch_display),
+            ("path", path or "(なし)"),
+            ("commit", commit or "(なし)"),
+            ("polling", polling or "(なし)"),
+            ("リポジトリ状態", gr_status or "(なし)"),
+        ]
+        md_lines = []
+        for k, v in prop_rows:
+            md_lines.append(f"- **{k}**: `{v}`")
+        if gh_url:
+            md_lines.append(f"- **GitHub**: [{gh_url}]({gh_url})")
+        st.markdown("\n".join(md_lines))
+
+        # ── この Bundle のクラスタごとの適用状況 ──
+        bds_for_this_bundle = [bd for bd in bds if bd.get("bundle") == bundle_name]
+        if bds_for_this_bundle:
+            state_counts: dict = {}
+            for bd in bds_for_this_bundle:
+                s = _bd_state(bd)
+                state_counts[s] = state_counts.get(s, 0) + 1
+            total = sum(state_counts.values())
+
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("正常", state_counts.get("Ready", 0))
+            m2.metric("差分あり", state_counts.get("Modified", 0))
+            m3.metric("適用失敗", state_counts.get("ErrApplied", 0))
+            m4.metric("異常", state_counts.get("NotReady", 0))
+            m5.metric("適用 合計", total)
+
+            severity_order = {"ErrApplied": 0, "NotReady": 1, "Modified": 2,
+                              "OutOfSync": 3, "Pending": 4, "WaitApplied": 5,
+                              "Ready": 9}
+            bds_sorted = sorted(
+                bds_for_this_bundle,
+                key=lambda b: (severity_order.get(_bd_state(b), 99),
+                               b.get("cluster_name", "")),
+            )
+            rows = []
+            for bd in bds_sorted:
+                rows.append({
+                    "クラスタ": bd.get("cluster_name", ""),
+                    "状態": STATE_LABELS.get(_bd_state(bd), _bd_state(bd)),
+                    "差分": bd.get("modified_count", 0),
+                    "未準備": bd.get("non_ready_count", 0),
+                    "メッセージ": (bd.get("ready_message", "") or "")[:80],
+                })
+            st.markdown("**各クラスタへの適用状況**")
+            st.table(rows)
+
+        # ── 最終更新情報 ──
+        if meta.get("updated_at"):
+            st.caption(
+                f"用途の最終更新: {meta.get('updated_at', '')} "
+                f"by {meta.get('updated_by', 'anonymous')}"
+            )
+
+        # ── 編集フォーム ──
+        new_purpose = st.text_area(
+            "用途 (この Bundle / リポジトリ の役割)",
+            value=meta.get("purpose", "") or "",
+            height=120,
+            max_chars=PURPOSE_MAXLEN,
+            key=f"purpose_text_{gitrepo_name}",
+            help="マトリックスの Bundle ヘッダに表示される簡潔な説明文。 "
+                 f"最大 {PURPOSE_MAXLEN} 字。",
+        )
+
+        _, col_save, col_cancel, _ = st.columns([1, 2, 2, 1])
+        with col_save:
+            if st.button(
+                "保存",
+                type="primary",
+                key=f"save_{gitrepo_name}",
+                use_container_width=True,
+            ):
+                print(
+                    f"[DBG save] CLICKED gitrepo={gitrepo_name} "
+                    f"ss._dialog_target_before={st.session_state.get('_dialog_target','')!r}",
+                    flush=True,
+                )
+                # HTTP write はここで実行 (同期、 ~100-500ms)。
+                # cache clear / error 表示 / toast は session_state 経由で
+                # render() に deferred (fragment 内で重い処理を避ける)。
+                user = _current_user()
+                res = kernel_api.set_gitrepo_purpose(
+                    gitrepo_name, new_purpose, updated_by=user,
+                )
+                print(
+                    f"[DBG save] HTTP_RESULT res_keys={list(res.keys())}",
+                    flush=True,
+                )
+                if "_error" in res:
+                    st.session_state["_save_error"] = res["_error"]
+                else:
+                    st.session_state["_save_success_target"] = gitrepo_name
+                    st.session_state["_needs_cache_clear"] = True
+                # 成否どちらでも modal は閉じる (error は render() で表示)
+                st.session_state["_dialog_target"] = ""
+                print(
+                    f"[DBG save] BEFORE_RERUN "
+                    f"ss._dialog_target={st.session_state.get('_dialog_target','')!r}",
+                    flush=True,
+                )
+                st.rerun()
+        with col_cancel:
+            if st.button(
+                "キャンセル",
+                key=f"cancel_{gitrepo_name}",
+                use_container_width=True,
+            ):
+                print(
+                    f"[DBG cancel] CLICKED gitrepo={gitrepo_name} "
+                    f"ss._dialog_target_before={st.session_state.get('_dialog_target','')!r}",
+                    flush=True,
+                )
+                st.session_state["_dialog_target"] = ""
+                print(
+                    f"[DBG cancel] BEFORE_RERUN "
+                    f"ss._dialog_target={st.session_state.get('_dialog_target','')!r}",
+                    flush=True,
+                )
+                st.rerun()
+
+
+    @st.dialog("Cluster プロパティ", width="large")
+    def _cluster_detail_dialog(cluster_name: str, cluster_record: dict,
+                               bds_for_cluster: list, gitrepo_metadata: dict):
+        """Cluster ヘッダクリックで開く詳細 modal (read-only).
+
+        Cluster CR の基本情報 + その Cluster にデプロイされた BD 一覧を表示。
+        """
+        # ── Cluster 基本情報 ──
+        cr_name = cluster_record.get("name", "")
+        cr_ns = cluster_record.get("namespace", "")
+        ns_for_bd = cluster_record.get("ns_for_bd", "")
+        state = cluster_record.get("state", "")
+        ready_bundles = cluster_record.get("ready_bundles", "")
+        conditions = cluster_record.get("conditions_kv", {}) or {}
+        aggregated_at = cluster_record.get("_aggregated_at", "")
+
+        prop_rows = [
+            ("Cluster (label)", cluster_name),
+            ("Cluster CR name", cr_name or "(未登録)"),
+            ("Cluster CR namespace", cr_ns or ""),
+            ("BD namespace", ns_for_bd or ""),
+            ("State", state or "(unknown)"),
+            ("Ready Bundles", ready_bundles or ""),
+        ]
+        for k, v in conditions.items():
+            prop_rows.append((f"cond.{k}", str(v)))
+        if aggregated_at:
+            prop_rows.append(("集計時刻", aggregated_at))
+
+        md_lines = []
+        for k, v in prop_rows:
+            md_lines.append(f"- **{k}**: `{v}`")
+        st.markdown("\n".join(md_lines))
+
+        # ── 適用 集計 ──
+        state_counts: dict = {}
+        for bd in bds_for_cluster:
+            s = _bd_state(bd)
+            state_counts[s] = state_counts.get(s, 0) + 1
+        total = sum(state_counts.values())
+
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("正常", state_counts.get("Ready", 0))
+        m2.metric("差分あり", state_counts.get("Modified", 0))
+        m3.metric("適用失敗", state_counts.get("ErrApplied", 0))
+        m4.metric("異常", state_counts.get("NotReady", 0))
+        m5.metric("適用 合計", total)
+
+        # ── 適用一覧 (problem 順) ──
+        severity_order = {"ErrApplied": 0, "NotReady": 1, "Modified": 2,
+                          "OutOfSync": 3, "Pending": 4, "WaitApplied": 5,
+                          "Ready": 9}
+        bds_sorted = sorted(
+            bds_for_cluster,
+            key=lambda b: (severity_order.get(_bd_state(b), 99),
+                           b.get("bundle", "")),
+        )
+        if bds_sorted:
+            st.markdown("**このクラスタへの適用一覧**")
+            rows = []
+            for bd in bds_sorted:
+                bundle = bd.get("bundle", "")
+                gr = bd.get("gitrepo", "") or ""
+                purpose = (gitrepo_metadata.get(gr, {}) or {}).get("purpose", "") if gr else ""
+                rows.append({
+                    "Bundle": bundle,
+                    "用途": (purpose or "")[:60],
+                    "状態": STATE_LABELS.get(_bd_state(bd), _bd_state(bd)),
+                    "差分": bd.get("modified_count", 0),
+                    "未準備": bd.get("non_ready_count", 0),
+                    "メッセージ": (bd.get("ready_message", "") or "")[:80],
+                })
+            st.table(rows)
+        else:
+            st.info("このクラスタには適用がありません")
+
+        _, col_close, _ = st.columns([2, 2, 2])
+        with col_close:
+            if st.button(
+                "閉じる",
+                key=f"close_cluster_{cluster_name}",
+                use_container_width=True,
+            ):
+                st.session_state["_cluster_dialog_target"] = ""
+                st.rerun()
+
+
+    def render():
+        st.title("Fleet")
+
+        # ── DEBUG ──
+        try:
+            _qp_edit = st.query_params.get(QP_EDIT, "")
+            _qp_cluster = st.query_params.get(QP_CLUSTER, "")
+            _qp_n = st.query_params.get("_n", "")
+        except Exception as e:
+            _qp_edit = _qp_cluster = _qp_n = f"<err:{e}>"
+        print(
+            f"[DBG render] START "
+            f"ss._dialog_target={st.session_state.get('_dialog_target','')!r} "
+            f"ss._cluster_dialog_target={st.session_state.get('_cluster_dialog_target','')!r} "
+            f"ss._dialog_last_n={st.session_state.get('_dialog_last_n','')!r} "
+            f"url.edit={_qp_edit!r} url.cluster={_qp_cluster!r} url.n={_qp_n!r}",
+            flush=True,
+        )
+
+        col_t, col_b = st.columns([6, 1])
+        with col_b:
+            if st.button("Refresh", key="fleet_refresh"):
+                kernel_api.clear_caches()
+                _clear_edit_qp()
+                st.rerun()
+
+        # ── deferred 処理 (on_click callback が書いた session_state) ──
+        # callback は fragment context の外で動くが、 fragment 内では使えない
+        # 副作用 (cache clear、 toast 表示等) はここでまとめて処理する。
+        if st.session_state.pop("_needs_cache_clear", False):
+            try:
+                kernel_api.clear_caches()
+            except Exception:
+                pass
+        save_err = st.session_state.pop("_save_error", None)
+        if save_err:
+            st.error(f"保存失敗: {save_err}")
+        save_target = st.session_state.pop("_save_success_target", None)
+        if save_target:
+            st.toast(f"`{save_target}` の用途を保存しました", icon="✅")
+
+        if not kernel_api.hub_healthy():
+            st.error("hub OpenSearch (opensearch.opensearch.svc:9200) に接続できません")
+            return
+
+        clusters = kernel_api.list_fleet_clusters()
+        gitrepos = kernel_api.list_fleet_gitrepos()
+        bundles = kernel_api.list_fleet_bundles()
+        bds = kernel_api.list_fleet_bds()
+        gitrepo_metadata = kernel_api.list_gitrepo_metadata()
+
+        # 真の 「fleet データ未取得」 判定は ACL filter の **前** に行う。
+        # filter 後の空状態を 「データ未取得」 と誤判定しないように。
+        if not bds and not gitrepos:
+            st.info(
+                "**fleet_state index にまだデータがありません**\n\n"
+                "CronJob `fleet-state-publisher` の初回完了まで "
+                "もう少しお待ちください。"
+            )
+            return
+
+        # ── ACL filter ──
+        # 非 admin: bds (BundleDeployments) を cluster AND module の両方が
+        # 許可されているものだけに絞り込む。 これで下流の全集計
+        # (cluster_summary / 問題リスト / マトリックス) が自動的に
+        # 許可範囲内だけになる。
+        #
+        # 注意: derive_module_bundles の戻り値 b["bundle_name"] は実態は
+        # GitRepo 名 (例: "example-cluster")。 Fleet Bundle 名 (例: "example-cluster-openspoke-
+        # application-example-cluster-manifests-14e77d5b") ではない。 そのため
+        # bd → module の逆引きは bd["gitrepo"] フィールドで行う。
+        scope = user_scope.get_current_scope()
+        if not scope.get("is_admin"):
+            ledger = kernel_api.get_ledger()
+            derived = kernel_api.derive_module_bundles(ledger or {}, gitrepos)
+            # GitRepo 名 → (Category, Module)
+            gitrepo_to_modkey = {}
+            for (cat, mod), bundle_list in derived.items():
+                for b in bundle_list:
+                    gr_name = b.get("bundle_name", "")  # 実は GitRepo 名
+                    if gr_name:
+                        gitrepo_to_modkey[gr_name] = (cat, mod)
+            filtered_bds = []
+            for bd in bds:
+                cn = bd.get("cluster_name", "")
+                gr = bd.get("gitrepo", "")
+                if not user_scope.is_cluster_allowed(scope, cn):
+                    continue
+                cm = gitrepo_to_modkey.get(gr)
+                if not cm:
+                    # ledger に紐付かない bundle (fleet-agent-* 等 = gitrepo="") は非表示
+                    continue
+                key = cm[0] + "/" + cm[1]
+                if not user_scope.is_module_allowed(scope, key):
+                    continue
+                filtered_bds.append(bd)
+            bds = filtered_bds
+            # GitRepo / cluster の lookup も絞る (lookup 経由の漏洩防止)
+            allowed_cluster_names = {bd.get("cluster_name", "") for bd in bds}
+            clusters = [c for c in clusters
+                        if (c.get("cluster_name") or c.get("name", "")) in allowed_cluster_names]
+            allowed_gitrepo_names = set()
+            for bd in bds:
+                gr = bd.get("gitrepo", "")
+                if gr:
+                    allowed_gitrepo_names.add(gr)
+            gitrepos = [g for g in gitrepos if g.get("name", "") in allowed_gitrepo_names]
+
+        # ── GitRepo / Bundle / Cluster の lookup map ──
+        gitrepo_lookup = {gr.get("name", ""): gr for gr in gitrepos
+                          if gr.get("name")}
+        bundle_to_gitrepo = {}
+        for bd in bds:
+            b = bd.get("bundle", "")
+            gr = bd.get("gitrepo", "") or ""
+            if b and gr and b not in bundle_to_gitrepo:
+                bundle_to_gitrepo[b] = gr
+        cluster_lookup = {}
+        for c in clusters:
+            label = c.get("cluster_name", "") or c.get("name", "")
+            if label:
+                cluster_lookup[label] = c
+
+        # ──────────────────────────────
+        # ヘッダクリック検知: URL クエリパラメータ → session_state にコピー
+        # ──────────────────────────────
+        # st.query_params の mutate は WebSocket 経由で URL 更新するため、
+        # save/cancel 後の st.rerun() で読む URL state が古いまま (= 直前の
+        # trigger が見える) になる race があり、 session_state を再 set してしまう。
+        #
+        # 対策: URL に毎クリック固有の _n=<ms timestamp> を入れ、 session_state
+        # に「最後に処理した _n」 を持つ。 _n が同一なら処理しない (race 回避)。
+        # 新規 click のときだけ _n が変わるので、 新規 click のみ消費される。
+        # bundle / cluster modal は mutex (同時に開けない) なので、 URL trigger が
+        # 来たら逆側の state はクリアする。
+        try:
+            edit_from_url = st.query_params.get(QP_EDIT, "")
+        except Exception:
+            edit_from_url = ""
+        try:
+            cluster_from_url = st.query_params.get(QP_CLUSTER, "")
+        except Exception:
+            cluster_from_url = ""
+        try:
+            url_n = st.query_params.get("_n", "")
+        except Exception:
+            url_n = ""
+
+        last_n = st.session_state.get("_dialog_last_n", "")
+        is_new_click = bool(url_n) and url_n != last_n
+        print(
+            f"[DBG render] URL_CHECK is_new_click={is_new_click} "
+            f"edit_from_url={edit_from_url!r} cluster_from_url={cluster_from_url!r} "
+            f"url_n={url_n!r} last_n={last_n!r}",
+            flush=True,
+        )
+
+        if is_new_click and edit_from_url:
+            st.session_state["_dialog_target"] = edit_from_url
+            st.session_state["_cluster_dialog_target"] = ""
+            st.session_state["_dialog_last_n"] = url_n
+            _clear_edit_qp()
+        elif is_new_click and cluster_from_url:
+            st.session_state["_cluster_dialog_target"] = cluster_from_url
+            st.session_state["_dialog_target"] = ""
+            st.session_state["_dialog_last_n"] = url_n
+            _clear_edit_qp()
+
+        dialog_target = st.session_state.get("_dialog_target", "")
+        cluster_target = st.session_state.get("_cluster_dialog_target", "")
+        print(
+            f"[DBG render] BEFORE_DIALOG "
+            f"dialog_target={dialog_target!r} cluster_target={cluster_target!r}",
+            flush=True,
+        )
+        if dialog_target:
+            gr_name = bundle_to_gitrepo.get(dialog_target, "")
+            if gr_name:
+                _purpose_edit_dialog(
+                    dialog_target,
+                    gr_name,
+                    gitrepo_lookup.get(gr_name, {}),
+                    gitrepo_metadata.get(gr_name, {}),
+                    bds,
+                )
+            else:
+                # リポジトリ紐付け無し: dialog は出さず警告だけ表示
+                st.warning(
+                    f"Bundle `{dialog_target}` にはリポジトリの紐付けがありません "
+                    "(fleet-agent-* 等の auto-bundle は編集対象外)。"
+                )
+                st.session_state["_dialog_target"] = ""
+        elif cluster_target:
+            cluster_record = cluster_lookup.get(cluster_target, {})
+            bds_for_cluster = [bd for bd in bds
+                               if bd.get("cluster_name") == cluster_target]
+            _cluster_detail_dialog(
+                cluster_target,
+                cluster_record,
+                bds_for_cluster,
+                gitrepo_metadata,
+            )
+
+        # ──────────────────────────────
+        # 1. 全体サマリ + 正常率バー
+        # ──────────────────────────────
+        state_counts: dict = {}
+        for bd in bds:
+            s = _bd_state(bd)
+            state_counts[s] = state_counts.get(s, 0) + 1
+        total = sum(state_counts.values())
+        ready = state_counts.get("Ready", 0)
+        ready_pct = (ready / total * 100) if total else 0
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("正常", ready)
+        c2.metric("差分あり", state_counts.get("Modified", 0))
+        c3.metric("適用失敗", state_counts.get("ErrApplied", 0))
+        c4.metric("異常", state_counts.get("NotReady", 0))
+        c5.metric("適用 合計", total)
+
+        bar_color = "#3aa655" if ready_pct >= 95 else ("#d4a020" if ready_pct >= 80 else "#d23a3a")
+        bar_html = (
+            f'<div style="margin: 4px 0 14px; padding: 6px 12px; '
+            f'background:#262730; border-radius:6px; color:#fafafa; '
+            f'font-family:monospace; font-size:13px;">'
+            f'  正常率: <strong>{ready_pct:.1f}%</strong>'
+            f'  <div style="margin-top:6px; height:8px; background:#1a1a1a; '
+            f'border-radius:4px; overflow:hidden;">'
+            f'    <div style="width:{ready_pct:.1f}%; height:100%; '
+            f'background:{bar_color};"></div>'
+            f'  </div>'
+            f'</div>'
+        )
+        st.markdown(bar_html, unsafe_allow_html=True)
+
+        # ──────────────────────────────
+        # 2. クラスタ別ヘルスカード
+        # ──────────────────────────────
+        cluster_summary: dict = {}
+        for bd in bds:
+            cn = bd.get("cluster_name", "") or "(unknown)"
+            if cn not in cluster_summary:
+                cluster_summary[cn] = {"Ready": 0, "Modified": 0, "ErrApplied": 0,
+                                       "NotReady": 0, "Other": 0, "_total": 0}
+            s = _bd_state(bd)
+            if s in cluster_summary[cn]:
+                cluster_summary[cn][s] += 1
+            else:
+                cluster_summary[cn]["Other"] += 1
+            cluster_summary[cn]["_total"] += 1
+
+        def _cluster_severity(cs: dict) -> tuple:
+            return (
+                -(cs["ErrApplied"] > 0),
+                -cs["ErrApplied"],
+                -(cs["NotReady"] + cs["Modified"]),
+                -cs["_total"],
+            )
+        sorted_clusters = sorted(
+            cluster_summary.items(),
+            key=lambda kv: _cluster_severity(kv[1]),
+        )
+
+        cards_html = _build_cluster_cards_html(sorted_clusters)
+        st.markdown(cards_html, unsafe_allow_html=True)
+
+        # ──────────────────────────────
+        # 3. 問題リスト
+        # ──────────────────────────────
+        problems = [bd for bd in bds if _bd_state(bd) in NON_READY_STATES]
+        st.subheader(f"問題のある Bundle ({len(problems)})")
+        if not problems:
+            st.success("全 Bundle が正常です ✓")
+        else:
+            severity_order = {"ErrApplied": 0, "NotReady": 1, "Modified": 2,
+                              "OutOfSync": 3, "Pending": 4}
+            problems_sorted = sorted(
+                problems,
+                key=lambda b: (severity_order.get(_bd_state(b), 99),
+                              b.get("cluster_name", ""), b.get("bundle", ""))
+            )
+            problem_rows = []
+            for bd in problems_sorted:
+                state = _bd_state(bd)
+                problem_rows.append({
+                    "クラスタ": bd.get("cluster_name", ""),
+                    "Bundle": bd.get("bundle", ""),
+                    "リポジトリ": bd.get("gitrepo", ""),
+                    "状態": STATE_LABELS.get(state, state),
+                    "差分": bd.get("modified_count", 0),
+                    "未準備": bd.get("non_ready_count", 0),
+                    "メッセージ": (bd.get("ready_message", "") or "")[:200],
+                })
+            st.table(problem_rows)
+
+        # ──────────────────────────────
+        # 4. マトリックス view
+        # ──────────────────────────────
+        st.subheader("クラスタ × Bundle マトリックス")
+        st.caption(
+            "Bundle 名 / クラスタ名 (列ヘッダ・ 行ヘッダ) をクリックすると "
+            "詳細・ 編集ダイアログが開きます。 GitHub リンク (↗) は別タブで開きます。"
+        )
+
+        orientation = st.radio(
+            "向き",
+            ["Bundle × クラスタ", "クラスタ × Bundle"],
+            key="matrix_orient",
+            horizontal=True,
+        )
+
+        all_clusters_set = sorted({bd.get("cluster_name", "") for bd in bds if bd.get("cluster_name")})
+        all_bundles_set = sorted({bd.get("bundle", "") for bd in bds if bd.get("bundle")})
+
+        if not all_bundles_set:
+            st.info("マトリックスに表示する適用がありません")
+            return
+
+        bd_lookup = {}
+        bd_lookup_full = {}
+        for bd in bds:
+            key = (bd.get("cluster_name", ""), bd.get("bundle", ""))
+            bd_lookup[key] = _bd_state(bd)
+            bd_lookup_full[key] = bd
+
+        if orientation == "Bundle × クラスタ":
+            row_items = all_bundles_set
+            col_items = all_clusters_set
+            row_label = "bundle"
+            col_label = "cluster"
+        else:
+            row_items = all_clusters_set
+            col_items = all_bundles_set
+            row_label = "cluster"
+            col_label = "bundle"
+
+        legend = '<div style="margin: 8px 0; font-size:12px; color:#bbb;">凡例: '
+        for state in ("Ready", "Modified", "ErrApplied", "NotReady",
+                      "WaitApplied", "Pending"):
+            label = STATE_LABELS.get(state, state)
+            legend += (
+                f'<span style="display:inline-block; width:12px; height:12px; '
+                f'background:{_state_color(state)}; vertical-align:middle; '
+                f'margin: 0 4px 0 12px; border-radius:2px;"></span>{label}'
+            )
+        legend += (
+            f'<span style="display:inline-block; width:12px; height:12px; '
+            f'background:{STATE_BG_MISSING}; vertical-align:middle; '
+            f'margin: 0 4px 0 12px; border-radius:2px;"></span>未配置</div>'
+        )
+        st.markdown(legend, unsafe_allow_html=True)
+
+        matrix_html = _build_matrix_html(
+            row_items, col_items, row_label, col_label,
+            bd_lookup, bd_lookup_full, orientation,
+            gitrepo_lookup, bundle_to_gitrepo, gitrepo_metadata,
+        )
+        st.markdown(matrix_html, unsafe_allow_html=True)
+
+        # ──────────────────────────────
+        # JS: URL hash (#bundle-X / #cluster-X) で対象要素まで scroll
+        # ──────────────────────────────
+        # Streamlit の React rerun は DOM 再構築のタイミングで scroll を
+        # トップに戻しうる。 1 回の setTimeout では rerun の後追い scroll に
+        # 負けることがあるため、 複数 delay でリトライする。
+        components.html(
+            """
+            <script>
+            (function() {
+              try {
+                var pw = window.parent;
+                var hash = pw.location.hash;
+                if (!hash) return;
+                var id = decodeURIComponent(hash.substring(1));
+                var doScroll = function() {
+                  var el = pw.document.getElementById(id);
+                  if (el && typeof el.scrollIntoView === 'function') {
+                    el.scrollIntoView({behavior: 'auto', block: 'center'});
+                  }
+                };
+                // 複数 delay で連続実行 (Streamlit の rerun が後追いで
+                // scroll を打ち消す可能性に対抗)
+                [100, 300, 600, 1000, 1500, 2000].forEach(function(d) {
+                  setTimeout(doScroll, d);
+                });
+              } catch (e) {
+                if (window.console) console.error(
+                  'Fleet anchor scroll failed:', e
+                );
+              }
+            })();
+            </script>
+            """,
+            height=0,
+        )
+
+
+    def _build_cluster_cards_html(sorted_clusters) -> str:
+        """クラスタ別ヘルスカードを 1 行の CSS Flex grid で描画."""
+        cards = []
+        for name, cs in sorted_clusters:
+            err = cs.get("ErrApplied", 0)
+            mod = cs.get("Modified", 0)
+            nr = cs.get("NotReady", 0)
+            rdy = cs.get("Ready", 0)
+            total = cs.get("_total", 0)
+
+            if err > 0:
+                accent = STATE_COLORS["ErrApplied"]
+            elif mod > 0:
+                accent = STATE_COLORS["Modified"]
+            elif nr > 0:
+                accent = STATE_COLORS["NotReady"]
+            else:
+                accent = STATE_COLORS["Ready"]
+
+            bar_segments = []
+            for state, count in [("Ready", rdy), ("Modified", mod),
+                                 ("NotReady", nr), ("ErrApplied", err)]:
+                if count > 0 and total > 0:
+                    pct = count / total * 100
+                    bar_segments.append(
+                        f'<div style="width:{pct:.1f}%; '
+                        f'background:{STATE_COLORS[state]}; height:100%;" '
+                        f'title="{state}: {count}"></div>'
+                    )
+            bar_inner = "".join(bar_segments)
+
+            badges = []
+            if rdy > 0:
+                badges.append(f'<span style="color:{STATE_COLORS["Ready"]}; font-weight:bold;">{rdy}</span>')
+            if mod > 0:
+                badges.append(f'<span style="color:{STATE_COLORS["Modified"]}; font-weight:bold;">M:{mod}</span>')
+            if nr > 0:
+                badges.append(f'<span style="color:{STATE_COLORS["NotReady"]}; font-weight:bold;">N:{nr}</span>')
+            if err > 0:
+                badges.append(f'<span style="color:{STATE_COLORS["ErrApplied"]}; font-weight:bold;">E:{err}</span>')
+            badges_html = " &nbsp; ".join(badges)
+
+            cards.append(
+                f'<div style="flex:1 1 140px; min-width:140px; '
+                f'background:#262730; border-left:4px solid {accent}; '
+                f'border-radius:4px; padding:8px 10px; color:#fafafa;">'
+                f'<div style="font-size:13px; font-weight:bold; '
+                f'margin-bottom:6px; overflow:hidden; '
+                f'text-overflow:ellipsis; white-space:nowrap;" '
+                f'title="{escape(name)}">{escape(name)}</div>'
+                f'<div style="height:6px; background:#1a1a1a; '
+                f'border-radius:2px; display:flex; overflow:hidden; '
+                f'margin-bottom:6px;">{bar_inner}</div>'
+                f'<div style="font-size:11px; font-family:monospace;">'
+                f'{badges_html}</div>'
+                f'</div>'
+            )
+        return (
+            '<div style="margin: 4px 0 18px; display:flex; flex-wrap:wrap; '
+            'gap:8px;">' + "".join(cards) + '</div>'
+        )
+
+
+    def _bundle_extras(bundle_name: str, gitrepo_lookup: dict,
+                      bundle_to_gitrepo: dict,
+                      gitrepo_metadata: dict) -> dict:
+        """bundle の付随情報を抽出 (ヘッダ描画用、 列/行で共通)."""
+        gitrepo_name = bundle_to_gitrepo.get(bundle_name, "")
+        gr = gitrepo_lookup.get(gitrepo_name, {}) if gitrepo_name else {}
+        meta = gitrepo_metadata.get(gitrepo_name, {}) if gitrepo_name else {}
+
+        purpose = (meta.get("purpose") or "").strip()
+        repo = gr.get("repo", "") or ""
+        branch = gr.get("branch", "") or "main"
+        paths = gr.get("paths", []) or []
+        path = paths[0] if paths else ""
+        commit = (gr.get("commit") or "")[:8]
+        polling = gr.get("polling_interval", "") or ""
+        gr_status = (gr.get("conditions_kv", {}) or {}).get("Ready", "") or ""
+        gh_url = _gitrepo_url(repo, branch, path)
+
+        tooltip_lines = [f"bundle: {bundle_name}",
+                         "(クリックで編集 modal が開きます)"]
+        if gitrepo_name:
+            tooltip_lines.append(f"gitrepo: {gitrepo_name}")
+        if purpose:
+            tooltip_lines.append(f"purpose: {purpose}")
+        if path:
+            tooltip_lines.append(f"path: {path}")
+        if commit:
+            tooltip_lines.append(f"commit: {commit}")
+        if polling:
+            tooltip_lines.append(f"polling: {polling}")
+        if gr_status:
+            tooltip_lines.append(f"gitrepo Ready: {gr_status}")
+
+        return {
+            "gitrepo_name": gitrepo_name,
+            "purpose": purpose,
+            "path": path,
+            "gh_url": gh_url,
+            "tooltip": "\n".join(tooltip_lines),
+            "has_gitrepo": bool(gitrepo_name),
+        }
+
+
+    def _render_bundle_colhead(bundle_name: str, ex: dict) -> str:
+        """Bundle 列ヘッダ (縦書き 3 段) を描画.
+
+        ・bn / bp は 編集 modal リンク (`?edit_bundle=...`)
+        ・bl (path) は GitHub リンク (target=_blank)
+        """
+        edit_href = _edit_url(bundle_name)
+        purpose_disp = _truncate(ex["purpose"], PURPOSE_COLHEAD_TRUNC) or "—"
+        path = ex["path"]
+        if path and len(path) > PATH_COLHEAD_TRUNC:
+            path_disp = "…" + path[-(PATH_COLHEAD_TRUNC - 1):]
+        else:
+            path_disp = path or ""
+
+        if ex["has_gitrepo"]:
+            bn_html = (
+                f'<a class="bn-link" href="{escape(edit_href)}" '
+                f'data-bundle="{escape(bundle_name)}" target="_self">'
+                f'<span class="bn">{escape(bundle_name)}</span></a>'
+            )
+            bp_html = (
+                f'<a class="bp-link" href="{escape(edit_href)}" '
+                f'data-bundle="{escape(bundle_name)}" target="_self">'
+                f'<span class="bp">{escape(purpose_disp)}</span></a>'
+            )
+        else:
+            bn_html = f'<span class="bn">{escape(bundle_name)}</span>'
+            bp_html = f'<span class="bp">{escape(purpose_disp)}</span>'
+
+        if ex["gh_url"] and path_disp:
+            bl_html = (
+                f'<a class="bl" href="{escape(ex["gh_url"])}" target="_blank" '
+                f'rel="noopener">{escape(path_disp)} ↗</a>'
+            )
+        elif path_disp:
+            bl_html = f'<span class="bl">{escape(path_disp)}</span>'
+        else:
+            bl_html = '<span class="bl">—</span>'
+
+        return (
+            f'<th class="colhead bundle-col" id="bundle-{escape(bundle_name)}" '
+            f'title="{escape(ex["tooltip"])}">'
+            f'<div class="colhead-inner">'
+            f'{bn_html}{bp_html}{bl_html}'
+            f'</div></th>'
+        )
+
+
+    def _render_bundle_rowhead(bundle_name: str, ex: dict) -> str:
+        """Bundle 行ヘッダ (横書き 3 段) を描画."""
+        edit_href = _edit_url(bundle_name)
+        purpose_disp = _truncate(ex["purpose"], PURPOSE_ROWHEAD_TRUNC) or "—"
+        path = ex["path"]
+        if path and len(path) > PATH_ROWHEAD_TRUNC:
+            path_disp = "…" + path[-(PATH_ROWHEAD_TRUNC - 1):]
+        else:
+            path_disp = path or ""
+
+        if ex["has_gitrepo"]:
+            name_html = (
+                f'<a class="rn-name-link" href="{escape(edit_href)}" '
+                f'data-bundle="{escape(bundle_name)}" target="_self">'
+                f'{escape(bundle_name)}</a>'
+            )
+            purpose_html = (
+                f'<a class="rn-purpose-link" href="{escape(edit_href)}" '
+                f'data-bundle="{escape(bundle_name)}" target="_self">'
+                f'{escape(purpose_disp)}</a>'
+            )
+        else:
+            name_html = f'<span class="rn-name">{escape(bundle_name)}</span>'
+            purpose_html = f'<span class="rn-purpose">{escape(purpose_disp)}</span>'
+
+        if ex["gh_url"] and path_disp:
+            link_html = (
+                f'<a class="rn-path" href="{escape(ex["gh_url"])}" '
+                f'target="_blank" rel="noopener">{escape(path_disp)} ↗</a>'
+            )
+        elif path_disp:
+            link_html = f'<span class="rn-path">{escape(path_disp)}</span>'
+        else:
+            link_html = '<span class="rn-path">—</span>'
+
+        return (
+            f'<th class="rowname bundle-row" id="bundle-{escape(bundle_name)}" '
+            f'title="{escape(ex["tooltip"])}">'
+            f'<div class="rn-line rn-name-line">{name_html}</div>'
+            f'<div class="rn-line rn-purpose-line">{purpose_html}</div>'
+            f'<div class="rn-line rn-path-line">{link_html}</div>'
+            f'</th>'
+        )
+
+
+    def _build_matrix_html(
+        row_items, col_items, row_label, col_label,
+        bd_lookup, bd_lookup_full, orientation,
+        gitrepo_lookup, bundle_to_gitrepo, gitrepo_metadata,
+    ) -> str:
+        """マトリックス HTML テーブル.
+
+        bundle 軸 (列 or 行) のヘッダはクリック可能。
+        """
+        # ── ヘッダ行 ──
+        head_cells = [f'<th class="rowname-h">{escape(row_label)} ＼ {escape(col_label)}</th>']
+        for col in col_items:
+            if col_label == "bundle":
+                ex = _bundle_extras(col, gitrepo_lookup, bundle_to_gitrepo, gitrepo_metadata)
+                head_cells.append(_render_bundle_colhead(col, ex))
+            else:
+                cluster_url = _cluster_url(col)
+                head_cells.append(
+                    f'<th class="colhead cluster-col" '
+                    f'id="cluster-{escape(col)}">'
+                    f'<div class="colhead-inner">'
+                    f'<a class="cn-link" href="{escape(cluster_url)}" '
+                    f'target="_self"><span class="bn">{escape(col)}</span></a>'
+                    f'</div></th>'
+                )
+        head_html = "<thead><tr>" + "".join(head_cells) + "</tr></thead>"
+
+        # ── ボディ行 ──
+        body_rows = []
+        for row in row_items:
+            if row_label == "bundle":
+                ex = _bundle_extras(row, gitrepo_lookup, bundle_to_gitrepo, gitrepo_metadata)
+                cells = [_render_bundle_rowhead(row, ex)]
+            else:
+                cluster_url = _cluster_url(row)
+                cells = [
+                    f'<th class="rowname cluster-row" '
+                    f'id="cluster-{escape(row)}">'
+                    f'<a class="rn-name-link" href="{escape(cluster_url)}" '
+                    f'target="_self">{escape(row)}</a>'
+                    f'</th>'
+                ]
+            for col in col_items:
+                if orientation == "Bundle × クラスタ":
+                    bundle, cluster = row, col
+                else:
+                    cluster, bundle = row, col
+                state = bd_lookup.get((cluster, bundle))
+                bd = bd_lookup_full.get((cluster, bundle), {})
+                if state is None:
+                    bg = STATE_BG_MISSING
+                    title = "(未配置)"
+                    label = ""
+                else:
+                    bg = _state_color(state)
+                    title_parts = [
+                        f"クラスタ: {cluster}",
+                        f"Bundle: {bundle}",
+                        f"状態: {STATE_LABELS.get(state, state)}",
+                    ]
+                    if bd.get("gitrepo"):
+                        title_parts.append(f"リポジトリ: {bd['gitrepo']}")
+                    if bd.get("modified_count", 0):
+                        title_parts.append(f"差分: {bd['modified_count']}")
+                    if bd.get("non_ready_count", 0):
+                        title_parts.append(f"未準備: {bd['non_ready_count']}")
+                    if bd.get("ready_message"):
+                        msg = bd["ready_message"][:120]
+                        title_parts.append(f"メッセージ: {msg}")
+                    title = "\n".join(title_parts)
+                    label = state[:1] if state else ""
+                cells.append(
+                    f'<td class="cell" style="background:{bg};" title="{escape(title)}">'
+                    f'<span class="cell-label">{escape(label)}</span></td>'
+                )
+            body_rows.append("<tr>" + "".join(cells) + "</tr>")
+        body_html = "<tbody>" + "".join(body_rows) + "</tbody>"
+
+        # bundle 列があるとき (cluster × bundle) はヘッダを高く
+        colhead_height = 280 if col_label == "bundle" else 110
+        # bundle 行があるとき (bundle × cluster) は左の min-width を広く
+        rowname_min_width = 320 if row_label == "bundle" else 180
+
+        html = (
+            '<style>\n'
+            '  .fleet-matrix { border-collapse: collapse; font-family: sans-serif; '
+            '    font-size: 12px; color: #fafafa; }\n'
+            '  .fleet-matrix th.rowname-h { padding: 6px 8px; background: #262730; '
+            '    text-align: left; border-bottom: 2px solid #444; '
+            '    position: sticky; top: 0; left: 0; z-index: 3; }\n'
+            f'  .fleet-matrix th.colhead {{ padding: 0; background: #262730; '
+            f'    border-bottom: 2px solid #444; vertical-align: bottom; '
+            f'    height: {colhead_height}px; '
+            f'    position: sticky; top: 0; z-index: 2; }}\n'
+            '  .fleet-matrix th.colhead .colhead-inner {\n'
+            '    display: flex; flex-direction: column-reverse;\n'
+            '    height: 100%; align-items: center; padding: 4px 0;\n'
+            '  }\n'
+            '  .fleet-matrix th.colhead .colhead-inner > * {\n'
+            '    writing-mode: vertical-rl; transform: rotate(180deg);\n'
+            '    white-space: nowrap; text-align: left; padding: 2px 0;\n'
+            '  }\n'
+            '  .fleet-matrix th.colhead .bn { font-weight: bold; font-size: 11px; color: #fff; }\n'
+            '  .fleet-matrix th.colhead .bp { font-size: 10px; color: #d0d0d0; }\n'
+            '  .fleet-matrix th.colhead .bl { font-size: 9px; color: #6af; text-decoration: none; }\n'
+            '  .fleet-matrix th.colhead .bn-link,\n'
+            '  .fleet-matrix th.colhead .bp-link {\n'
+            '    text-decoration: none; color: inherit; cursor: pointer;\n'
+            '  }\n'
+            '  .fleet-matrix th.colhead.bundle-col:hover { background: #303040; }\n'
+            '  .fleet-matrix th.colhead.cluster-col:hover { background: #303040; }\n'
+            '  .fleet-matrix th.colhead .cn-link {\n'
+            '    text-decoration: none; color: inherit; cursor: pointer;\n'
+            '  }\n'
+            '  .fleet-matrix th.colhead .cn-link:hover .bn {\n'
+            '    color: #6af; text-decoration: underline;\n'
+            '  }\n'
+            '  /* anchor scroll target: sticky ヘッダの内側に来ないようマージン */\n'
+            '  .fleet-matrix th.bundle-col,\n'
+            '  .fleet-matrix th.cluster-col { scroll-margin-left: 220px; scroll-margin-top: 20px; }\n'
+            '  .fleet-matrix th.bundle-row,\n'
+            '  .fleet-matrix th.cluster-row { scroll-margin-top: 130px; scroll-margin-left: 20px; }\n'
+            '  .fleet-matrix th.colhead .bn-link:hover .bn,\n'
+            '  .fleet-matrix th.colhead .bp-link:hover .bp { color: #6af; text-decoration: underline; }\n'
+            '  .fleet-matrix th.colhead .bl:hover { text-decoration: underline; }\n'
+            f'  .fleet-matrix th.rowname {{ padding: 6px 10px; background: #1e1e1e; '
+            f'    text-align: left; border-right: 1px solid #444; '
+            f'    min-width: {rowname_min_width}px; '
+            f'    position: sticky; left: 0; z-index: 1; vertical-align: middle; }}\n'
+            '  .fleet-matrix th.rowname.bundle-row:hover { background: #2a2a36; }\n'
+            '  .fleet-matrix th.rowname.cluster-row:hover { background: #2a2a36; }\n'
+            '  .fleet-matrix th.rowname .rn-line { line-height: 1.3; '
+            '    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; '
+            '    max-width: 300px; }\n'
+            '  .fleet-matrix th.rowname .rn-name,\n'
+            '  .fleet-matrix th.rowname .rn-name-link { font-weight: bold; '
+            '    font-size: 12px; color: #fff; }\n'
+            '  .fleet-matrix th.rowname .rn-purpose,\n'
+            '  .fleet-matrix th.rowname .rn-purpose-link { font-size: 10px; color: #d0d0d0; }\n'
+            '  .fleet-matrix th.rowname .rn-path,\n'
+            '  .fleet-matrix th.rowname .rn-path { font-size: 10px; }\n'
+            '  .fleet-matrix th.rowname .rn-name-link,\n'
+            '  .fleet-matrix th.rowname .rn-purpose-link { text-decoration: none; cursor: pointer; }\n'
+            '  .fleet-matrix th.rowname .rn-name-link:hover,\n'
+            '  .fleet-matrix th.rowname .rn-purpose-link:hover { color: #6af; text-decoration: underline; }\n'
+            '  .fleet-matrix th.rowname a.rn-path { color: #6af; text-decoration: none; }\n'
+            '  .fleet-matrix th.rowname a.rn-path:hover { text-decoration: underline; }\n'
+            '  .fleet-matrix td.cell { width: 28px; height: 24px; text-align: center; '
+            '    border: 1px solid #1e1e1e; cursor: default; }\n'
+            '  .fleet-matrix td.cell:hover { outline: 2px solid #fff; }\n'
+            '  .fleet-matrix td.cell .cell-label { font-size: 10px; font-weight: bold; '
+            '    color: rgba(255,255,255,0.85); }\n'
+            '</style>\n'
+            '<div style="overflow:visible; padding: 4px;">'
+            '<table class="fleet-matrix">'
+            f'{head_html}{body_html}'
+            '</table></div>'
+        )
+        return html

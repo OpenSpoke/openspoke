@@ -1,0 +1,45 @@
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: fleet
+  namespace: kube-system
+spec:
+  chart: fleet
+  repo: https://rancher.github.io/fleet-helm-charts/
+  version: 0.15.1
+  targetNamespace: cattle-fleet-system
+  createNamespace: false
+  # bootstrap.enabled=true: 自クラスタ自身を fleet-local workspace に
+  # 登録する。 fleet-cluster では「自分自身の managed/ を Fleet で GitOps
+  # 管理する」要件があるため、 これを有効化する必要がある。
+  # (元 rancher クラスタでは Rancher 自体が同等の役割をしていたため
+  #  bootstrap.enabled=false で運用できていた。)
+  #
+  # agentTLSMode: system-store は the operator's環境 (Cloudflare Tunnel 経由)
+  # の downstream クラスタを登録するために必須。
+  valuesContent: |-
+    bootstrap:
+      enabled: true
+    agentTLSMode: system-store
+    # URL that downstream fleet-agent instances will connect back to.
+    # Typically the fleet-cluster kube-apiserver, exposed via a Cloudflare
+    # Tunnel (or another ingress) using a certificate signed by a public CA
+    # so apiServerCA can stay empty.
+    apiServerURL: https://fleet-api.example.com
+    apiServerCA: ""
+    cpu: 250m
+    memory: 256Mi
+    gitops:
+      enabled: true
+    # gitjob と helmops を replicas: 2 にして 1 ノード障害耐性を確保。
+    # Worker 2 ノード (example-node/110) の現状なら 2 が最適 (3 にしても
+    # 片寄るだけで意味がない)。 fleet-controller 自体は公式 Issue #1837
+    # でレプリカ複数化に問題がある旨が認められているため replicas: 1 のまま。
+    gitjob:
+      replicas: 2
+    helmops:
+      enabled: true
+      replicas: 2
+    extraAnnotations:
+      fleetController:
+        restarted-at: "2026-05-22T17:35:00Z"

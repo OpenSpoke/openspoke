@@ -1,0 +1,715 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-backend-kernel-k8s-observer
+  namespace: rag-spoke
+data:
+  k8s_observer.py: |
+    """
+    k8s_observer.py
+    ====================================================================
+    Kubernetes Observability Module (read-only)
+
+    kernel pod に Pod / Deployment / Logs / Events の read-only 観測機能を
+    提供する。the assistant経由で Claude (LLM) からクラスタ稼働状況を確認できるよう
+    にすることが目的。
+
+    エンドポイント (prefix=/core/k8s):
+      - GET  /pods?namespace=xxx                  pod 一覧 + status
+      - GET  /pod/{namespace}/{name}              pod 詳細 (annotations/labels 含む)
+      - GET  /logs/{namespace}/{pod}              container ログ取得
+      - GET  /deployments?namespace=xxx           deployment 一覧 + restarted-at
+      - GET  /events?namespace=xxx                events (異常検知用)
+
+    設計方針:
+      - read-only。verb は kubernetes API client の get/list のみ。
+      - namespace allowlist をモジュール内ハードコードして、
+        意図しない名前空間への問い合わせを防ぐ (RBAC は ClusterRole で
+        全 namespace 横断 read 権限を持っているため、 アプリ層で更に絞る)。
+      - logs はサイズ制限 + JWT/シークレット類のマスキングを行う。
+      - in-cluster config を前提 (kernel pod が ServiceAccount=rag-backend-kernel
+        で動く前提)。
+
+    依存: kubernetes==31.0.0 (initContainer の pip install で投入済)
+    """
+    from __future__ import annotations
+
+    import logging
+    import re
+    import time
+    from datetime import datetime, timezone
+    from typing import Any, Dict, List, Optional
+
+    from fastapi import APIRouter, HTTPException, Query
+
+    logger = logging.getLogger(__name__)
+
+    # ── kubernetes client (遅延 import) ──
+    # initContainer がライブラリを入れ忘れていた場合でも main が起動できるように、
+    # import 失敗を握りつぶし、 各 endpoint で 503 を返す方針にする。
+    try:
+        from kubernetes import client as k8s_client
+        from kubernetes import config as k8s_config
+        from kubernetes.client.rest import ApiException
+        _K8S_AVAILABLE = True
+    except ImportError as _e:
+        logger.warning(f"[K8S_OBS] kubernetes library not available: {_e}")
+        _K8S_AVAILABLE = False
+        k8s_client = None
+        k8s_config = None
+        ApiException = Exception
+
+
+    # ── namespace allowlist ──
+    # ClusterRole は全 namespace を読める権限を持つが、 アプリ層で更に絞り、
+    # 意図しない名前空間への問い合わせを 403 で弾く。
+    ALLOWED_NAMESPACES = frozenset({
+        # 自社アプリ
+        "rag-company1",
+        "rag-spoke",
+        "secretary",
+        "voice",
+        "builder",
+        "mcp",
+        "rag",
+        "pdf-converter",
+        # データ層
+        "opensearch",
+        "milvus",
+        "memgraph",
+        "valkey",
+        # 認証
+        "keycloak",
+        # システム (トラブルシュート用)
+        "kube-system",
+        "cattle-fleet-system",
+        "cattle-fleet-local-system",
+        "cattle-system",
+        "cert-manager",
+        "ingress-nginx",
+    })
+
+
+    # ── サイズ・件数制限 ──
+    LOGS_TAIL_MAX = 1000          # logs の tail 上限
+    LOGS_SINCE_SECONDS_MAX = 3600  # logs の since 上限 (1 時間)
+    LOGS_RESPONSE_MAX_BYTES = 256 * 1024  # logs レスポンスサイズ上限
+    EVENTS_SINCE_SECONDS_DEFAULT = 600  # events のデフォルト取得期間 (10 分)
+    EVENTS_SINCE_SECONDS_MAX = 86400    # events の取得期間上限 (1 日)
+
+
+    # ── ログマスキングパターン ──
+    # 値部分を *** で隠す。完全な機密情報フィルタではないが、 軽量な防御線。
+    _MASK_PATTERNS = [
+        # Authorization: Bearer xxx → Authorization: Bearer ***
+        (re.compile(r"(?i)(authorization\s*:\s*bearer\s+)[A-Za-z0-9._\-]+"), r"\1***"),
+        # Bearer eyJ... (JWT 単体)
+        (re.compile(r"\bBearer\s+ey[A-Za-z0-9._\-]+"), "Bearer ***"),
+        # eyJ... (JWT 単体、 大体 30 文字以上の base64url 形式)
+        (re.compile(r"\bey[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{20,}"), "***JWT***"),
+        # api-key/apikey/api_key: xxx
+        (re.compile(r"(?i)(api[\-_]?key\s*[=:]\s*[\"']?)[A-Za-z0-9._\-]+"), r"\1***"),
+        # password: xxx
+        (re.compile(r"(?i)(password\s*[=:]\s*[\"']?)[^\s\"']+"), r"\1***"),
+        # secret: xxx (kubernetes secret 等)
+        (re.compile(r"(?i)(secret[\-_]?key\s*[=:]\s*[\"']?)[A-Za-z0-9._\-]+"), r"\1***"),
+        # x-api-key header
+        (re.compile(r"(?i)(x[\-_]?api[\-_]?key\s*[=:]\s*[\"']?)[A-Za-z0-9._\-]+"), r"\1***"),
+    ]
+
+
+    def _mask_secrets(text: str) -> str:
+        """ログテキスト中の機密値をマスクする。"""
+        if not text:
+            return text
+        out = text
+        for pat, repl in _MASK_PATTERNS:
+            out = pat.sub(repl, out)
+        return out
+
+
+    def _check_namespace(namespace: str) -> None:
+        """namespace の空チェックのみ行う (allowlist は撤廃済み)。"""
+        if not namespace:
+            raise HTTPException(status_code=400, detail="namespace is required")
+
+
+    def _ensure_k8s_available() -> None:
+        """kubernetes library が import できていない場合 503 を投げる。"""
+        if not _K8S_AVAILABLE:
+            raise HTTPException(
+                status_code=503,
+                detail="kubernetes client library is not available in this Pod",
+            )
+
+
+    # ── kubernetes API client (遅延初期化) ──
+    _v1_core: Optional[Any] = None  # CoreV1Api
+    _v1_apps: Optional[Any] = None  # AppsV1Api
+
+
+    def _get_core_api():
+        global _v1_core
+        if _v1_core is None:
+            _ensure_k8s_available()
+            try:
+                k8s_config.load_incluster_config()
+                logger.info("[K8S_OBS] in-cluster config loaded")
+            except Exception as e:
+                # 開発環境などで kubeconfig フォールバックを許す
+                try:
+                    k8s_config.load_kube_config()
+                    logger.info("[K8S_OBS] kubeconfig loaded (fallback)")
+                except Exception as e2:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=f"failed to load kube config: {type(e).__name__}: {e}",
+                    )
+            _v1_core = k8s_client.CoreV1Api()
+        return _v1_core
+
+
+    def _get_apps_api():
+        global _v1_apps
+        if _v1_apps is None:
+            _get_core_api()  # config を初期化させる
+            _v1_apps = k8s_client.AppsV1Api()
+        return _v1_apps
+
+
+    def _age_seconds(dt: Optional[datetime]) -> int:
+        """datetime から現在までの経過秒数。"""
+        if dt is None:
+            return 0
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int((datetime.now(timezone.utc) - dt).total_seconds())
+
+
+    def _container_state_summary(state: Any) -> Dict[str, Any]:
+        """V1ContainerState を JSON 化可能な dict に圧縮する。"""
+        if state is None:
+            return {"phase": "unknown"}
+        if getattr(state, "running", None) is not None:
+            started = state.running.started_at
+            return {"phase": "running", "started_at": started.isoformat() if started else None}
+        if getattr(state, "waiting", None) is not None:
+            return {
+                "phase": "waiting",
+                "reason": state.waiting.reason or "",
+                "message": (state.waiting.message or "")[:300],
+            }
+        if getattr(state, "terminated", None) is not None:
+            t = state.terminated
+            return {
+                "phase": "terminated",
+                "reason": t.reason or "",
+                "exit_code": t.exit_code,
+                "message": (t.message or "")[:300],
+                "finished_at": t.finished_at.isoformat() if t.finished_at else None,
+            }
+        return {"phase": "unknown"}
+
+
+    def _container_status_to_dict(cs: Any) -> Dict[str, Any]:
+        """V1ContainerStatus を JSON 化可能な dict にする。"""
+        return {
+            "name": cs.name,
+            "ready": bool(cs.ready),
+            "restart_count": int(cs.restart_count or 0),
+            "image": cs.image or "",
+            "state": _container_state_summary(cs.state),
+            "last_state": _container_state_summary(getattr(cs, "last_state", None)),
+        }
+
+
+    def _pod_to_summary(pod: Any) -> Dict[str, Any]:
+        """V1Pod を一覧表示用の dict に変換する。"""
+        meta = pod.metadata
+        spec = pod.spec
+        status = pod.status
+        container_statuses = status.container_statuses or []
+        # ready_count / total_containers
+        total = len(container_statuses)
+        ready = sum(1 for cs in container_statuses if cs.ready)
+        # restart 合計
+        total_restarts = sum(int(cs.restart_count or 0) for cs in container_statuses)
+        return {
+            "name": meta.name,
+            "namespace": meta.namespace,
+            "phase": status.phase or "Unknown",
+            "ready": f"{ready}/{total}",
+            "ready_bool": (total > 0 and ready == total),
+            "restarts": total_restarts,
+            "age_seconds": _age_seconds(meta.creation_timestamp),
+            "node": spec.node_name or "",
+            "pod_ip": status.pod_ip or "",
+            "containers": [_container_status_to_dict(cs) for cs in container_statuses],
+        }
+
+
+    def _pod_to_detail(pod: Any) -> Dict[str, Any]:
+        """V1Pod を詳細表示用の dict に変換する (annotations / labels 含む)。"""
+        summary = _pod_to_summary(pod)
+        meta = pod.metadata
+        summary["labels"] = dict(meta.labels or {})
+        summary["annotations"] = dict(meta.annotations or {})
+        summary["creation_timestamp"] = (
+            meta.creation_timestamp.isoformat() if meta.creation_timestamp else None
+        )
+        # init container も拾う
+        init_statuses = pod.status.init_container_statuses or []
+        summary["init_containers"] = [_container_status_to_dict(cs) for cs in init_statuses]
+        # 条件 (PodScheduled, ContainersReady 等)
+        conditions = []
+        for c in (pod.status.conditions or []):
+            conditions.append({
+                "type": c.type,
+                "status": c.status,
+                "reason": c.reason or "",
+                "message": (c.message or "")[:300],
+                "last_transition_time": c.last_transition_time.isoformat() if c.last_transition_time else None,
+            })
+        summary["conditions"] = conditions
+        return summary
+
+
+    def _deployment_to_summary(dep: Any) -> Dict[str, Any]:
+        """V1Deployment を一覧表示用の dict に変換する。"""
+        meta = dep.metadata
+        spec = dep.spec
+        status = dep.status
+        # template の annotations にある restarted-at を拾う
+        template_annotations: Dict[str, str] = {}
+        try:
+            template_annotations = dict(spec.template.metadata.annotations or {})
+        except Exception:
+            template_annotations = {}
+        return {
+            "name": meta.name,
+            "namespace": meta.namespace,
+            "replicas_desired": int(spec.replicas or 0),
+            "replicas_ready": int(status.ready_replicas or 0),
+            "replicas_available": int(status.available_replicas or 0),
+            "replicas_updated": int(status.updated_replicas or 0),
+            "age_seconds": _age_seconds(meta.creation_timestamp),
+            "annotations_restarted_at": template_annotations.get("restarted-at", ""),
+            "annotations_kubectl_restarted_at": template_annotations.get(
+                "kubectl.kubernetes.io/restartedAt", ""
+            ),
+            "generation": int(meta.generation or 0),
+            "observed_generation": int(status.observed_generation or 0),
+        }
+
+
+    def _event_to_summary(ev: Any) -> Dict[str, Any]:
+        """CoreV1Event を JSON 化可能な dict にする。"""
+        involved = ev.involved_object
+        return {
+            "type": ev.type or "",  # Normal / Warning
+            "reason": ev.reason or "",
+            "message": (ev.message or "")[:500],
+            "count": int(ev.count or 0),
+            "first_timestamp": ev.first_timestamp.isoformat() if ev.first_timestamp else None,
+            "last_timestamp": ev.last_timestamp.isoformat() if ev.last_timestamp else None,
+            "involved_object": {
+                "kind": involved.kind if involved else "",
+                "name": involved.name if involved else "",
+                "namespace": involved.namespace if involved else "",
+            } if involved else None,
+            "source_component": (ev.source.component if ev.source else "") or "",
+        }
+
+
+    # ====================================================================
+    # FastAPI Router
+    # ====================================================================
+    router = APIRouter(prefix="/core/k8s", tags=["k8s-observer"])
+
+
+    @router.get("/pods")
+    async def list_pods(namespace: str = Query(..., description="target namespace")) -> Dict[str, Any]:
+        """指定 namespace の pod 一覧を返す。"""
+        _check_namespace(namespace)
+        api = _get_core_api()
+        try:
+            result = api.list_namespaced_pod(namespace=namespace, timeout_seconds=10)
+        except ApiException as e:
+            logger.warning(f"[K8S_OBS] list_pods failed: ns={namespace} status={e.status} reason={e.reason}")
+            raise HTTPException(status_code=502, detail=f"k8s API error: {e.status} {e.reason}")
+        except Exception as e:
+            logger.error(f"[K8S_OBS] list_pods unexpected error: {type(e).__name__}: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)[:200]}")
+        pods = [_pod_to_summary(p) for p in (result.items or [])]
+        return {
+            "namespace": namespace,
+            "count": len(pods),
+            "pods": pods,
+        }
+
+
+    @router.get("/pod/{namespace}/{name}")
+    async def get_pod(namespace: str, name: str) -> Dict[str, Any]:
+        """指定 pod の詳細 (annotations / labels / conditions 含む) を返す。"""
+        _check_namespace(namespace)
+        api = _get_core_api()
+        try:
+            pod = api.read_namespaced_pod(name=name, namespace=namespace)
+        except ApiException as e:
+            if e.status == 404:
+                raise HTTPException(status_code=404, detail=f"pod not found: {namespace}/{name}")
+            logger.warning(f"[K8S_OBS] get_pod failed: ns={namespace} name={name} status={e.status}")
+            raise HTTPException(status_code=502, detail=f"k8s API error: {e.status} {e.reason}")
+        except Exception as e:
+            logger.error(f"[K8S_OBS] get_pod unexpected error: {type(e).__name__}: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)[:200]}")
+        return _pod_to_detail(pod)
+
+
+    @router.get("/deployments")
+    async def list_deployments(namespace: str = Query(..., description="target namespace")) -> Dict[str, Any]:
+        """指定 namespace の deployment 一覧を返す (restarted-at annotation 込み)。"""
+        _check_namespace(namespace)
+        api = _get_apps_api()
+        try:
+            result = api.list_namespaced_deployment(namespace=namespace, timeout_seconds=10)
+        except ApiException as e:
+            logger.warning(f"[K8S_OBS] list_deployments failed: ns={namespace} status={e.status}")
+            raise HTTPException(status_code=502, detail=f"k8s API error: {e.status} {e.reason}")
+        except Exception as e:
+            logger.error(f"[K8S_OBS] list_deployments unexpected error: {type(e).__name__}: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)[:200]}")
+        deps = [_deployment_to_summary(d) for d in (result.items or [])]
+        return {
+            "namespace": namespace,
+            "count": len(deps),
+            "deployments": deps,
+        }
+
+
+    @router.get("/events")
+    async def list_events(
+        namespace: str = Query(..., description="target namespace"),
+        since_seconds: int = Query(EVENTS_SINCE_SECONDS_DEFAULT, ge=1, le=EVENTS_SINCE_SECONDS_MAX,
+                                   description="how far back to fetch events (seconds)"),
+        type_filter: str = Query("", description="filter by event type (Normal / Warning). empty = all"),
+    ) -> Dict[str, Any]:
+        """指定 namespace の event 一覧を返す。 ImagePullBackOff / OOMKilled / FailedScheduling 等の
+        異常検知に使う。 since_seconds で取得期間を制限。"""
+        _check_namespace(namespace)
+        api = _get_core_api()
+        try:
+            result = api.list_namespaced_event(namespace=namespace, timeout_seconds=10)
+        except ApiException as e:
+            logger.warning(f"[K8S_OBS] list_events failed: ns={namespace} status={e.status}")
+            raise HTTPException(status_code=502, detail=f"k8s API error: {e.status} {e.reason}")
+        except Exception as e:
+            logger.error(f"[K8S_OBS] list_events unexpected error: {type(e).__name__}: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)[:200]}")
+
+        cutoff = datetime.now(timezone.utc).timestamp() - since_seconds
+        events: List[Dict[str, Any]] = []
+        for ev in (result.items or []):
+            if type_filter and ev.type != type_filter:
+                continue
+            # last_timestamp 優先、 無ければ first_timestamp で判定
+            ts = ev.last_timestamp or ev.first_timestamp
+            if ts:
+                ts_ts = ts.timestamp() if hasattr(ts, "timestamp") else 0
+                if ts_ts < cutoff:
+                    continue
+            events.append(_event_to_summary(ev))
+
+        # 新しい順にソート
+        events.sort(key=lambda e: e.get("last_timestamp") or e.get("first_timestamp") or "", reverse=True)
+        return {
+            "namespace": namespace,
+            "since_seconds": since_seconds,
+            "type_filter": type_filter or "all",
+            "count": len(events),
+            "events": events,
+        }
+
+
+    @router.get("/logs/{namespace}/{pod}")
+    async def get_pod_logs(
+        namespace: str,
+        pod: str,
+        container: str = Query("", description="container name (empty = first container)"),
+        tail: int = Query(200, ge=1, le=LOGS_TAIL_MAX, description="last N lines"),
+        since_seconds: int = Query(0, ge=0, le=LOGS_SINCE_SECONDS_MAX,
+                                   description="seconds back from now (0 = no time limit)"),
+        previous: bool = Query(False, description="get logs of previous instance (after restart)"),
+        timestamps: bool = Query(False, description="prepend ISO8601 timestamps"),
+    ) -> Dict[str, Any]:
+        """指定 pod の container ログを取得する。
+
+        - tail: 末尾何行か (LOGS_TAIL_MAX 件で頭打ち)
+        - since_seconds: 何秒前以降のログだけか (LOGS_SINCE_SECONDS_MAX で頭打ち)
+        - previous=True: 直前のインスタンス (CrashLoopBackOff のクラッシュ前ログ等)
+        - timestamps: 各行に ISO8601 timestamp を前置するか
+        - レスポンスは LOGS_RESPONSE_MAX_BYTES でサイズ制限し、JWT/secret はマスクする
+        """
+        _check_namespace(namespace)
+        api = _get_core_api()
+
+        kwargs: Dict[str, Any] = {
+            "name": pod,
+            "namespace": namespace,
+            "tail_lines": int(tail),
+            "previous": bool(previous),
+            "timestamps": bool(timestamps),
+            "_request_timeout": 30,
+        }
+        if container:
+            kwargs["container"] = container
+        if since_seconds and since_seconds > 0:
+            kwargs["since_seconds"] = int(since_seconds)
+
+        start = time.time()
+        try:
+            log_text = api.read_namespaced_pod_log(**kwargs)
+        except ApiException as e:
+            if e.status == 404:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"pod or container not found: {namespace}/{pod}/{container or '<first>'}",
+                )
+            if e.status == 400:
+                # previous=True で履歴が無い場合などに 400 が返る
+                raise HTTPException(status_code=400, detail=f"k8s API rejected request: {e.reason}")
+            logger.warning(f"[K8S_OBS] get_pod_logs failed: ns={namespace} pod={pod} status={e.status}")
+            raise HTTPException(status_code=502, detail=f"k8s API error: {e.status} {e.reason}")
+        except Exception as e:
+            logger.error(f"[K8S_OBS] get_pod_logs unexpected error: {type(e).__name__}: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)[:200]}")
+
+        elapsed = time.time() - start
+
+        # マスキング → サイズ制限
+        masked = _mask_secrets(log_text or "")
+        truncated = False
+        raw_size = len(masked.encode("utf-8"))
+        if raw_size > LOGS_RESPONSE_MAX_BYTES:
+            # 末尾を残す (新しいログを優先) ため、 後ろから切り出す
+            encoded = masked.encode("utf-8")
+            cut = encoded[-LOGS_RESPONSE_MAX_BYTES:]
+            # マルチバイトの中途半端なバイトを除去
+            masked = cut.decode("utf-8", errors="ignore")
+            truncated = True
+
+        line_count = masked.count("\n") + (1 if masked and not masked.endswith("\n") else 0)
+        logger.info(
+            f"[K8S_OBS] logs: ns={namespace} pod={pod} container={container or '<first>'} "
+            f"tail={tail} since={since_seconds}s previous={previous} "
+            f"raw_bytes={raw_size} returned_bytes={len(masked.encode('utf-8'))} "
+            f"lines={line_count} elapsed={elapsed:.2f}s"
+        )
+        return {
+            "namespace": namespace,
+            "pod": pod,
+            "container": container or "<first>",
+            "tail": tail,
+            "since_seconds": since_seconds,
+            "previous": previous,
+            "timestamps": timestamps,
+            "line_count": line_count,
+            "raw_bytes": raw_size,
+            "returned_bytes": len(masked.encode("utf-8")),
+            "truncated": truncated,
+            "elapsed_sec": round(elapsed, 3),
+            "logs": masked,
+        }
+
+
+    @router.get("/health")
+    async def health() -> Dict[str, Any]:
+        """k8s observer 自身の health check。 ライブラリ可用性と制限値を返す。"""
+        return {
+            "ok": _K8S_AVAILABLE,
+            "kubernetes_library_available": _K8S_AVAILABLE,
+            "allow_all_namespaces": True,
+            "allowed_namespaces": sorted(ALLOWED_NAMESPACES),
+            "limits": {
+                "logs_tail_max": LOGS_TAIL_MAX,
+                "logs_since_seconds_max": LOGS_SINCE_SECONDS_MAX,
+                "logs_response_max_bytes": LOGS_RESPONSE_MAX_BYTES,
+                "events_since_seconds_max": EVENTS_SINCE_SECONDS_MAX,
+            },
+        }
+
+
+    # ────────────────────────────────────────────────────────────────────────
+    # Fleet GitOps state (local cluster only)
+    # ────────────────────────────────────────────────────────────────────────
+    # local_fleet_state エンドポイント。 spoke の kernel が自クラスタの Fleet CRDs
+    # (Bundle / BundleDeployment / Cluster) を CustomObjectsApi で取得し、
+    # 表示に必要なフィールドだけを抽出した compact JSON を返す。
+    #
+    # 設計意図:
+    #   - cluster_k8s_get で同等のことをやろうとすると、 status.resources や
+    #     managedFields 等の巨大 field まで含めて MCP 応答サイズ上限を超える。
+    #   - ここで kernel 側で field を絞り込むことで安全に転送できるサイズに
+    #     圧縮する。
+    #   - 自クラスタが Fleet 配下でない (CRD が存在しない) 場合は空配列を返す。
+    #
+    # 使用者:
+    #   - mcp-server-code.yaml の local_fleet_state() ツール → kernel /core/k8s/fleet-state
+    #   - その上位の hub MCP cluster_local_fleet_state(cluster) ラッパー
+    #   - fleet-state-publisher CronJob (rag-company1/rag) が hub MCP 経由で呼ぶ
+    #
+    # RBAC:
+    #   - ClusterRole `rag-backend-kernel-observer-spoke` が fleet.cattle.io
+    #     の bundles / bundledeployments / gitrepos / clusters に対する
+    #     get/list verb を持っている必要がある (kernel-observer.yaml に定義)。
+
+    def _get_custom_objects_api():
+        """CustomObjectsApi を遅延初期化."""
+        global _v1_custom
+        if _v1_custom is None:
+            _get_core_api()  # config を初期化させる
+            _v1_custom = k8s_client.CustomObjectsApi()
+        return _v1_custom
+
+
+    _v1_custom: Optional[Any] = None
+
+
+    @router.get("/fleet-state")
+    async def get_fleet_state() -> Dict[str, Any]:
+        """自クラスタの Fleet CRDs を圧縮して返す.
+
+        含む内容:
+          - clusters: fleet-default ns の Cluster CR 一覧
+          - bundles:  fleet-default ns の Bundle 一覧
+          - bundle_deployments: 全 ns の BundleDeployment 一覧
+
+        Fleet CRD が存在しないクラスタでは各リストは空になる。
+        """
+        _ensure_k8s_available()
+        api = _get_custom_objects_api()
+
+        out = {
+            "clusters": [],
+            "bundles": [],
+            "bundle_deployments": [],
+            "errors": [],
+        }
+
+        # ── Clusters (fleet-default) ──
+        try:
+            res = api.list_namespaced_custom_object(
+                group="fleet.cattle.io",
+                version="v1alpha1",
+                namespace="fleet-default",
+                plural="clusters",
+                _request_timeout=15,
+            )
+            for c in (res.get("items") or []):
+                meta = c.get("metadata") or {}
+                labels = meta.get("labels") or {}
+                status = c.get("status") or {}
+                display = status.get("display") or {}
+                conditions = status.get("conditions") or []
+                out["clusters"].append({
+                    "name": meta.get("name", ""),
+                    "namespace": meta.get("namespace", ""),
+                    "cluster_name": labels.get("cluster-name") or labels.get("management.cattle.io/cluster-name") or meta.get("name", ""),
+                    "ns_for_bd": status.get("namespace", ""),
+                    "ready_bundles": display.get("readyBundles", ""),
+                    "state": display.get("state", ""),
+                    "conditions_kv": {c.get("type", ""): c.get("status", "") for c in conditions},
+                })
+        except ApiException as e:
+            if e.status != 404:
+                out["errors"].append(f"clusters: {e.status} {e.reason}")
+        except Exception as e:
+            out["errors"].append(f"clusters: {type(e).__name__}: {str(e)[:200]}")
+
+        # ── Bundles (fleet-default) ──
+        try:
+            res = api.list_namespaced_custom_object(
+                group="fleet.cattle.io",
+                version="v1alpha1",
+                namespace="fleet-default",
+                plural="bundles",
+                _request_timeout=15,
+            )
+            for b in (res.get("items") or []):
+                meta = b.get("metadata") or {}
+                labels = meta.get("labels") or {}
+                status = b.get("status") or {}
+                summary = status.get("summary") or {}
+                display = status.get("display") or {}
+                conditions = status.get("conditions") or []
+                out["bundles"].append({
+                    "name": meta.get("name", ""),
+                    "namespace": meta.get("namespace", "fleet-default"),
+                    "gitrepo": labels.get("fleet.cattle.io/repo-name", ""),
+                    "summary": {
+                        "ready": summary.get("ready", 0),
+                        "desiredReady": summary.get("desiredReady", 0),
+                        "notReady": summary.get("notReady", 0),
+                        "modified": summary.get("modified", 0),
+                        "errApplied": summary.get("errApplied", 0),
+                        "outOfSync": summary.get("outOfSync", 0),
+                        "pending": summary.get("pending", 0),
+                        "waitApplied": summary.get("waitApplied", 0),
+                    },
+                    "display_state": display.get("state", ""),
+                    "display_ready_clusters": display.get("readyClusters", ""),
+                    "conditions_kv": {c.get("type", ""): c.get("status", "") for c in conditions},
+                    "ready_message": next((c.get("message", "") for c in conditions if c.get("type") == "Ready"), "")[:500],
+                })
+        except ApiException as e:
+            if e.status != 404:
+                out["errors"].append(f"bundles: {e.status} {e.reason}")
+        except Exception as e:
+            out["errors"].append(f"bundles: {type(e).__name__}: {str(e)[:200]}")
+
+        # ── BundleDeployments (all namespaces) ──
+        try:
+            res = api.list_cluster_custom_object(
+                group="fleet.cattle.io",
+                version="v1alpha1",
+                plural="bundledeployments",
+                _request_timeout=20,
+            )
+            for bd in (res.get("items") or []):
+                meta = bd.get("metadata") or {}
+                labels = meta.get("labels") or {}
+                status = bd.get("status") or {}
+                display = status.get("display") or {}
+                conditions = status.get("conditions") or []
+                modified_status = status.get("modifiedStatus") or []
+                non_ready_status = status.get("nonReadyStatus") or []
+                out["bundle_deployments"].append({
+                    "name": meta.get("name", ""),
+                    "namespace": meta.get("namespace", ""),
+                    "bundle": labels.get("fleet.cattle.io/bundle-name", ""),
+                    "gitrepo": labels.get("fleet.cattle.io/repo-name", ""),
+                    "deployed": status.get("deployed", False),
+                    "ready": status.get("ready", False),
+                    "non_modified": status.get("nonModified", True),
+                    "modified_count": len(modified_status),
+                    "non_ready_count": len(non_ready_status),
+                    "modified_status": modified_status[:20],
+                    "non_ready_status": non_ready_status[:20],
+                    "display_state": display.get("state", ""),
+                    "display_deployed": display.get("deployed", ""),
+                    "display_monitored": display.get("monitored", ""),
+                    "conditions_kv": {c.get("type", ""): c.get("status", "") for c in conditions},
+                    "ready_message": next((c.get("message", "") for c in conditions if c.get("type") == "Ready"), "")[:500],
+                })
+        except ApiException as e:
+            if e.status != 404:
+                out["errors"].append(f"bundledeployments: {e.status} {e.reason}")
+        except Exception as e:
+            out["errors"].append(f"bundledeployments: {type(e).__name__}: {str(e)[:200]}")
+
+        out["counts"] = {
+            "clusters": len(out["clusters"]),
+            "bundles": len(out["bundles"]),
+            "bundle_deployments": len(out["bundle_deployments"]),
+        }
+        return out

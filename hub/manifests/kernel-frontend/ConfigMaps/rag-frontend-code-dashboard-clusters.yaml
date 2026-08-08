@@ -1,0 +1,68 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-frontend-code-dashboard-clusters
+  namespace: rag-company1
+data:
+  view_clusters.py: |
+    """Clusters view — クラスタ一覧表.
+
+    元は view_topology の下部に置いていた「登録済みクラスタ」 表をここに移動。
+    Hub & Spoke topology view をグラフィカルなダッシュボードに専念させるため。
+
+    表示: cluster_name / status / url / env / k8s / last_probe_at / last_active_at /
+          http_code / probe_ms / purpose / owner
+    内部スクロール無し、 全件 st.table で展開。
+    """
+    import streamlit as st
+
+    import kernel_api
+    import user_scope
+
+
+    def render():
+        st.title("Clusters")
+
+        scope = user_scope.get_current_scope()
+
+        col1, col2 = st.columns([6, 1])
+        with col2:
+            if st.button("Refresh", key="clusters_refresh"):
+                kernel_api.clear_caches()
+                st.rerun()
+
+        if not kernel_api.hub_healthy():
+            st.error("hub OpenSearch (opensearch.opensearch.svc:9200) に接続できません")
+            return
+
+        spokes_all = kernel_api.list_spokes()
+        if not spokes_all:
+            st.warning("spoke_clusters index にデータがありません")
+            return
+
+        spokes = user_scope.filter_clusters(scope, spokes_all)
+
+        health_map = kernel_api.list_spoke_health()
+
+        st.subheader(f"登録済みクラスタ ({len(spokes)} 件)")
+        if not spokes:
+            st.info("表示できるクラスタはありません.")
+            return
+        rows = []
+        for s in spokes:
+            cid = s.get("cluster_name") or s.get("_id")
+            h = health_map.get(cid, {})
+            rows.append({
+                "cluster": cid,
+                "status": h.get("status", "unknown"),
+                "url": s.get("url", ""),
+                "env": s.get("env", ""),
+                "k8s": s.get("k8s_distribution", ""),
+                "last_probe_at": h.get("last_probe_at", ""),
+                "last_active_at": h.get("last_active_at", ""),
+                "http_code": h.get("http_code", ""),
+                "probe_ms": h.get("probe_duration_ms", ""),
+                "purpose": s.get("purpose", "") or s.get("description", ""),
+                "owner": s.get("owner", ""),
+            })
+        st.table(rows)

@@ -1,0 +1,555 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-frontend-code-dashboard-api
+  namespace: rag-company1
+data:
+  kernel_api.py: |
+    """OpenSearch / kernel HTTP API helpers.
+
+    rag クラスタ上には 2 つの OpenSearch インスタンスがある:
+      - opensearch.opensearch.svc.cluster.local:9200  ← ハブの中央 OpenSearch
+        (spoke_clusters, spoke_health, nodes_aggregated, fleet_state,
+         gitrepo_metadata, etc.)
+      - opensearch.rag-spoke.svc.cluster.local:9200   ← スポーク用 (node_inventory)
+
+    dashboard は前者 (ハブ中央) のみを見る。
+    """
+    import datetime as _dt
+    import streamlit as st
+    import requests
+
+    HUB_OS_URL = "http://opensearch.opensearch.svc.cluster.local:9200"
+
+
+    def _post(path: str, payload: dict, timeout: int = 10) -> dict:
+        try:
+            resp = requests.post(
+                f"{HUB_OS_URL}{path}",
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            return {"_error": str(e)}
+
+
+    def _put(path: str, payload: dict, timeout: int = 10) -> dict:
+        try:
+            resp = requests.put(
+                f"{HUB_OS_URL}{path}",
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            return {"_error": str(e)}
+
+
+    def hub_healthy() -> bool:
+        try:
+            resp = requests.get(f"{HUB_OS_URL}/_cluster/health", timeout=3)
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+
+    @st.cache_data(ttl=10)
+    def list_spokes() -> list:
+        result = _post(
+            "/spoke_clusters/_search",
+            {"size": 100, "query": {"match_all": {}}, "sort": [{"_id": "asc"}]},
+        )
+        if "_error" in result:
+            return []
+        hits = result.get("hits", {}).get("hits", [])
+        out = []
+        for h in hits:
+            doc = dict(h.get("_source", {}) or {})
+            doc["_id"] = h.get("_id")
+            out.append(doc)
+        return out
+
+
+    @st.cache_data(ttl=10)
+    def list_spoke_health() -> dict:
+        result = _post(
+            "/spoke_health/_search",
+            {"size": 100, "query": {"match_all": {}}},
+        )
+        if "_error" in result:
+            return {}
+        hits = result.get("hits", {}).get("hits", [])
+        out = {}
+        for h in hits:
+            src = h.get("_source", {}) or {}
+            name = src.get("cluster_name") or h.get("_id")
+            if name:
+                out[name] = src
+        return out
+
+
+    @st.cache_data(ttl=30)
+    def list_nodes_aggregated() -> list:
+        result = _post(
+            "/nodes_aggregated/_search",
+            {"size": 1000, "query": {"match_all": {}}, "sort": [{"_id": "asc"}]},
+        )
+        if "_error" in result:
+            return []
+        hits = result.get("hits", {}).get("hits", [])
+        out = []
+        for h in hits:
+            doc = dict(h.get("_source", {}) or {})
+            doc["_id"] = h.get("_id")
+            out.append(doc)
+        return out
+
+
+    def _list_fleet_state_by_kind(kind: str) -> list:
+        """fleet_state index から特定 kind のみ取得.
+
+        OpenSearch は `_id` への prefix クエリを受け付けないため、 アグリゲータが
+        書き込んだ `kind` フィールド (text+keyword 自動マッピング) を使う。
+        """
+        result = _post(
+            "/fleet_state/_search",
+            {
+                "size": 1000,
+                "query": {"term": {"kind.keyword": kind}},
+                "sort": [{"_id": "asc"}],
+            },
+        )
+        if "_error" in result:
+            return []
+        hits = result.get("hits", {}).get("hits", [])
+        return [
+            {"_id": h.get("_id"), **(h.get("_source", {}) or {})}
+            for h in hits
+        ]
+
+
+    @st.cache_data(ttl=30)
+    def list_fleet_clusters() -> list:
+        return _list_fleet_state_by_kind("Cluster")
+
+
+    @st.cache_data(ttl=30)
+    def list_fleet_gitrepos() -> list:
+        return _list_fleet_state_by_kind("GitRepo")
+
+
+    @st.cache_data(ttl=30)
+    def list_fleet_bundles() -> list:
+        return _list_fleet_state_by_kind("Bundle")
+
+
+    @st.cache_data(ttl=30)
+    def list_fleet_bds() -> list:
+        return _list_fleet_state_by_kind("BundleDeployment")
+
+
+    # ─────────────────────────────────────────────────────────
+    # GitRepo metadata (purpose 等の operator メモ書き)
+    # ─────────────────────────────────────────────────────────
+    # index: gitrepo_metadata
+    # _id   : GitRepo 名 (例 "hub-mcp")
+    # fields: gitrepo, purpose, updated_at, updated_by
+
+    @st.cache_data(ttl=10)
+    def list_gitrepo_metadata() -> dict:
+        """全 GitRepo metadata を取得し、 {gitrepo_name: doc} で返す.
+
+        OpenSearch の index が未作成の場合は空 dict を返す (初回書込で自動作成)。
+        """
+        result = _post(
+            "/gitrepo_metadata/_search",
+            {"size": 1000, "query": {"match_all": {}}},
+        )
+        if "_error" in result:
+            return {}
+        hits = result.get("hits", {}).get("hits", [])
+        out = {}
+        for h in hits:
+            name = h.get("_id")
+            if name:
+                out[name] = dict(h.get("_source", {}) or {})
+        return out
+
+
+    def set_gitrepo_purpose(gitrepo_name: str, purpose: str,
+                            updated_by: str = "anonymous") -> dict:
+        """gitrepo_metadata index に purpose を書き込み (upsert).
+
+        Returns OpenSearch のレスポンス dict。 失敗時は {"_error": ...}。
+        """
+        if not gitrepo_name:
+            return {"_error": "gitrepo_name is empty"}
+        purpose = (purpose or "").strip()
+        now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        doc = {
+            "gitrepo": gitrepo_name,
+            "purpose": purpose,
+            "updated_at": now_iso,
+            "updated_by": updated_by or "anonymous",
+        }
+        # _id 固定の upsert は PUT /index/_doc/<_id>
+        # refresh=wait_for で書込み直後の検索整合性を保証
+        return _put(
+            f"/gitrepo_metadata/_doc/{gitrepo_name}?refresh=wait_for",
+            doc,
+        )
+
+
+    @st.cache_data(ttl=10)
+    def get_ledger() -> dict:
+        """OpenSpoke 運用台帳 (fleet_state index, _id=ledger) を dict で返す.
+
+        返り値は台帳本体 _source: {categories, cluster_map, schema_version, ...}。
+        未投入・エラー時は空 dict。
+        """
+        result = _post(
+            "/fleet_state/_search",
+            {"size": 1, "query": {"ids": {"values": ["ledger"]}}},
+        )
+        if "_error" in result:
+            return {}
+        hits = result.get("hits", {}).get("hits", [])
+        if not hits:
+            return {}
+        return dict(hits[0].get("_source", {}) or {})
+
+
+    def derive_module_bundles(ledger, gitrepos):
+        """Fleet GitRepo の spec.paths と ledger の module.path を前方一致照合し、
+        モジュール → 所属 bundle 一覧 を機械的に導出する.
+
+        Fleet の現在の設定を真実源とする。 ledger.categories.<cat>.<mod> の
+        手書き静的フィールド (components / bundles / fanout_bundles /
+        per_cluster_registration) は参照しない。 これにより 「ledger 上の分類」
+        と「Fleet の実態」 が乖離する事故を原理的に防ぐ.
+
+        Args:
+            ledger:   get_ledger() の戻り値 (categories と各 module の path を持つ)
+            gitrepos: list_fleet_gitrepos() の戻り値 (kind=GitRepo の集約済み
+                      OpenSearch ドキュメント)
+
+        Returns:
+            {(cat_name, mod_name): [{
+                "bundle_name":               str,   # GitRepo name (= Fleet bundle 名)
+                "matched_path":              str,   # module に属した spec.paths[i]
+                "all_paths":                 list,  # spec.paths 全体
+                "relative_path":             str,   # matched_path の <module>/manifests 以降
+                "ready_clusters":            int,
+                "desired_ready_clusters":    int,
+                "ready_bundle_deployments":  str,
+                "conditions_kv":             dict,
+            }, ...]}
+
+            (bundle_name, matched_path) で重複排除済み.
+            各モジュール内は relative_path → bundle_name で安定ソート.
+        """
+        if not ledger or not gitrepos:
+            return {}
+        modpath_index = []
+        for cat_name, cat in (ledger.get("categories") or {}).items():
+            for mod_name, mod in cat.items():
+                mp = ((mod or {}).get("path") or "").rstrip("/")
+                if mp:
+                    modpath_index.append((mp, (cat_name, mod_name)))
+        # 最長一致で判定するため、 module path の長い順にソート
+        modpath_index.sort(key=lambda x: len(x[0]), reverse=True)
+
+        out = {}
+        for gr in gitrepos:
+            name = gr.get("name") or gr.get("_id", "")
+            paths = gr.get("paths") or []
+            ready_clusters = gr.get("ready_clusters", 0)
+            desired = gr.get("desired_ready_clusters", 0)
+            ready_bds = gr.get("ready_bundle_deployments", "")
+            conds = gr.get("conditions_kv") or {}
+            for p in paths:
+                pn = (p or "").rstrip("/")
+                matched = None
+                for mp, key in modpath_index:
+                    prefix = mp + "/manifests"
+                    if pn == prefix or pn.startswith(prefix + "/"):
+                        relative = pn[len(prefix):].lstrip("/")
+                        matched = (key, relative)
+                        break
+                if matched is None:
+                    continue
+                key, relative = matched
+                out.setdefault(key, []).append({
+                    "bundle_name": name,
+                    "matched_path": pn,
+                    "all_paths": list(paths),
+                    "relative_path": relative,
+                    "ready_clusters": ready_clusters,
+                    "desired_ready_clusters": desired,
+                    "ready_bundle_deployments": ready_bds,
+                    "conditions_kv": dict(conds),
+                })
+        # 重複排除 + ソート
+        for key, items in out.items():
+            seen = set()
+            unique = []
+            for it in items:
+                k = (it["bundle_name"], it["matched_path"])
+                if k in seen:
+                    continue
+                seen.add(k)
+                unique.append(it)
+            unique.sort(key=lambda x: (x["relative_path"], x["bundle_name"]))
+            out[key] = unique
+        return out
+
+
+    def set_ledger_policy(target: str, policy: dict = None,
+                          updated_by: str = "anonymous") -> dict:
+        """ledger 本体の指定 target に policy を merge して保存する.
+
+        target 形式:
+          - "module:<category>/<module_name>"
+                例: "module:Core/Hub"
+                module 既定の policy を保存する.
+          - "bundle:<category>/<module_name>/<bundle_name>"
+                例: "bundle:Core/rancher/rancher-003"
+                module 配下の特定 bundle にのみ適用する個別 policy を保存する.
+                bundle policy が設定されていれば bundle policy が優先、
+                未設定なら module policy を継承する.
+
+        policy は dict (None の値や空文字は無効として除外).
+        既知のキー: restart_safety / edit_safety / desired_state / notes.
+        None または空 dict なら該当 policy フィールドを削除する
+        (bundle 個別 policy なら bundle_policies dict のキーを削除し、
+         結果として dict が空になれば bundle_policies フィールド自体も削除).
+
+        ledger 本体全体を読み込み → 該当ノードに policy をマージ → 再 upsert.
+        並行編集は想定せず last-write-wins.
+
+        Returns:
+            OpenSearch のレスポンス dict. 失敗時は {"_error": ...}.
+        """
+        if not target:
+            return {"_error": "empty target"}
+
+        # target を 種別 / category / module / bundle_name にパース
+        if target.startswith("module:"):
+            kind = "module"
+            path_parts = target[len("module:"):].split("/")
+            if len(path_parts) != 2 or not all(path_parts):
+                return {"_error": f"invalid module target: {target}"}
+            cat_name, mod_name = path_parts
+            bundle_name = None
+        elif target.startswith("bundle:"):
+            kind = "bundle"
+            path_parts = target[len("bundle:"):].split("/")
+            if len(path_parts) != 3 or not all(path_parts):
+                return {"_error": f"invalid bundle target: {target}"}
+            cat_name, mod_name, bundle_name = path_parts
+        else:
+            return {"_error": f"unsupported target format: {target}"}
+
+        # 既存 ledger を取得
+        get_res = _post(
+            "/fleet_state/_search",
+            {"size": 1, "query": {"ids": {"values": ["ledger"]}}},
+        )
+        if "_error" in get_res:
+            return {"_error": f"failed to fetch ledger: {get_res['_error']}"}
+        hits = get_res.get("hits", {}).get("hits", [])
+        if not hits:
+            return {"_error": "ledger doc not found"}
+        ledger = dict(hits[0].get("_source", {}) or {})
+
+        cats = ledger.get("categories") or {}
+        cat = cats.get(cat_name)
+        if cat is None:
+            return {"_error": f"category not found: {cat_name}"}
+        mod = cat.get(mod_name)
+        if mod is None:
+            return {"_error": f"module not found: {cat_name}/{mod_name}"}
+
+        # bundle target なら、 bundle 名が module に実在することを確認
+        # (typo 等で存在しない bundle に override を書いて取り残されるのを防ぐ).
+        # 真実源は Fleet GitRepo (list_fleet_gitrepos)。 ledger の手書き
+        # 静的フィールドは参照しない (Fleet と ledger の乖離を防ぐため).
+        # ただし削除操作 (policy=None / 空) は孤児 bundle個別方針の片付けの
+        # ために検証スキップする.
+        if kind == "bundle" and policy:
+            try:
+                gitrepos = list_fleet_gitrepos()
+            except Exception as e:
+                return {"_error": f"failed to list fleet gitrepos: {e}"}
+            derived = derive_module_bundles(ledger, gitrepos)
+            known_bundle_names = {
+                b["bundle_name"]
+                for b in derived.get((cat_name, mod_name), [])
+            }
+            if bundle_name not in known_bundle_names:
+                return {"_error": (
+                    f"bundle '{bundle_name}' not found under "
+                    f"{cat_name}/{mod_name} "
+                    f"(known: {sorted(known_bundle_names)})"
+                )}
+
+        # policy を整形 (空文字 / None キーを除外)
+        now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        cleaned = {}
+        if policy:
+            cleaned = {k: v for k, v in policy.items()
+                       if v not in (None, "")}
+
+        if kind == "module":
+            # module 直下の policy フィールドを更新 or 削除
+            if cleaned:
+                cleaned["updated_at"] = now_iso
+                cleaned["updated_by"] = updated_by or "anonymous"
+                mod["policy"] = cleaned
+            else:
+                mod.pop("policy", None)
+        else:
+            # kind == "bundle": bundle_policies[<bname>] を更新 or 削除.
+            # 削除の結果 bundle_policies が空になればフィールドごと消す.
+            bps = mod.get("bundle_policies") or {}
+            if cleaned:
+                cleaned["updated_at"] = now_iso
+                cleaned["updated_by"] = updated_by or "anonymous"
+                bps[bundle_name] = cleaned
+                mod["bundle_policies"] = bps
+            else:
+                bps.pop(bundle_name, None)
+                if bps:
+                    mod["bundle_policies"] = bps
+                else:
+                    mod.pop("bundle_policies", None)
+
+        ledger["updated_at"] = now_iso
+
+        result = _put(
+            "/fleet_state/_doc/ledger?refresh=wait_for",
+            ledger,
+        )
+
+        # cache invalidation (UI 側で即時反映)
+        try:
+            get_ledger.clear()
+        except Exception:
+            pass
+
+        return result
+
+
+    # ─────────────────────────────────────────────────────────
+    # Spoke 管理下除外/復帰 (backend kernel 連携)
+    # ─────────────────────────────────────────────────────────
+    # backend kernel rag-backend-kernel.rag-company1.svc.cluster.local:8000 が
+    # /core/spoke/disable, /core/spoke/enable, /core/spoke/list-archived を
+    # 公開している (spoke_archive.py)。 ここからは HTTP で叩くだけ。
+    BACKEND_KERNEL_URL = (
+        "http://rag-backend-kernel.rag-company1.svc.cluster.local:8000"
+    )
+
+
+    def _backend_post(path: str, payload: dict, timeout: int = 60) -> dict:
+        try:
+            resp = requests.post(
+                f"{BACKEND_KERNEL_URL}{path}",
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=timeout,
+            )
+            if resp.status_code >= 400:
+                try:
+                    detail = resp.json().get("detail", resp.text)
+                except Exception:
+                    detail = resp.text
+                return {"_error": f"HTTP {resp.status_code}: {detail}"}
+            return resp.json()
+        except Exception as e:
+            return {"_error": str(e)}
+
+
+    def _backend_get(path: str, timeout: int = 30):
+        try:
+            resp = requests.get(
+                f"{BACKEND_KERNEL_URL}{path}", timeout=timeout
+            )
+            if resp.status_code >= 400:
+                try:
+                    detail = resp.json().get("detail", resp.text)
+                except Exception:
+                    detail = resp.text
+                return {"_error": f"HTTP {resp.status_code}: {detail}"}
+            return resp.json()
+        except Exception as e:
+            return {"_error": str(e)}
+
+
+    def spoke_disable(cluster_name: str, archived_by: str = "") -> dict:
+        """Spoke を OpenSpoke 管理下から外す (可逆).
+
+        backend kernel が一括処理:
+          1. fleet GitRepo YAML を編集/削除 (個別 + fanout target)
+          2. Spoke per-cluster bootstrap を削除
+          3. spoke_clusters_archive に復元情報を保存
+          4. spoke_clusters から元 doc を削除
+        """
+        return _backend_post(
+            "/core/spoke/disable",
+            {"cluster_name": cluster_name, "archived_by": archived_by},
+            timeout=300,
+        )
+
+
+    def spoke_enable(cluster_name: str) -> dict:
+        """アーカイブから Spoke を管理下に戻す (完全復元)."""
+        return _backend_post(
+            "/core/spoke/enable",
+            {"cluster_name": cluster_name},
+            timeout=300,
+        )
+
+
+    def delete_cluster_cr(cluster_name: str) -> dict:
+        """fleet-cluster の Cluster CR を kubectl delete する独立 API call.
+
+        disable と分離されており、 disable 完了後に view_topology から
+        続けて呼ばれる. backend kernel ↔ 中央ハブ MCP の循環依存に
+        よる HTTP デッドロック様状況を、 同期処理タイミングの分離により
+        回避する.
+        """
+        return _backend_post(
+            "/core/spoke/delete-cluster-cr",
+            {"cluster_name": cluster_name},
+            timeout=120,
+        )
+
+
+    @st.cache_data(ttl=10)
+    def list_archived_spokes() -> list:
+        """archive 済み Spoke の一覧."""
+        result = _backend_get("/core/spoke/list-archived")
+        if isinstance(result, dict) and "_error" in result:
+            return []
+        if not isinstance(result, list):
+            return []
+        return result
+
+
+    def clear_caches():
+        get_ledger.clear()
+        list_spokes.clear()
+        list_spoke_health.clear()
+        list_nodes_aggregated.clear()
+        list_fleet_clusters.clear()
+        list_fleet_gitrepos.clear()
+        list_fleet_bundles.clear()
+        list_fleet_bds.clear()
+        list_gitrepo_metadata.clear()
+        list_archived_spokes.clear()

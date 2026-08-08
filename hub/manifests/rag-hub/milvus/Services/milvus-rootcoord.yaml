@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: milvus-rootcoord
+  namespace: milvus
+spec:
+  internalTrafficPolicy: Cluster
+  ipFamilies:
+    - IPv4
+  ipFamilyPolicy: SingleStack
+  ports:
+    - port: 53100
+      protocol: TCP
+      targetPort: 53100
+  selector:
+    app: milvus-rootcoord
+  sessionAffinity: None
+  type: ClusterIP

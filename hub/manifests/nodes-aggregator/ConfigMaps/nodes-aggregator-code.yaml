@@ -1,0 +1,428 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nodes-aggregator-code
+  namespace: rag-company1
+data:
+  aggregate.py: |
+    """Nodes Aggregator (v2).
+
+    Hub MCP (mcp-company1.rag-spoke.svc:8000/sse) に SSE で接続し、 各 spoke の
+    Kubernetes Node リストを `cluster_k8s_get(kind="Node")` で取得、 hub OpenSearch
+    (opensearch.opensearch.svc:9200) の `nodes_aggregated` index に upsert する。
+
+    spoke ごとに doc_id = "{cluster_name}:{node_name}" で保存。
+    aggregated_at に集計時刻、 spoke_status (active/unreachable/stopped/unknown) も
+    spoke_health からマージして格納。
+
+    v1 -> v2 の差分: 旧版は spoke 側の `node_inventory` index に依存していたが、
+    現在のコードベースに populate 処理が無く新規 spoke では 0 件になる問題があった。
+    v2 は spoke の k8s API から直接 Node リストを取得して既存スキーマに変換する。
+    旧 node_inventory への依存は廃止。
+    """
+    import asyncio
+    import json
+    import os
+    import urllib.request
+    from datetime import datetime, timezone
+
+    from mcp import ClientSession
+    from mcp.client.sse import sse_client
+
+
+    HUB_OS_URL = os.environ.get(
+        "HUB_OS_URL",
+        "http://opensearch.opensearch.svc.cluster.local:9200",
+    )
+    HUB_MCP_URL = os.environ.get(
+        "HUB_MCP_URL",
+        "http://mcp-company1.mcp.svc.cluster.local:8000/sse",
+    )
+    MCP_API_KEY = os.environ.get("MCP_API_KEY", "")
+    PER_SPOKE_TIMEOUT = float(os.environ.get("PER_SPOKE_TIMEOUT", "30"))
+
+
+    # K8s Node の labels のうち、 system 由来 (= 利用者が興味を持たないもの) を除外して
+    # node_labels フィールドに格納するためのプレフィックス一覧。
+    SYSTEM_LABEL_PREFIXES = (
+        "kubernetes.io/",
+        "beta.kubernetes.io/",
+        "node-role.kubernetes.io/",
+        "node.kubernetes.io/",
+        "topology.kubernetes.io/",
+        "failure-domain.beta.kubernetes.io/",
+        "k3s.io/",
+        "rke2.io/",
+        "fleet.cattle.io/",
+        "objectset.rio.cattle.io/",
+        "eks.amazonaws.com/",
+        "alpha.kubernetes.io/",
+        "feature.node.kubernetes.io/",
+        "csi.storage.k8s.io/",
+    )
+    SYSTEM_LABEL_EXACT = {
+        "kubernetes.io/hostname",
+        "kubernetes.io/os",
+        "kubernetes.io/arch",
+    }
+
+
+    def now_utc() -> str:
+        return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+    def os_request(method, path, payload=None, timeout=10):
+        data = None
+        headers = {"Content-Type": "application/json"}
+        if payload is not None:
+            data = json.dumps(payload).encode()
+        req = urllib.request.Request(
+            f"{HUB_OS_URL}{path}", data=data, headers=headers, method=method
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read())
+
+
+    def list_spokes() -> list:
+        res = os_request("POST", "/spoke_clusters/_search", {
+            "size": 100,
+            "query": {"match_all": {}},
+            "sort": [{"_id": "asc"}],
+        })
+        return [h.get("_id") for h in res.get("hits", {}).get("hits", [])]
+
+
+    def list_spoke_health() -> dict:
+        try:
+            res = os_request("POST", "/spoke_health/_search", {
+                "size": 100, "query": {"match_all": {}},
+            })
+            out = {}
+            for h in res.get("hits", {}).get("hits", []):
+                src = h.get("_source", {}) or {}
+                name = src.get("cluster_name") or h.get("_id")
+                if name:
+                    out[name] = src.get("status", "unknown")
+            return out
+        except Exception:
+            return {}
+
+
+    def _parse_memory_to_kb(mem_str: str) -> int:
+        """K8s capacity.memory ("8138564Ki", "16Gi" 等) を KB に正規化する。"""
+        if not mem_str or not isinstance(mem_str, str):
+            return 0
+        units = [
+            ("Ki", 1),
+            ("Mi", 1024),
+            ("Gi", 1024 * 1024),
+            ("Ti", 1024 * 1024 * 1024),
+        ]
+        for suffix, mult in units:
+            if mem_str.endswith(suffix):
+                try:
+                    return int(mem_str[: -len(suffix)]) * mult
+                except ValueError:
+                    return 0
+        # 単位なしはバイトとみなして KB 換算
+        try:
+            return int(mem_str) // 1024
+        except ValueError:
+            return 0
+
+
+    def extract_node_fields(node_obj: dict, cluster_name: str) -> dict:
+        """K8s Node オブジェクトから nodes_aggregated 用のスキーマへ変換する。"""
+        metadata = node_obj.get("metadata", {}) or {}
+        status = node_obj.get("status", {}) or {}
+        info = status.get("nodeInfo", {}) or {}
+        capacity = status.get("capacity", {}) or {}
+        labels = metadata.get("labels", {}) or {}
+        addresses = status.get("addresses", []) or []
+
+        node_name = metadata.get("name", "")
+        hostname = node_name
+        internal_ip = ""
+        external_ip = ""
+        for addr in addresses:
+            atype = addr.get("type", "")
+            aval = addr.get("address", "")
+            if atype == "InternalIP" and not internal_ip:
+                internal_ip = aval
+            elif atype == "ExternalIP" and not external_ip:
+                external_ip = aval
+            elif atype == "Hostname" and aval:
+                hostname = aval
+
+        cpu_str = str(capacity.get("cpu", "0"))
+        try:
+            cpu_count = int(cpu_str)
+        except ValueError:
+            cpu_count = 0
+
+        mem_kb = _parse_memory_to_kb(str(capacity.get("memory", "0")))
+
+        # node_role: node-role.kubernetes.io/<role> ラベルを + 結合 (example-cluster 等の既存表記に合わせる)
+        roles = sorted([
+            k.split("/", 1)[1]
+            for k in labels.keys()
+            if k.startswith("node-role.kubernetes.io/") and "/" in k
+        ])
+        node_role = "+".join(roles) if roles else "worker"
+
+        # GPU
+        gpu_info = None
+        if "nvidia.com/gpu" in capacity:
+            try:
+                cnt = int(capacity["nvidia.com/gpu"])
+                if cnt > 0:
+                    gpu_info = {"count": cnt, "vendor": "nvidia"}
+            except (ValueError, TypeError):
+                pass
+
+        # custom labels (system label を除外)
+        custom_labels = {
+            k: v for k, v in labels.items()
+            if not any(k.startswith(p) for p in SYSTEM_LABEL_PREFIXES)
+            and k not in SYSTEM_LABEL_EXACT
+        }
+
+        # cloud metadata (EKS / generic topology)
+        cloud = None
+        region = labels.get("topology.kubernetes.io/region", "")
+        zone = labels.get("topology.kubernetes.io/zone", "")
+        if region or zone:
+            cloud = {}
+            if "eks.amazonaws.com/nodegroup" in labels:
+                cloud["provider"] = "aws"
+                cloud["nodegroup"] = labels["eks.amazonaws.com/nodegroup"]
+            if region:
+                cloud["region"] = region
+            if zone:
+                cloud["zone"] = zone
+            itype = labels.get(
+                "node.kubernetes.io/instance-type"
+            ) or labels.get("beta.kubernetes.io/instance-type", "")
+            if itype:
+                cloud["instance_type"] = itype
+
+        doc = {
+            "node_name": node_name,
+            "cluster_name": cluster_name,
+            "hostname": hostname,
+            "internal_ip": internal_ip,
+            "arch": info.get("architecture", ""),
+            "boot_id": info.get("bootID", ""),
+            "container_runtime": info.get("containerRuntimeVersion", ""),
+            "cpu": {"count": cpu_count},
+            "kernel": {"release": info.get("kernelVersion", "")},
+            "kubelet": {"version": info.get("kubeletVersion", "")},
+            "memory": {"total_kb": mem_kb},
+            "node_role": node_role,
+            "os": {
+                "operating_system": info.get("operatingSystem", ""),
+                "pretty_name": info.get("osImage", ""),
+            },
+            "collected_at": now_utc(),
+        }
+        if external_ip:
+            doc["external_ip"] = external_ip
+        if custom_labels:
+            doc["node_labels"] = custom_labels
+        if gpu_info:
+            doc["gpu"] = gpu_info
+        if cloud:
+            doc["cloud"] = cloud
+        return doc
+
+
+    def _parse_k8s_get_payload(text: str) -> list:
+        """`cluster_k8s_get` の戻り値テキストから Node オブジェクト dict のリストを抽出する。
+
+        中央ハブの cluster_k8s_get は spoke の k8s_get を MCP プロトコル経由で呼ぶ。
+        実装によって戻り値は (a) 整形済みテキストか (b) JSON 文字列のどちらか。
+        いずれにも対応するため次の順で試みる:
+          1. text を直接 JSON parse → list/dict として処理
+          2. 失敗時は最初の '[' か '{' から末尾まで切り出して JSON parse
+          3. それでも駄目なら空リスト
+        """
+        text = (text or "").strip()
+        if not text:
+            return []
+
+        # 試行 1: そのまま parse
+        try:
+            obj = json.loads(text)
+            if isinstance(obj, list):
+                return [x for x in obj if isinstance(x, dict)]
+            if isinstance(obj, dict):
+                # items キーがあれば k8s list 形式
+                items = obj.get("items")
+                if isinstance(items, list):
+                    return [x for x in items if isinstance(x, dict)]
+                # 単一オブジェクト
+                return [obj]
+        except json.JSONDecodeError:
+            pass
+
+        # 試行 2: 最初の JSON っぽい開始位置から末尾まで
+        for start_char in ("[", "{"):
+            idx = text.find(start_char)
+            if idx < 0:
+                continue
+            try:
+                obj = json.loads(text[idx:])
+                if isinstance(obj, list):
+                    return [x for x in obj if isinstance(x, dict)]
+                if isinstance(obj, dict):
+                    items = obj.get("items")
+                    if isinstance(items, list):
+                        return [x for x in items if isinstance(x, dict)]
+                    return [obj]
+            except json.JSONDecodeError:
+                continue
+        return []
+
+
+    async def fetch_k8s_nodes_for_spoke(session, cluster_name: str) -> list:
+        """spoke の k8s API から Node リストを取得して nodes_aggregated 形式に変換する。"""
+        try:
+            result = await asyncio.wait_for(
+                session.call_tool(
+                    "cluster_k8s_get",
+                    arguments={
+                        "cluster": cluster_name,
+                        "api_version": "v1",
+                        "kind": "Node",
+                    },
+                ),
+                timeout=PER_SPOKE_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            print(f"  {cluster_name:<22} TIMEOUT after {PER_SPOKE_TIMEOUT}s")
+            return []
+        except Exception as e:
+            print(f"  {cluster_name:<22} ERROR: {type(e).__name__}: {e}")
+            return []
+
+        if not result.content:
+            print(f"  {cluster_name:<22} empty content (isError={getattr(result, 'isError', '?')})")
+            return []
+        text_parts = []
+        for c in result.content:
+            t = getattr(c, "text", None)
+            if t:
+                text_parts.append(t)
+        full = "\n".join(text_parts)
+        if getattr(result, "isError", False):
+            print(f"  {cluster_name:<22} TOOL ERROR: {full[:300]}")
+            return []
+
+        raw_nodes = _parse_k8s_get_payload(full)
+        if not raw_nodes:
+            print(f"  {cluster_name:<22} 0 nodes parsed from {len(full)}B response. preview: {full[:200]!r}")
+            return []
+
+        extracted = []
+        for n in raw_nodes:
+            kind = n.get("kind", "")
+            if kind and kind != "Node":
+                continue
+            try:
+                extracted.append(extract_node_fields(n, cluster_name))
+            except Exception as e:
+                meta_name = (n.get("metadata") or {}).get("name", "?")
+                print(f"  {cluster_name:<22} extract failed for {meta_name}: {type(e).__name__}: {e}")
+        return extracted
+
+
+    def upsert_node(doc_id: str, doc: dict):
+        os_request("PUT", f"/nodes_aggregated/_doc/{doc_id}", doc)
+
+
+    def delete_stale_nodes_for_spoke(cluster_name: str, cycle_aggregated_at: str) -> int:
+        """指定 cluster で _aggregated_at が cycle_aggregated_at 未満の doc を物理削除する.
+
+        spoke から node 一覧を取得した cycle 終了時に呼ぶ自浄機能.
+        spoke 側で削除された node は cycle で取得されないので _aggregated_at が更新されず、
+        この削除で nodes_aggregated から除去される.
+
+        unreachable な spoke (= nodes 0 件) には呼ばないこと
+        (既存 doc を巻き戻し的に削除する事故を防ぐ).
+
+        OpenSearch _delete_by_query API は refresh=true / false のみ valid
+        (wait_for は single doc API 専用).
+        """
+        body = {
+            "query": {
+                "bool": {
+                    "must": [
+                        {"term": {"cluster_name.keyword": cluster_name}},
+                        {"range": {"_aggregated_at": {"lt": cycle_aggregated_at}}},
+                    ]
+                }
+            }
+        }
+        res = os_request(
+            "POST",
+            "/nodes_aggregated/_delete_by_query?refresh=true",
+            body,
+        )
+        return int(res.get("deleted", 0) or 0)
+
+
+    async def main():
+        started_at = now_utc()
+        spokes = list_spokes()
+        if not spokes:
+            print(f"[{started_at}] no spokes registered, exit")
+            return
+
+        health = list_spoke_health()
+        print(f"[{started_at}] aggregating nodes from {len(spokes)} spokes via hub MCP (v2: k8s_get direct)")
+        print(f"  hub_mcp_url={HUB_MCP_URL}")
+
+        total_written = 0
+        per_spoke_count = {}
+
+        async with sse_client(HUB_MCP_URL, headers={"X-API-Key": MCP_API_KEY} if MCP_API_KEY else None) as streams:
+            read_stream, write_stream = streams
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                for name in spokes:
+                    nodes = await fetch_k8s_nodes_for_spoke(session, name)
+                    per_spoke_count[name] = len(nodes)
+                    spoke_status = health.get(name, "unknown")
+                    aggregated_at = now_utc()
+                    for n in nodes:
+                        node_name = n.get("node_name") or "?"
+                        doc_id = f"{name}:{node_name}"
+                        n["_aggregated_at"] = aggregated_at
+                        n["_spoke_status"] = spoke_status
+                        try:
+                            upsert_node(doc_id, n)
+                            total_written += 1
+                        except Exception as e:
+                            print(f"  {name}:{node_name} upsert failed: {e}")
+
+                    # 自浄: spoke から 1 件以上 node を取得できた cycle のみ、
+                    # 同 cluster で _aggregated_at が今 cycle 未満の doc を削除.
+                    # nodes が空 (unreachable / 取得失敗) のときは何もしない
+                    # (既存 doc を巻き戻し的に削除する事故防止).
+                    if nodes:
+                        try:
+                            deleted = delete_stale_nodes_for_spoke(name, aggregated_at)
+                            if deleted:
+                                print(f"  {name:<22} stale nodes cleaned: {deleted}")
+                        except Exception as e:
+                            print(f"  {name:<22} stale cleanup failed: {type(e).__name__}: {e}")
+
+        finished_at = now_utc()
+        print(f"[{finished_at}] aggregation complete: {total_written} nodes written")
+        for name in spokes:
+            count = per_spoke_count.get(name, 0)
+            print(f"  {name:<22} nodes={count}")
+
+
+    if __name__ == "__main__":
+        asyncio.run(main())

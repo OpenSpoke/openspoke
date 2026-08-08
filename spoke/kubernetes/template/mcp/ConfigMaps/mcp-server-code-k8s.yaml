@@ -1,0 +1,143 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcp-server-code-k8s
+  namespace: rag-spoke
+data:
+  mcp_server_k8s.py: |
+    """
+    スポーク MCP の Kubernetes 関連ツール群。
+
+    今後、 K8s リソース操作に関するツール (read / write / watch / apply 等) は
+    このモジュールに集約していく。 既存の k8s 関連ツールは mcp_server_write.py
+    にあるが、 順次こちらに移行する。 当面は新規追加分のみここに置く。
+
+    register_tools(mcp) を mcp_server.py の末尾で呼び出すことでツールが
+    FastMCP に登録される。
+    """
+
+    import logging
+
+    from kubernetes import client as _k8sclient, config as _k8sconfig
+    from kubernetes import dynamic as _k8sdyn
+    from kubernetes.client.rest import ApiException
+
+    log = logging.getLogger("mcp_server_k8s")
+
+    # ── kubernetes client は初回利用時に lazy 初期化 ──
+    # mcp_server_write.py の _init_k8s と独立。 同じプロセス内で両方が
+    # 走っても問題ないようにモジュール固有のグローバルにする。 将来、
+    # mcp_server_write の K8s ロジックがこちらに移ってきたら、 こちらの
+    # _init() を共通実装にする。
+    _api_client = None
+
+    def _init():
+        global _api_client
+        if _api_client is not None:
+            return
+        try:
+            _k8sconfig.load_incluster_config()
+            log.info("loaded in-cluster kubeconfig")
+        except _k8sconfig.ConfigException:
+            _k8sconfig.load_kube_config()
+            log.info("loaded local kubeconfig (dev mode)")
+
+        # kubernetes Python client (OpenAPI Generator 36+) は
+        # load_incluster_config() で api_key に "bearer <token>" を埋め込み、
+        # api_key_prefix が空のまま Authorization ヘッダを送らない既知の問題が
+        # ある。 回避: ApiClient.set_default_header で Authorization を直接設定。
+        _cfg = _k8sclient.Configuration.get_default_copy()
+        _tok = (_cfg.api_key or {}).get("authorization", "")
+        if _tok.lower().startswith("bearer "):
+            _tok = _tok[len("bearer "):]
+        _api_client = _k8sclient.ApiClient(configuration=_cfg)
+        _api_client.set_default_header("Authorization", f"Bearer {_tok}")
+
+
+    def register_tools(mcp):
+        """mcp_server.py の末尾でこの関数を呼ぶことでツールが登録される。"""
+
+        @mcp.tool()
+        async def cluster_k8s_get(
+            api_version: str,
+            kind: str,
+            name: str = "",
+            namespace: str = "",
+            label_selector: str = "",
+            field_selector: str = "",
+        ) -> str:
+            """自クラスタから任意の K8s リソースを取得する汎用ツール (read-only)。
+
+            ハブ MCP の同名ツール cluster_k8s_get がこの関数を MCP プロトコル
+            経由で呼び出す。 ハブ・スポーク間で同じ名前にして、 連携関係を
+            明確にする。
+
+            標準 API (Pod、 Deployment、 ConfigMap、 Secret 等) と
+            CustomResource (fleet.cattle.io の Cluster、 GitRepo、
+            BundleDeployment 等) の両方に対応する。 内部実装は
+            kubernetes.dynamic.DynamicClient を使い、 kind と api_version
+            から正しい resource (plural 推論含む) を自動的に解決する。
+
+            動作:
+              - name 指定あり → 単一リソースを取得 (get)
+              - name 省略 → 一覧を取得 (list、 label/field selector で
+                絞り込み可)
+
+            cluster-scoped リソース (例: Namespace、 ClusterRoleBinding) は
+            namespace を空文字で呼ぶ。 namespace-scoped リソースは
+            namespace 指定が必要。
+
+            Secret の data は base64 のまま返す (デコードしない)。 機密値が
+            意図せず画面に出ないようにするための最低限の防御。 base64 は
+            マスキングではないので呼び出し側で必要に応じてマスクする。
+
+            Args:
+                api_version: 例: "v1"、 "apps/v1"、 "fleet.cattle.io/v1alpha1"
+                kind:        例: "Pod"、 "Deployment"、 "Cluster"、 "GitRepo"
+                name:        リソース名 (省略時は list)
+                namespace:   名前空間 (cluster-scoped なら省略可)
+                label_selector: list 時の label セレクタ
+                                (例: "app=fleet-agent")
+                field_selector: list 時の field セレクタ
+                                (例: "status.phase=Running")
+            """
+            import json as _json
+
+            _init()
+            try:
+                dyn = _k8sdyn.DynamicClient(_api_client)
+            except Exception as e:
+                return f"ERROR: DynamicClient init failed: {e}"
+
+            try:
+                res = dyn.resources.get(api_version=api_version, kind=kind)
+            except Exception as e:
+                return (f"ERROR: resource not found for "
+                        f"api_version={api_version} kind={kind}: {e}")
+
+            try:
+                if name:
+                    obj = res.get(name=name, namespace=namespace or None)
+                    return _json.dumps(obj.to_dict(), ensure_ascii=False,
+                                       indent=2, default=str)
+                else:
+                    kw = {}
+                    if label_selector:
+                        kw["label_selector"] = label_selector
+                    if field_selector:
+                        kw["field_selector"] = field_selector
+                    if namespace:
+                        kw["namespace"] = namespace
+                    lst = res.get(**kw)
+                    items = lst.to_dict().get("items", [])
+                    if not items:
+                        loc = (f"{namespace}/" if namespace
+                               else "(cluster-scoped) ")
+                        return f"no {kind} found in {loc}"
+                    return _json.dumps(items, ensure_ascii=False, indent=2,
+                                       default=str)
+            except ApiException as e:
+                return (f"ERROR: k8s_get failed: status={e.status} "
+                        f"reason={e.reason} body={(e.body or '')[:300]}")
+            except Exception as e:
+                return f"ERROR: k8s_get failed: {type(e).__name__}: {str(e)[:300]}"

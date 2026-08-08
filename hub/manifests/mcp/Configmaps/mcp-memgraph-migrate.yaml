@@ -1,0 +1,89 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcp-memgraph-migrate
+  namespace: mcp
+data:
+  memgraph_migrate_tool.py: |
+    """Memgraph グラフ移行の制御ツール (ハブ / 検証 MCP 用)。
+
+    target kernel の /core/memgraph/migrate_pull を Cloudflare 経由で叩く。
+    target が source の /core/memgraph/migrate_export を pull して自分の
+    Memgraph に MERGE で投入する。 node / edge は kernel 間を直接流れ、 MCP /
+    Claude のコンテキストには載らない (summary のみ返る)。
+
+    node identity は source 側の id(n) を property nid_src に固定して
+    保つ。 同じ source からの再投入は冪等。
+
+    mcp-server-code.py から
+      import memgraph_migrate_tool as _mgm
+      _mgm.register_memgraph_migrate_tools(mcp)
+    で取り込む (knowledge_migrate_tool と同じ流儀)。
+
+    NOTE: mcp_server には typing が import されていないため、 型注釈は builtin
+    (dict / list / str / bool) のみ使用する。
+    """
+    import os
+    import httpx
+
+
+    _KERNELS = {
+        "aws": "https://kernel-0001.example.com",
+        "aws2": "https://kernel-0002.example.com",
+        "rag": "https://kernel-9001.example.com",
+    }
+
+
+    def register_memgraph_migrate_tools(mcp):
+        _token = os.environ.get("KNOWLEDGE_MIGRATE_TOKEN", "")
+
+        @mcp.tool()
+        async def migrate_memgraph(target: str, source: str,
+                                   batch_size: int = 1000,
+                                   dry_run: bool = False) -> dict:
+            """Memgraph 全 node + 全 edge を source kernel から target kernel に移行 (pull) する。
+
+            target / source は "aws" | "aws2" | "rag"。 target kernel の
+            /core/memgraph/migrate_pull を起動し、 target が source の
+            /core/memgraph/migrate_export から全 node を先に pull して MERGE、
+            その後全 edge を pull して MERGE する。 source 側の id(n) は
+            property nid_src として保持され、 edge は両端 nid_src で一致させる。
+            dry_run=True なら fetched 件数のみ確認。
+
+            Args:
+                target:     投入先クラスタ "aws" | "aws2" | "rag"
+                source:     取得元クラスタ "aws" | "aws2" | "rag"
+                batch_size: 1 ページの件数 (既定 1000)
+                dry_run:    True で件数のみ確認 (非破壊)
+            Returns:
+                target kernel の migrate_pull の結果
+                (nodes_fetched / nodes_merged / edges_fetched / edges_merged 等を含む dict)。
+            """
+            if not _token:
+                return {"ok": False, "error": "KNOWLEDGE_MIGRATE_TOKEN not configured on this MCP"}
+            if target not in _KERNELS or source not in _KERNELS:
+                return {"ok": False, "error": f"target/source must be one of {list(_KERNELS.keys())}"}
+            if target == source:
+                return {"ok": False, "error": "target and source must differ"}
+
+            target_url = _KERNELS[target]
+            source_url = _KERNELS[source]
+            try:
+                async with httpx.AsyncClient(timeout=600.0) as c:
+                    r = await c.post(
+                        f"{target_url}/core/memgraph/migrate_pull",
+                        json={
+                            "source_base_url": source_url,
+                            "source_token": _token,
+                            "batch_size": batch_size,
+                            "dry_run": dry_run,
+                        },
+                        headers={"Authorization": f"Bearer {_token}"},
+                    )
+                try:
+                    return r.json()
+                except Exception:
+                    return {"ok": False,
+                            "error": f"non-JSON response (status {r.status_code}): {r.text[:300]}"}
+            except Exception as e:
+                return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}

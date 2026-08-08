@@ -1,0 +1,658 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Fleet UI</title>
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    [v-cloak] { display: none; }
+    .state-Ready { @apply bg-green-100 text-green-800; }
+    .state-NotReady, .state-Error, .state-ErrApplied { @apply bg-red-100 text-red-800; }
+    .state-Modified, .state-WaitApplied, .state-OutOfSync { @apply bg-yellow-100 text-yellow-800; }
+    .state-Unknown { @apply bg-gray-100 text-gray-800; }
+    /* 押下中の force-sync ボタン */
+    .syncing { @apply text-gray-400 cursor-wait; }
+    /* Toast アニメーション */
+    .toast-enter-from, .toast-leave-to { opacity: 0; transform: translateY(8px); }
+    .toast-enter-active, .toast-leave-active { transition: all 0.25s ease; }
+  </style>
+</head>
+<body class="bg-gray-50">
+<div id="app" v-cloak class="min-h-screen flex flex-col">
+
+  <!-- Toast 通知 (右下) -->
+  <div class="fixed bottom-4 right-4 z-50 flex flex-col gap-2 pointer-events-none">
+    <transition-group name="toast">
+      <div v-for="t in toasts" :key="t.id"
+           :class="['px-4 py-2 rounded shadow-md text-sm pointer-events-auto',
+                    t.kind === 'success' ? 'bg-green-600 text-white'
+                                         : 'bg-red-600 text-white']">
+        {{ t.message }}
+      </div>
+    </transition-group>
+  </div>
+
+  <!-- Header -->
+  <header class="bg-white border-b border-gray-200">
+    <div class="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <div class="w-3 h-3 rounded-full" :style="{ backgroundColor: config.brandColor }"></div>
+        <h1 class="text-xl font-semibold">{{ config.title }}</h1>
+      </div>
+      <div class="text-sm text-gray-500">
+        workspace:
+        <select v-model="workspace" class="ml-1 border border-gray-300 rounded px-2 py-1">
+          <option v-for="ws in workspaces" :key="ws" :value="ws">{{ ws }}</option>
+        </select>
+      </div>
+    </div>
+    <nav class="max-w-7xl mx-auto px-4 flex gap-1">
+      <button v-for="t in tabs" :key="t.id"
+              @click="activeTab = t.id"
+              :class="['px-4 py-2 text-sm font-medium border-b-2',
+                       activeTab === t.id
+                         ? 'border-blue-500 text-blue-600'
+                         : 'border-transparent text-gray-500 hover:text-gray-700']">
+        {{ t.label }}
+      </button>
+    </nav>
+  </header>
+
+  <!-- Body -->
+  <main class="flex-1 max-w-7xl mx-auto w-full px-4 py-6">
+
+    <!-- Dashboard -->
+    <section v-if="activeTab === 'dashboard'">
+      <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+        <div class="bg-white rounded-lg shadow p-4">
+          <div class="text-sm text-gray-500">GitRepos</div>
+          <div class="text-3xl font-bold mt-1">{{ gitrepos.length }}</div>
+        </div>
+        <div class="bg-white rounded-lg shadow p-4">
+          <div class="text-sm text-gray-500">Bundles</div>
+          <div class="text-3xl font-bold mt-1">{{ bundles.length }}</div>
+        </div>
+        <div class="bg-white rounded-lg shadow p-4">
+          <div class="text-sm text-gray-500">Clusters</div>
+          <div class="text-3xl font-bold mt-1">{{ clusters.length }}</div>
+        </div>
+        <div class="bg-white rounded-lg shadow p-4">
+          <div class="text-sm text-gray-500">Ready %</div>
+          <div class="text-3xl font-bold mt-1">{{ readyPercent }}%</div>
+        </div>
+      </div>
+
+      <h2 class="text-lg font-semibold mt-8 mb-3">Recent errors</h2>
+      <div class="bg-white rounded-lg shadow">
+        <table class="w-full text-sm">
+          <thead class="bg-gray-50">
+            <tr>
+              <th class="text-left px-4 py-2">Type</th>
+              <th class="text-left px-4 py-2">Name</th>
+              <th class="text-left px-4 py-2">Namespace</th>
+              <th class="text-left px-4 py-2">Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="e in recentErrors" :key="e.uid" class="border-t border-gray-100">
+              <td class="px-4 py-2">{{ e.kind }}</td>
+              <td class="px-4 py-2 font-mono">{{ e.name }}</td>
+              <td class="px-4 py-2">{{ e.namespace }}</td>
+              <td class="px-4 py-2 text-red-600">{{ e.message }}</td>
+            </tr>
+            <tr v-if="recentErrors.length === 0">
+              <td colspan="4" class="px-4 py-6 text-center text-gray-400">No errors</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- GitRepos -->
+    <section v-if="activeTab === 'gitrepos'">
+      <div class="flex justify-between items-center mb-4">
+        <h2 class="text-lg font-semibold">GitRepos in {{ workspace }}</h2>
+        <button @click="refresh" class="px-3 py-1.5 bg-blue-500 text-white rounded text-sm">Refresh</button>
+      </div>
+      <div class="bg-white rounded-lg shadow overflow-x-auto">
+        <table class="w-full text-sm">
+          <thead class="bg-gray-50">
+            <tr>
+              <th class="text-left px-4 py-2">Name</th>
+              <th class="text-left px-4 py-2">Repo</th>
+              <th class="text-left px-4 py-2">Branch</th>
+              <th class="text-left px-4 py-2">Commit</th>
+              <th class="text-left px-4 py-2">Paths</th>
+              <th class="text-left px-4 py-2">Targets</th>
+              <th class="text-left px-4 py-2">Ready</th>
+              <th class="text-left px-4 py-2">Polling</th>
+              <th class="text-left px-4 py-2">Updated</th>
+              <th class="text-left px-4 py-2">Status</th>
+              <th class="text-right px-4 py-2">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="r in filteredGitRepos" :key="r.metadata.uid"
+                :class="['border-t border-gray-100',
+                         isTransient(stateOf(r)) ? 'bg-yellow-50' : '']">
+              <td class="px-4 py-2 font-mono">{{ r.metadata.name }}</td>
+              <td class="px-4 py-2 text-gray-600 truncate max-w-xs">{{ r.spec?.repo }}</td>
+              <td class="px-4 py-2">{{ r.spec?.branch || 'main' }}</td>
+              <td class="px-4 py-2 font-mono text-xs">{{ shortSha(r.status?.commit) }}</td>
+              <td class="px-4 py-2 text-xs">{{ (r.spec?.paths || []).join(', ') || '-' }}</td>
+              <td class="px-4 py-2 text-xs">{{ gitrepoTargetsLabel(r) }}</td>
+              <td class="px-4 py-2">{{ readyOf(r.status?.summary) }}</td>
+              <td class="px-4 py-2 text-xs"
+                  :class="isPollingDisabled(r) ? 'text-gray-400 italic' : 'text-gray-600'"
+                  :title="isPollingDisabled(r) ? 'polling 事実上停止 (forceUpdate のみ)' : ''">
+                {{ pollingLabel(r) }}
+              </td>
+              <td class="px-4 py-2 text-xs text-gray-600"
+                  :title="gitrepoUpdatedAtRaw(r)">
+                {{ relativeTime(gitrepoUpdatedAtRaw(r)) }}
+              </td>
+              <td class="px-4 py-2">
+                <span :class="['text-xs px-2 py-0.5 rounded', stateClass(stateOf(r))]">{{ stateOf(r) }}</span>
+              </td>
+              <td class="px-4 py-2 text-right">
+                <button @click="forceSync('gitrepos', r)"
+                        :disabled="isSyncing(r)"
+                        :class="['text-xs',
+                                 isSyncing(r) ? 'syncing'
+                                              : 'text-blue-600 hover:underline']">
+                  {{ isSyncing(r) ? 'syncing…' : 'force-sync' }}
+                </button>
+              </td>
+            </tr>
+            <tr v-if="filteredGitRepos.length === 0">
+              <td colspan="11" class="px-4 py-6 text-center text-gray-400">No GitRepos in this workspace</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Bundles -->
+    <section v-if="activeTab === 'bundles'">
+      <div class="flex justify-between items-center mb-4">
+        <h2 class="text-lg font-semibold">Bundles in {{ workspace }}</h2>
+        <button @click="refresh" class="px-3 py-1.5 bg-blue-500 text-white rounded text-sm">Refresh</button>
+      </div>
+      <div class="bg-white rounded-lg shadow overflow-x-auto">
+        <table class="w-full text-sm">
+          <thead class="bg-gray-50">
+            <tr>
+              <th class="text-left px-4 py-2">Name</th>
+              <th class="text-left px-4 py-2">GitRepo</th>
+              <th class="text-left px-4 py-2">Commit</th>
+              <th class="text-left px-4 py-2">Targets</th>
+              <th class="text-left px-4 py-2">Ready</th>
+              <th class="text-left px-4 py-2">Updated</th>
+              <th class="text-left px-4 py-2">Status</th>
+              <th class="text-right px-4 py-2">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="b in filteredBundles" :key="b.metadata.uid"
+                :class="['border-t border-gray-100',
+                         isTransient(stateOf(b)) ? 'bg-yellow-50' : '']">
+              <td class="px-4 py-2 font-mono">{{ b.metadata.name }}</td>
+              <td class="px-4 py-2 text-xs">{{ bundleRepoName(b) }}</td>
+              <td class="px-4 py-2 font-mono text-xs">{{ shortSha(bundleCommit(b)) }}</td>
+              <td class="px-4 py-2 text-xs">{{ bundleTargetsLabel(b) }}</td>
+              <td class="px-4 py-2">{{ readyOf(b.status?.summary) }}</td>
+              <td class="px-4 py-2 text-xs text-gray-600"
+                  :title="bundleUpdatedAtRaw(b)">
+                {{ relativeTime(bundleUpdatedAtRaw(b)) }}
+              </td>
+              <td class="px-4 py-2">
+                <span :class="['text-xs px-2 py-0.5 rounded', stateClass(stateOf(b))]">{{ stateOf(b) }}</span>
+              </td>
+              <td class="px-4 py-2 text-right">
+                <button v-if="bundleRepoName(b) !== '-'"
+                        @click="forceSyncBundleParent(b)"
+                        :disabled="isSyncingBundleParent(b)"
+                        title="Bundle 自身ではなく親 GitRepo の force-sync を打つ"
+                        :class="['text-xs',
+                                 isSyncingBundleParent(b) ? 'syncing'
+                                              : 'text-blue-600 hover:underline']">
+                  {{ isSyncingBundleParent(b) ? 'syncing…' : 'force-sync parent' }}
+                </button>
+              </td>
+            </tr>
+            <tr v-if="filteredBundles.length === 0">
+              <td colspan="8" class="px-4 py-6 text-center text-gray-400">No Bundles in this workspace</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Clusters -->
+    <section v-if="activeTab === 'clusters'">
+      <div class="flex justify-between items-center mb-4">
+        <h2 class="text-lg font-semibold">Clusters in {{ workspace }}</h2>
+        <button @click="refresh" class="px-3 py-1.5 bg-blue-500 text-white rounded text-sm">Refresh</button>
+      </div>
+      <div class="bg-white rounded-lg shadow overflow-x-auto">
+        <table class="w-full text-sm">
+          <thead class="bg-gray-50">
+            <tr>
+              <th class="text-left px-4 py-2">Cluster Name</th>
+              <th class="text-left px-4 py-2 text-xs">CR Name</th>
+              <th class="text-left px-4 py-2">Bundles Ready</th>
+              <th class="text-left px-4 py-2">Last Seen</th>
+              <th class="text-left px-4 py-2">Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="c in filteredClusters" :key="c.metadata.uid"
+                :class="['border-t border-gray-100',
+                         isTransient(stateOf(c)) ? 'bg-yellow-50' : '']">
+              <td class="px-4 py-2">
+                <span v-if="clusterDisplay(c) !== '-'"
+                      class="text-lg font-semibold text-gray-900">{{ clusterDisplay(c) }}</span>
+                <span v-else class="text-sm text-yellow-700 italic">(unlabeled)</span>
+              </td>
+              <td class="px-4 py-2 font-mono text-xs text-gray-500">{{ c.metadata.name }}</td>
+              <td class="px-4 py-2">{{ c.status?.summary?.ready || 0 }} / {{ c.status?.summary?.desiredReady || 0 }}</td>
+              <td class="px-4 py-2 text-xs text-gray-600"
+                  :title="c.status?.agent?.lastSeen">
+                {{ relativeTime(c.status?.agent?.lastSeen) }}
+              </td>
+              <td class="px-4 py-2">
+                <span :class="['text-xs px-2 py-0.5 rounded', stateClass(stateOf(c))]">{{ stateOf(c) }}</span>
+              </td>
+            </tr>
+            <tr v-if="filteredClusters.length === 0">
+              <td colspan="5" class="px-4 py-6 text-center text-gray-400">No Clusters in this workspace</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Footer -->
+  <footer class="text-center text-xs text-gray-400 py-4">
+    fleet-ui v0.2.0 · last refresh {{ lastRefresh }} (auto-refresh every 10s)
+  </footer>
+</div>
+
+<script>
+const { createApp, ref, computed, onMounted, watch } = Vue;
+
+createApp({
+  setup() {
+    const config = ref({ title: 'Fleet UI', brandColor: '#3d98d3', defaultWorkspace: 'fleet-default' });
+    const tabs = [
+      { id: 'dashboard', label: 'Dashboard' },
+      { id: 'gitrepos',  label: 'GitRepos'  },
+      { id: 'bundles',   label: 'Bundles'   },
+      { id: 'clusters',  label: 'Clusters'  },
+    ];
+    const activeTab  = ref('dashboard');
+    const workspaces = ref(['fleet-default', 'fleet-local']);
+    const workspace  = ref('fleet-default');
+    const gitrepos   = ref([]);
+    const bundles    = ref([]);
+    const clusters   = ref([]);
+    const lastRefresh = ref('-');
+    // 「now」を 5 秒ごとに更新する ref。 相対時刻表示が動的に進むように使う。
+    const now = ref(Date.now());
+
+    // Toast の管理
+    const toasts = ref([]);
+    let toastSeq = 0;
+    function pushToast(message, kind = 'success', timeoutMs = 3000) {
+      const id = ++toastSeq;
+      toasts.value.push({ id, message, kind });
+      setTimeout(() => {
+        toasts.value = toasts.value.filter(t => t.id !== id);
+      }, timeoutMs);
+    }
+
+    // force-sync 中の (kind, namespace, name) を Set で管理
+    const syncingKeys = ref(new Set());
+    function syncKey(kind, obj) {
+      return `${kind}/${obj.metadata.namespace}/${obj.metadata.name}`;
+    }
+
+    async function api(path, opts = {}) {
+      const r = await fetch('/api/' + path, opts);
+      if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
+      const ct = r.headers.get('content-type') || '';
+      return ct.includes('json') ? r.json() : r.text();
+    }
+
+    async function refresh() {
+      try {
+        const [grs, bs, cs] = await Promise.all([
+          api('gitrepos').then(x => x.items || []),
+          api('bundles').then(x => x.items || []),
+          api('clusters').then(x => x.items || []),
+        ]);
+        gitrepos.value = grs;
+        bundles.value = bs;
+        clusters.value = cs;
+        lastRefresh.value = new Date().toLocaleTimeString();
+      } catch (e) {
+        console.error('refresh failed:', e);
+      }
+    }
+
+    async function loadWorkspaces() {
+      try {
+        const list = await api('workspaces');
+        if (Array.isArray(list) && list.length > 0) workspaces.value = list;
+      } catch (e) { console.error('workspaces:', e); }
+    }
+
+    async function loadConfig() {
+      try {
+        const c = await api('config');
+        config.value = { ...config.value, ...c };
+        workspace.value = c.defaultWorkspace || workspace.value;
+      } catch (e) { console.error('config:', e); }
+    }
+
+    async function forceSync(kind, obj) {
+      const key = syncKey(kind, obj);
+      // 二重押下防止
+      if (syncingKeys.value.has(key)) return;
+      const newSet = new Set(syncingKeys.value);
+      newSet.add(key);
+      syncingKeys.value = newSet;
+
+      try {
+        await api(`${kind}/${obj.metadata.namespace}/${obj.metadata.name}/force-sync`, { method: 'POST' });
+        pushToast(`force-sync requested: ${obj.metadata.name}`, 'success');
+        // すぐに refresh して、 Updated 列 と Status 列に変化が出るのを早く見せる
+        await refresh();
+      } catch (e) {
+        pushToast(`force-sync failed: ${e.message}`, 'error', 6000);
+      } finally {
+        const after = new Set(syncingKeys.value);
+        after.delete(key);
+        syncingKeys.value = after;
+      }
+    }
+
+    // Bundle に対する force-sync は概念的には GitRepo に対して打つ。
+    // Bundle 一覧から親 GitRepo を逆引きして force-sync を呼び出す。
+    async function forceSyncBundleParent(b) {
+      const repoName = bundleRepoName(b);
+      if (repoName === '-' ) {
+        pushToast('この Bundle に親 GitRepo が見つかりません', 'error', 4000);
+        return;
+      }
+      const repoObj = gitrepos.value.find(
+        r => r.metadata.namespace === b.metadata.namespace && r.metadata.name === repoName
+      );
+      if (!repoObj) {
+        pushToast(`親 GitRepo "${repoName}" が一覧にありません`, 'error', 4000);
+        return;
+      }
+      await forceSync('gitrepos', repoObj);
+    }
+
+    function isSyncing(r) {
+      return syncingKeys.value.has(syncKey('gitrepos', r));
+    }
+    function isSyncingBundleParent(b) {
+      const repoName = bundleRepoName(b);
+      if (repoName === '-') return false;
+      return syncingKeys.value.has(`gitrepos/${b.metadata.namespace}/${repoName}`);
+    }
+
+    const filteredGitRepos = computed(() => gitrepos.value.filter(r => r.metadata.namespace === workspace.value));
+    const filteredBundles  = computed(() => bundles.value.filter(r => r.metadata.namespace === workspace.value));
+    // Clusters は cluster-name で昇順ソート。 unlabeled ('-') は最後尾に。
+    const filteredClusters = computed(() => {
+      const list = clusters.value.filter(r => r.metadata.namespace === workspace.value);
+      return list.slice().sort((a, b) => {
+        const an = clusterDisplay(a);
+        const bn = clusterDisplay(b);
+        const aUnlabeled = an === '-';
+        const bUnlabeled = bn === '-';
+        if (aUnlabeled && !bUnlabeled) return 1;
+        if (!aUnlabeled && bUnlabeled) return -1;
+        if (aUnlabeled && bUnlabeled) {
+          // どちらも unlabeled なら CR 名で安定ソート
+          return a.metadata.name.localeCompare(b.metadata.name);
+        }
+        return an.localeCompare(bn, undefined, { numeric: true, sensitivity: 'base' });
+      });
+    });
+
+    const readyPercent = computed(() => {
+      const all = [...gitrepos.value, ...bundles.value];
+      if (all.length === 0) return 100;
+      const ready = all.filter(x => stateOf(x) === 'Ready').length;
+      return Math.round((ready / all.length) * 100);
+    });
+
+    const recentErrors = computed(() => {
+      const errs = [];
+      for (const kind of [['GitRepo', gitrepos], ['Bundle', bundles], ['Cluster', clusters]]) {
+        for (const x of kind[1].value) {
+          const s = stateOf(x);
+          if (s !== 'Ready' && s !== 'Unknown') {
+            errs.push({
+              uid: x.metadata.uid,
+              kind: kind[0],
+              name: x.metadata.name,
+              namespace: x.metadata.namespace,
+              message: s,
+            });
+          }
+        }
+      }
+      return errs.slice(0, 20);
+    });
+
+    function stateOf(obj) {
+      // Fleet stores aggregated state on status.summary or status.conditions
+      const conds = obj.status?.conditions || [];
+      const ready = conds.find(c => c.type === 'Ready');
+      if (ready?.status === 'True') return 'Ready';
+      if (ready?.message) return shortenState(ready.message);
+      if (obj.status?.display?.state) return obj.status.display.state;
+      if (obj.status?.summary?.ready === obj.status?.summary?.desiredReady) return 'Ready';
+      return 'Unknown';
+    }
+
+    function shortenState(msg) {
+      // Fleet error messages start with "ErrApplied(...)" / "Modified(...)" / "WaitApplied(...)"
+      const m = msg.match(/^(\w+)/);
+      return m ? m[1] : 'Error';
+    }
+
+    // 過渡的な状態 (進行中) かどうか。 行背景を薄黄色にする判定に使う。
+    function isTransient(state) {
+      return ['NotReady', 'WaitApplied', 'Modified', 'OutOfSync'].includes(state);
+    }
+
+    function readyOf(summary) {
+      if (!summary) return '-';
+      return `${summary.ready || 0} / ${summary.desiredReady || 0}`;
+    }
+
+    function shortSha(s) {
+      return s ? s.slice(0, 7) : '-';
+    }
+
+    function stateClass(state) {
+      return 'state-' + state;
+    }
+
+    function formatTime(t) {
+      if (!t) return '-';
+      try {
+        return new Date(t).toLocaleString();
+      } catch (e) {
+        return t;
+      }
+    }
+
+    // 相対時刻表示: "5秒前"、 "2分前"、 "1時間前" など。
+    // tooltip 用に元の ISO 文字列も保持する想定。
+    function relativeTime(t) {
+      if (!t) return '-';
+      const then = new Date(t).getTime();
+      if (isNaN(then)) return t;
+      const diff = Math.max(0, Math.floor((now.value - then) / 1000));
+      if (diff < 5)        return 'just now';
+      if (diff < 60)       return `${diff}s ago`;
+      if (diff < 3600)     return `${Math.floor(diff / 60)}m ago`;
+      if (diff < 86400)    return `${Math.floor(diff / 3600)}h ago`;
+      return `${Math.floor(diff / 86400)}d ago`;
+    }
+
+    // 各オブジェクトの「最終 reconcile 時刻」候補:
+    //   GitRepo: status.conditions[Ready].lastUpdateTime
+    //            または status.lastPollingTriggered
+    //   Bundle:  status.conditions の中で一番新しい lastUpdateTime
+    //            あるいは status.lastUpdateTime
+    function latestConditionTime(obj) {
+      const conds = obj?.status?.conditions || [];
+      let best = '';
+      for (const c of conds) {
+        const t = c.lastUpdateTime || c.lastTransitionTime || '';
+        if (t && (!best || t > best)) best = t;
+      }
+      return best;
+    }
+
+    function gitrepoUpdatedAtRaw(r) {
+      return r?.status?.lastPollingTriggered
+          || latestConditionTime(r)
+          || '';
+    }
+
+    function bundleUpdatedAtRaw(b) {
+      return latestConditionTime(b)
+          || b?.metadata?.creationTimestamp
+          || '';
+    }
+
+    // Cluster の表示名:
+    //   1. cluster-name ラベル (新 standalone Fleet で the operatorが付ける運用)
+    //   2. fleet.cattle.io/cluster-display-name (Rancher 内蔵 Fleet 時代の慣習)
+    //   3. management.cattle.io/cluster-display-name (Rancher 全体管理の慣習)
+    //   4. spec.clusterGroupSelector.matchLabels.name (Cluster CR が group 化されている場合)
+    //   どれも無ければ '-' (フロント側で「unlabeled」と表示する)
+    function clusterDisplay(c) {
+      const labels = c.metadata?.labels || {};
+      return labels['cluster-name']
+        || labels['fleet.cattle.io/cluster-display-name']
+        || labels['management.cattle.io/cluster-display-name']
+        || c.spec?.clusterGroupSelector?.matchLabels?.name
+        || '-';
+    }
+
+    // Bundle の由来 GitRepo 名:
+    // Fleet は Bundle に "fleet.cattle.io/repo-name" ラベルを必ず付ける。
+    function bundleRepoName(b) {
+      return b.metadata?.labels?.['fleet.cattle.io/repo-name'] || '-';
+    }
+
+    // Bundle の commit hash:
+    // Fleet は "fleet.cattle.io/commit" ラベルを付ける (GitRepo 由来の Bundle のみ)。
+    function bundleCommit(b) {
+      return b.metadata?.labels?.['fleet.cattle.io/commit'] || '';
+    }
+
+    // Bundle の targets 表示:
+    // spec.targets[*].clusterSelector.matchLabels.cluster-name を集めて並べる。
+    // matchLabels が無いケースや clusterName を直接指定したケースもフォールバックで拾う。
+    function bundleTargetsLabel(b) {
+      const targets = b.spec?.targets || [];
+      const names = [];
+      for (const t of targets) {
+        const lbl = t.clusterSelector?.matchLabels?.['cluster-name'];
+        if (lbl) names.push(lbl);
+        else if (t.clusterName) names.push(t.clusterName);
+        else if (t.name) names.push(t.name);
+      }
+      const uniq = Array.from(new Set(names));
+      return uniq.length ? uniq.join(', ') : '-';
+    }
+
+    // GitRepo の targets 表示: 同じ規則を Bundle と共有。
+    function gitrepoTargetsLabel(r) {
+      const targets = r.spec?.targets || [];
+      const names = [];
+      for (const t of targets) {
+        const lbl = t.clusterSelector?.matchLabels?.['cluster-name'];
+        if (lbl) names.push(lbl);
+        else if (t.clusterName) names.push(t.clusterName);
+        else if (t.name) names.push(t.name);
+      }
+      const uniq = Array.from(new Set(names));
+      return uniq.length ? uniq.join(', ') : '-';
+    }
+
+    // GitRepo の polling 間隔表示:
+    //   spec.pollingInterval が未指定なら Fleet 内蔵デフォルト (15s) を
+    //   "15s (default)" と注記付きで表示する。
+    //   非常に大きな値 (87600h 等) は事実上停止扱いで、 行を薄くする
+    //   (isPollingDisabled() で判定)。
+    function pollingLabel(r) {
+      const p = r.spec?.pollingInterval;
+      if (!p) return '15s (default)';
+      if (isPollingDisabled(r)) return p + ' (manual)';
+      return p;
+    }
+
+    // polling が事実上停止しているか判定。
+    // 87600h (10 年) 以上、 または時間単位 'h' で 1000 以上を停止扱いにする。
+    // (Fleet 自体に「停止」フラグは無いため、 文字列パースで近似する)
+    function isPollingDisabled(r) {
+      const p = r.spec?.pollingInterval;
+      if (!p) return false;
+      const m = /^(\d+(?:\.\d+)?)\s*([a-z]+)$/i.exec(p);
+      if (!m) return false;
+      const n = parseFloat(m[1]);
+      const unit = m[2].toLowerCase();
+      // 1 日 (24h) 以上を停止扱いとする
+      if (unit === 'h' && n >= 24) return true;
+      if (unit === 'm' && n >= 24 * 60) return true;
+      if (unit === 's' && n >= 24 * 3600) return true;
+      return false;
+    }
+
+    onMounted(async () => {
+      await loadConfig();
+      await loadWorkspaces();
+      await refresh();
+      // 10 秒ごとに自動 refresh (反応をすぐ見せたい)
+      setInterval(refresh, 10000);
+      // 5 秒ごとに now を更新して相対時刻表示を進める
+      setInterval(() => { now.value = Date.now(); }, 5000);
+    });
+
+    return {
+      config, tabs, activeTab,
+      workspaces, workspace,
+      gitrepos, bundles, clusters,
+      filteredGitRepos, filteredBundles, filteredClusters,
+      readyPercent, recentErrors,
+      lastRefresh,
+      toasts,
+      refresh, forceSync, forceSyncBundleParent,
+      isSyncing, isSyncingBundleParent, isTransient,
+      stateOf, stateClass, readyOf, shortSha, formatTime,
+      relativeTime, gitrepoUpdatedAtRaw, bundleUpdatedAtRaw,
+      clusterDisplay, bundleRepoName, bundleCommit,
+      bundleTargetsLabel, gitrepoTargetsLabel,
+      pollingLabel, isPollingDisabled,
+    };
+  }
+}).mount('#app');
+</script>
+</body>
+</html>

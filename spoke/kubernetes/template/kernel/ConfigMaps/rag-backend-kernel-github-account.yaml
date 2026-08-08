@@ -1,0 +1,713 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-backend-kernel-github-account
+  namespace: rag-spoke
+data:
+  github_account.py: |
+    """
+    github_account.py
+    ====================================================================
+    GitHub Account Management Module
+
+    the assistant systemのユーザーごとに GitHub Personal Access Token を登録・
+    管理する。既存の /core/github/* エンドポイントが token を解決する際に
+    本モジュールの resolve_github_token() を呼び出す。
+
+    エンドポイント (prefix=/core/github-account):
+      - POST /add     ユーザーごとに GitHub アカウントを登録 (検証あり)
+      - POST /list    登録済みアカウント一覧 (token はマスク表示)
+      - POST /update  アカウント情報の部分更新 (label / default 切替 / token差し替え)
+      - POST /delete  アカウント削除
+
+    OpenSearch index:
+      - secretary_github_accounts
+        _id = {user_id}:{account_id}
+        fields:
+          user_id          (str)  アカウント所有者
+          account_id       (str)  識別子 (user_id 内で一意)
+          account_label    (str)  利用者向け表示名
+          token            (str)  PAT (平文)
+          github_login     (str)  検証時に取得
+          scopes           (list[str])  検証時に取得
+          default          (bool) 既定アカウント (user_id 内で唯一)
+          created_at       (str)  ISO8601
+          updated_at       (str)  ISO8601
+          last_used_at     (str)  ISO8601 (resolve_github_token 呼び出し時に更新)
+
+    設計方針:
+      - kernel 本体 (main.py) への依存をゼロにする。 OpenSearch / GitHub API
+        へは requests で直接アクセス (kernel と同じ流儀)。
+      - import 失敗時は警告のみで kernel 起動を妨げない (k8s_observer と同じ流儀)。
+      - index は lazy 作成 (add 時に PUT idempotent)。
+      - token は平文保存 (the operator明示の運用方針、 メールアカウントと同方針)。
+
+    resolve_github_token(user_id) の解決順:
+      1. user_id 指定あり + secretary_github_accounts に該当ユーザーの
+         default=True アカウントあり → そのユーザー token
+      2. それ以外 (未指定 / 未登録 / OpenSearch エラー)
+         → os.environ["GITHUB_TOKEN"] フォールバック
+      3. どちらも無ければ RuntimeError
+    """
+    from __future__ import annotations
+
+    import logging
+    import os
+    import re
+    from datetime import datetime, timezone
+    from typing import Any, Dict, List, Optional
+
+    from fastapi import APIRouter, HTTPException
+
+    logger = logging.getLogger(__name__)
+
+    # ── requests (遅延 import) ──
+    try:
+        import requests
+        _REQUESTS_AVAILABLE = True
+    except ImportError as _e:
+        logger.warning(f"[GITHUB_ACCOUNT] requests not available: {_e}")
+        _REQUESTS_AVAILABLE = False
+        requests = None
+
+
+    # ── 設定 ──
+    OPENSEARCH_URL = os.environ.get(
+        "OPENSEARCH_URL",
+        "http://opensearch.opensearch.svc.cluster.local:9200"
+    )
+    OS_INDEX_GITHUB_ACCOUNTS = "secretary_github_accounts"
+    GITHUB_API_BASE = "https://api.github.com"
+
+    # account_id の許容文字: 英数字 + アンダースコア + ハイフン
+    _ACCOUNT_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+    # ====================================================================
+    # OpenSearch helper (kernel と同じく requests 直叩き)
+    # ====================================================================
+
+    def _os_doc_id(user_id: str, account_id: str) -> str:
+        return f"{user_id}:{account_id}"
+
+
+    def _ensure_index() -> None:
+        """index が無ければ作成する (idempotent)。"""
+        if not _REQUESTS_AVAILABLE:
+            return
+        try:
+            resp = requests.head(
+                f"{OPENSEARCH_URL}/{OS_INDEX_GITHUB_ACCOUNTS}",
+                timeout=3,
+            )
+            if resp.status_code == 200:
+                return
+        except Exception as e:
+            logger.warning(f"[GITHUB_ACCOUNT] index HEAD failed: {e}")
+            return
+
+        # 無ければ作る
+        mapping = {
+            "settings": {
+                "number_of_shards": 1,
+                "number_of_replicas": 0,
+            },
+            "mappings": {
+                "properties": {
+                    "user_id":       {"type": "keyword"},
+                    "account_id":    {"type": "keyword"},
+                    "account_label": {"type": "keyword"},
+                    "token":         {"type": "keyword", "index": False},
+                    "github_login":  {"type": "keyword"},
+                    "scopes":        {"type": "keyword"},
+                    "default":       {"type": "boolean"},
+                    "created_at":    {"type": "date"},
+                    "updated_at":    {"type": "date"},
+                    "last_used_at":  {"type": "date"},
+                }
+            }
+        }
+        try:
+            resp = requests.put(
+                f"{OPENSEARCH_URL}/{OS_INDEX_GITHUB_ACCOUNTS}",
+                json=mapping,
+                timeout=5,
+            )
+            if resp.status_code >= 400:
+                logger.warning(
+                    f"[GITHUB_ACCOUNT] index create failed: "
+                    f"{resp.status_code} {resp.text[:200]}"
+                )
+            else:
+                logger.info(f"[GITHUB_ACCOUNT] index created: {OS_INDEX_GITHUB_ACCOUNTS}")
+        except Exception as e:
+            logger.warning(f"[GITHUB_ACCOUNT] index create error: {e}")
+
+
+    def _os_get(user_id: str, account_id: str) -> Optional[Dict[str, Any]]:
+        """1 ドキュメントを取得。 無ければ None。"""
+        if not _REQUESTS_AVAILABLE:
+            return None
+        try:
+            resp = requests.get(
+                f"{OPENSEARCH_URL}/{OS_INDEX_GITHUB_ACCOUNTS}/_doc/"
+                f"{_os_doc_id(user_id, account_id)}",
+                timeout=3,
+            )
+            if resp.status_code == 404:
+                return None
+            if resp.status_code >= 400:
+                logger.warning(
+                    f"[GITHUB_ACCOUNT] _os_get failed: "
+                    f"{resp.status_code} {resp.text[:200]}"
+                )
+                return None
+            return resp.json().get("_source")
+        except Exception as e:
+            logger.warning(f"[GITHUB_ACCOUNT] _os_get error: {e}")
+            return None
+
+
+    def _os_put(user_id: str, account_id: str, doc: Dict[str, Any]) -> bool:
+        """1 ドキュメントを upsert。"""
+        if not _REQUESTS_AVAILABLE:
+            return False
+        try:
+            resp = requests.put(
+                f"{OPENSEARCH_URL}/{OS_INDEX_GITHUB_ACCOUNTS}/_doc/"
+                f"{_os_doc_id(user_id, account_id)}?refresh=true",
+                json=doc,
+                timeout=5,
+            )
+            if resp.status_code >= 400:
+                logger.warning(
+                    f"[GITHUB_ACCOUNT] _os_put failed: "
+                    f"{resp.status_code} {resp.text[:200]}"
+                )
+                return False
+            return True
+        except Exception as e:
+            logger.warning(f"[GITHUB_ACCOUNT] _os_put error: {e}")
+            return False
+
+
+    def _os_delete(user_id: str, account_id: str) -> bool:
+        """1 ドキュメントを削除。"""
+        if not _REQUESTS_AVAILABLE:
+            return False
+        try:
+            resp = requests.delete(
+                f"{OPENSEARCH_URL}/{OS_INDEX_GITHUB_ACCOUNTS}/_doc/"
+                f"{_os_doc_id(user_id, account_id)}?refresh=true",
+                timeout=3,
+            )
+            if resp.status_code in (200, 404):
+                return True
+            logger.warning(
+                f"[GITHUB_ACCOUNT] _os_delete failed: "
+                f"{resp.status_code} {resp.text[:200]}"
+            )
+            return False
+        except Exception as e:
+            logger.warning(f"[GITHUB_ACCOUNT] _os_delete error: {e}")
+            return False
+
+
+    def _os_search_by_user(user_id: str) -> List[Dict[str, Any]]:
+        """user_id に紐づく全アカウントを返す。"""
+        if not _REQUESTS_AVAILABLE:
+            return []
+        try:
+            resp = requests.post(
+                f"{OPENSEARCH_URL}/{OS_INDEX_GITHUB_ACCOUNTS}/_search",
+                json={
+                    "query": {"term": {"user_id": user_id}},
+                    "size": 100,
+                    "sort": [{"created_at": {"order": "asc"}}],
+                },
+                timeout=5,
+            )
+            if resp.status_code >= 400:
+                if resp.status_code == 404:
+                    # index 未作成
+                    return []
+                logger.warning(
+                    f"[GITHUB_ACCOUNT] _os_search_by_user failed: "
+                    f"{resp.status_code} {resp.text[:200]}"
+                )
+                return []
+            hits = resp.json().get("hits", {}).get("hits", [])
+            return [h.get("_source", {}) for h in hits]
+        except Exception as e:
+            logger.warning(f"[GITHUB_ACCOUNT] _os_search_by_user error: {e}")
+            return []
+
+
+    def _os_find_default(user_id: str) -> Optional[Dict[str, Any]]:
+        """user_id の default=True アカウントを 1 件返す。"""
+        if not _REQUESTS_AVAILABLE:
+            return None
+        try:
+            resp = requests.post(
+                f"{OPENSEARCH_URL}/{OS_INDEX_GITHUB_ACCOUNTS}/_search",
+                json={
+                    "query": {
+                        "bool": {
+                            "filter": [
+                                {"term": {"user_id": user_id}},
+                                {"term": {"default": True}},
+                            ]
+                        }
+                    },
+                    "size": 1,
+                },
+                timeout=3,
+            )
+            if resp.status_code >= 400:
+                return None
+            hits = resp.json().get("hits", {}).get("hits", [])
+            if not hits:
+                return None
+            return hits[0].get("_source")
+        except Exception as e:
+            logger.warning(f"[GITHUB_ACCOUNT] _os_find_default error: {e}")
+            return None
+
+
+    def _os_clear_default_flag(user_id: str, except_account_id: str) -> None:
+        """user_id の他アカウントの default=True を一括で False に更新する。
+        except_account_id で指定したアカウントは対象外。
+        """
+        if not _REQUESTS_AVAILABLE:
+            return
+        try:
+            resp = requests.post(
+                f"{OPENSEARCH_URL}/{OS_INDEX_GITHUB_ACCOUNTS}"
+                f"/_update_by_query?refresh=true",
+                json={
+                    "query": {
+                        "bool": {
+                            "filter": [
+                                {"term": {"user_id": user_id}},
+                                {"term": {"default": True}},
+                            ],
+                            "must_not": [
+                                {"term": {"account_id": except_account_id}},
+                            ],
+                        }
+                    },
+                    "script": {
+                        "source": "ctx._source.default = false; "
+                                  "ctx._source.updated_at = params.now;",
+                        "lang": "painless",
+                        "params": {"now": _now_iso()},
+                    },
+                },
+                timeout=5,
+            )
+            if resp.status_code >= 400:
+                logger.warning(
+                    f"[GITHUB_ACCOUNT] _os_clear_default_flag failed: "
+                    f"{resp.status_code} {resp.text[:200]}"
+                )
+        except Exception as e:
+            logger.warning(f"[GITHUB_ACCOUNT] _os_clear_default_flag error: {e}")
+
+
+    def _os_touch_last_used(user_id: str, account_id: str) -> None:
+        """last_used_at だけを更新する (fire-and-forget)。"""
+        if not _REQUESTS_AVAILABLE:
+            return
+        try:
+            requests.post(
+                f"{OPENSEARCH_URL}/{OS_INDEX_GITHUB_ACCOUNTS}/_update/"
+                f"{_os_doc_id(user_id, account_id)}",
+                json={"doc": {"last_used_at": _now_iso()}},
+                timeout=2,
+            )
+        except Exception as e:
+            # last_used 更新は失敗しても処理続行
+            logger.debug(f"[GITHUB_ACCOUNT] _os_touch_last_used error: {e}")
+
+
+    # ====================================================================
+    # GitHub API helper
+    # ====================================================================
+
+    def _verify_github_token(token: str) -> Dict[str, Any]:
+        """GitHub API /user を叩いて token を検証する。
+        成功時: {"ok": True, "login": "...", "scopes": ["repo", ...]}
+        失敗時: {"ok": False, "error": "..."}
+        """
+        if not _REQUESTS_AVAILABLE:
+            return {"ok": False, "error": "requests library not available"}
+        try:
+            resp = requests.get(
+                f"{GITHUB_API_BASE}/user",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+                timeout=10,
+            )
+            if resp.status_code == 401:
+                return {"ok": False, "error": "token is invalid (401 Unauthorized)"}
+            if resp.status_code >= 400:
+                return {
+                    "ok": False,
+                    "error": f"GitHub API returned {resp.status_code}: "
+                             f"{resp.text[:200]}",
+                }
+            data = resp.json()
+            login = data.get("login", "")
+            scopes_header = resp.headers.get("X-OAuth-Scopes", "")
+            scopes = [s.strip() for s in scopes_header.split(",") if s.strip()]
+            return {"ok": True, "login": login, "scopes": scopes}
+        except Exception as e:
+            return {"ok": False, "error": f"verification error: {e}"}
+
+
+    # ====================================================================
+    # 公開ヘルパー: resolve_github_token
+    # ====================================================================
+
+    def resolve_github_token(user_id: Optional[str] = None) -> str:
+        """user_id に紐づく GitHub token を返す。
+
+        解決順:
+          1. user_id 指定あり + secretary_github_accounts に default=True
+             アカウントあり → そのユーザー token
+          2. それ以外 → os.environ["GITHUB_TOKEN"] フォールバック
+          3. どちらも無ければ RuntimeError
+
+        Args:
+            user_id: the assistant systemの利用者 ID (None / 空文字なら 2. に直行)
+
+        Returns:
+            GitHub Personal Access Token (str)
+
+        Raises:
+            RuntimeError: token が見つからない場合
+        """
+        # 1. ユーザー別 token を試す
+        if user_id:
+            acct = _os_find_default(user_id)
+            if acct and acct.get("token"):
+                # last_used_at を非同期で更新したいが、ここは同期で叩く
+                # (失敗しても処理続行)
+                _os_touch_last_used(user_id, acct.get("account_id", ""))
+                return acct["token"]
+
+        # 2. システム共通 token フォールバック
+        env_token = os.environ.get("GITHUB_TOKEN")
+        if env_token:
+            return env_token
+
+        # 3. どちらも無い
+        raise RuntimeError(
+            "GitHub token not available: "
+            "neither user-specific token nor GITHUB_TOKEN environment is set"
+        )
+
+
+    # ====================================================================
+    # token 表示用マスク
+    # ====================================================================
+
+    def _mask_token(token: str) -> str:
+        """token を先頭 4 文字 + アスタリスク + 末尾 4 文字に整形して返す。
+        長さが 8 以下なら全アスタリスク。
+        """
+        if not token:
+            return ""
+        if len(token) <= 8:
+            return "*" * len(token)
+        return f"{token[:4]}{'*' * (len(token) - 8)}{token[-4:]}"
+
+
+    # ====================================================================
+    # 共通バリデーション
+    # ====================================================================
+
+    def _now_iso() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+
+    def _validate_account_id(account_id: str) -> None:
+        if not account_id:
+            raise HTTPException(status_code=400, detail="account_id is required")
+        if not _ACCOUNT_ID_RE.match(account_id):
+            raise HTTPException(
+                status_code=400,
+                detail="account_id must match [A-Za-z0-9_-]+",
+            )
+
+
+    # ====================================================================
+    # FastAPI Router
+    # ====================================================================
+
+    router = APIRouter(prefix="/core/github-account", tags=["github-account"])
+
+
+    @router.post("/add")
+    async def add_github_account(request: dict) -> Dict[str, Any]:
+        """GitHub アカウントを新規登録する。
+
+        token を GitHub API /user で検証してから保存する。
+        同一 (user_id, account_id) が既に存在する場合は 409。
+        既存アカウントが無ければ default=True で保存。
+        既存アカウントがある状態で default=True 指定なら他をすべて False に更新。
+        """
+        user_id = (request.get("user_id") or "").strip()
+        account_id = (request.get("account_id") or "").strip()
+        account_label = (request.get("account_label") or "").strip() or account_id
+        token = (request.get("token") or "").strip()
+        is_default = bool(request.get("default", False))
+
+        if not user_id:
+            raise HTTPException(status_code=400, detail="user_id is required")
+        _validate_account_id(account_id)
+        if not token:
+            raise HTTPException(status_code=400, detail="token is required")
+
+        _ensure_index()
+
+        # 重複チェック
+        if _os_get(user_id, account_id) is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"account already exists: {user_id}:{account_id}",
+            )
+
+        # token 検証
+        verify = _verify_github_token(token)
+        if not verify.get("ok"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"token verification failed: {verify.get('error')}",
+            )
+
+        # 既存アカウントが無ければ強制的に default=True
+        existing = _os_search_by_user(user_id)
+        if not existing:
+            is_default = True
+
+        now = _now_iso()
+        doc = {
+            "user_id":       user_id,
+            "account_id":    account_id,
+            "account_label": account_label,
+            "token":         token,
+            "github_login":  verify.get("login", ""),
+            "scopes":        verify.get("scopes", []),
+            "default":       is_default,
+            "created_at":    now,
+            "updated_at":    now,
+            "last_used_at":  None,
+        }
+
+        if not _os_put(user_id, account_id, doc):
+            raise HTTPException(
+                status_code=500,
+                detail="failed to save account to OpenSearch",
+            )
+
+        # default=True なら他を False に
+        if is_default:
+            _os_clear_default_flag(user_id, account_id)
+
+        return {
+            "ok": True,
+            "user_id": user_id,
+            "account_id": account_id,
+            "account_label": account_label,
+            "github_login": verify.get("login", ""),
+            "scopes": verify.get("scopes", []),
+            "default": is_default,
+            "created_at": now,
+        }
+
+
+    @router.post("/list")
+    async def list_github_account(request: dict) -> Dict[str, Any]:
+        """指定 user_id の登録済みアカウント一覧を返す。 token はマスク表示。"""
+        user_id = (request.get("user_id") or "").strip()
+        if not user_id:
+            raise HTTPException(status_code=400, detail="user_id is required")
+
+        accounts = _os_search_by_user(user_id)
+        items = []
+        for a in accounts:
+            items.append({
+                "user_id":       a.get("user_id"),
+                "account_id":    a.get("account_id"),
+                "account_label": a.get("account_label"),
+                "token_masked":  _mask_token(a.get("token", "")),
+                "github_login":  a.get("github_login"),
+                "scopes":        a.get("scopes", []),
+                "default":       a.get("default", False),
+                "created_at":    a.get("created_at"),
+                "updated_at":    a.get("updated_at"),
+                "last_used_at":  a.get("last_used_at"),
+            })
+        return {"ok": True, "accounts": items, "count": len(items)}
+
+
+    @router.post("/update")
+    async def update_github_account(request: dict) -> Dict[str, Any]:
+        """既存アカウントの部分更新。
+
+        指定可能フィールド:
+          - account_label (str)
+          - token (str): 指定があれば再検証してから差し替え
+          - default (bool): True にすれば他を False に
+        空文字や未指定のフィールドは更新しない。
+        """
+        user_id = (request.get("user_id") or "").strip()
+        account_id = (request.get("account_id") or "").strip()
+        if not user_id:
+            raise HTTPException(status_code=400, detail="user_id is required")
+        _validate_account_id(account_id)
+
+        existing = _os_get(user_id, account_id)
+        if existing is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"account not found: {user_id}:{account_id}",
+            )
+
+        updated = dict(existing)
+        changed = False
+
+        # account_label
+        new_label = request.get("account_label")
+        if isinstance(new_label, str) and new_label.strip():
+            updated["account_label"] = new_label.strip()
+            changed = True
+
+        # token (差し替え時は必ず再検証)
+        new_token = request.get("token")
+        if isinstance(new_token, str) and new_token.strip():
+            verify = _verify_github_token(new_token.strip())
+            if not verify.get("ok"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"token verification failed: {verify.get('error')}",
+                )
+            updated["token"] = new_token.strip()
+            updated["github_login"] = verify.get("login", "")
+            updated["scopes"] = verify.get("scopes", [])
+            changed = True
+
+        # default
+        set_default = request.get("default", None)
+        will_be_default = False
+        if isinstance(set_default, bool):
+            updated["default"] = set_default
+            will_be_default = set_default
+            changed = True
+
+        if not changed:
+            raise HTTPException(
+                status_code=400,
+                detail="no updatable fields provided",
+            )
+
+        updated["updated_at"] = _now_iso()
+
+        if not _os_put(user_id, account_id, updated):
+            raise HTTPException(
+                status_code=500,
+                detail="failed to update account in OpenSearch",
+            )
+
+        # default=True に切り替えた場合は他を False に
+        if will_be_default:
+            _os_clear_default_flag(user_id, account_id)
+
+        return {
+            "ok": True,
+            "user_id": user_id,
+            "account_id": account_id,
+            "account_label": updated.get("account_label"),
+            "github_login": updated.get("github_login"),
+            "scopes": updated.get("scopes", []),
+            "default": updated.get("default", False),
+            "updated_at": updated.get("updated_at"),
+        }
+
+
+    @router.post("/delete")
+    async def delete_github_account(request: dict) -> Dict[str, Any]:
+        """アカウントを削除する。
+
+        削除対象が default=True だった場合、 残ったアカウントのうち
+        最も古いものを自動的に default=True に昇格させる。
+        """
+        user_id = (request.get("user_id") or "").strip()
+        account_id = (request.get("account_id") or "").strip()
+        if not user_id:
+            raise HTTPException(status_code=400, detail="user_id is required")
+        _validate_account_id(account_id)
+
+        existing = _os_get(user_id, account_id)
+        if existing is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"account not found: {user_id}:{account_id}",
+            )
+
+        was_default = bool(existing.get("default", False))
+
+        if not _os_delete(user_id, account_id):
+            raise HTTPException(
+                status_code=500,
+                detail="failed to delete account from OpenSearch",
+            )
+
+        # default アカウントを削除したら残りの最古を昇格
+        promoted_account_id = None
+        if was_default:
+            remaining = _os_search_by_user(user_id)
+            if remaining:
+                # _os_search_by_user は created_at asc で返るので先頭が最古
+                oldest = remaining[0]
+                promoted_account_id = oldest.get("account_id")
+                if promoted_account_id:
+                    oldest["default"] = True
+                    oldest["updated_at"] = _now_iso()
+                    _os_put(user_id, promoted_account_id, oldest)
+
+        return {
+            "ok": True,
+            "user_id": user_id,
+            "account_id": account_id,
+            "deleted": True,
+            "was_default": was_default,
+            "promoted_account_id": promoted_account_id,
+        }
+
+
+    @router.get("/health")
+    async def health() -> Dict[str, Any]:
+        """github-account モジュール自身の health check。"""
+        os_status = "unknown"
+        if _REQUESTS_AVAILABLE:
+            try:
+                resp = requests.get(
+                    f"{OPENSEARCH_URL}/_cluster/health",
+                    timeout=2,
+                )
+                os_status = "ok" if resp.status_code == 200 else f"http_{resp.status_code}"
+            except Exception as e:
+                os_status = f"error: {type(e).__name__}"
+        return {
+            "ok": True,
+            "module": "github_account",
+            "requests_available": _REQUESTS_AVAILABLE,
+            "opensearch": os_status,
+            "index": OS_INDEX_GITHUB_ACCOUNTS,
+            "github_token_env_set": bool(os.environ.get("GITHUB_TOKEN")),
+        }

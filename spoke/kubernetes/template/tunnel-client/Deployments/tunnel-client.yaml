@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tunnel-client
+  namespace: rag-spoke
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: tunnel-client
+  strategy:
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: tunnel-client
+      annotations:
+        restarted-at: "2026-06-03T02:00:00Z"
+    spec:
+      containers:
+        - name: tunnel-client
+          image: ghcr.io/openspoke/openspoke-tunnel-client:v0.1.0
+          imagePullPolicy: IfNotPresent
+          env:
+            # hub_url / target / insecure are identical across every spoke
+            # (they live in the tunnel-client-config ConfigMap).
+            # spoke_id and token are per-spoke and live in the Secret.
+            - name: HUB_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: tunnel-client-config
+                  key: hub_url
+            - name: SPOKE_ID
+              valueFrom:
+                secretKeyRef:
+                  name: tunnel-client-secret
+                  key: spoke_id
+            - name: TARGET
+              valueFrom:
+                configMapKeyRef:
+                  name: tunnel-client-config
+                  key: target
+            - name: TUNNEL_INSECURE
+              valueFrom:
+                configMapKeyRef:
+                  name: tunnel-client-config
+                  key: insecure
+                  optional: true
+            # Phase 1 (this release): pre-shared token.
+            # Phase 3 will replace this with the spoke's Ed25519 private key.
+            - name: TUNNEL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: tunnel-client-secret
+                  key: token
+          resources:
+            limits:
+              cpu: 500m
+              memory: 128Mi
+            requests:
+              cpu: 20m
+              memory: 32Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30

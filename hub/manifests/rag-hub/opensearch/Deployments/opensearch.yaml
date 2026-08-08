@@ -1,0 +1,334 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opensearch
+  namespace: opensearch
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: opensearch
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: opensearch
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nodetype
+                    operator: In
+                    values:
+                      - database
+      containers:
+        - command:
+            - bash
+            - '-c'
+            - >
+              # plugin はデフォルト image に含まれないので毎回 install (これまでと同じ運用)
+
+              if ! /usr/share/opensearch/bin/opensearch-plugin list | grep -q
+              analysis-kuromoji; then
+                /usr/share/opensearch/bin/opensearch-plugin install --batch analysis-kuromoji
+              fi
+
+              # repository-s3 (MinIO snapshot 用) も install
+
+              if ! /usr/share/opensearch/bin/opensearch-plugin list | grep -q
+              repository-s3; then
+                /usr/share/opensearch/bin/opensearch-plugin install --batch repository-s3
+              fi
+
+              # initContainer が用意した keystore (MinIO 認証情報入り) を読み込む
+
+              if [ -f /shared-config/opensearch.keystore ]; then
+                cp /shared-config/opensearch.keystore /usr/share/opensearch/config/opensearch.keystore
+                echo "Loaded opensearch.keystore from shared config"
+              fi
+
+              # initContainer が用意した opensearch.yml (MinIO の S3 endpoint 設定)
+              を読み込む
+
+              if [ -f /shared-config/opensearch.yml ]; then
+                cp /shared-config/opensearch.yml /usr/share/opensearch/config/opensearch.yml
+                echo "Loaded opensearch.yml from shared config"
+              fi
+
+
+              # バックグラウンドでインデックス作成（OpenSearch起動後に実行）
+
+              (
+                echo "Waiting for OpenSearch to start for index creation..."
+                for i in $(seq 1 60); do
+                  if curl -sf http://localhost:9200/_cluster/health > /dev/null 2>&1; then
+                    break
+                  fi
+                  sleep 5
+                done
+                if curl -sf http://localhost:9200/rag_chunks > /dev/null 2>&1; then
+                  echo "Index rag_chunks already exists"
+                else
+                  echo "Creating rag_chunks index with kuromoji analyzer..."
+                  curl -X PUT http://localhost:9200/rag_chunks \
+                    -H 'Content-Type: application/json' \
+                    -d '{
+                      "settings": {
+                        "analysis": {
+                          "analyzer": {
+                            "kuromoji_analyzer": {
+                              "type": "custom",
+                              "tokenizer": "kuromoji_tokenizer",
+                              "filter": ["kuromoji_baseform","kuromoji_part_of_speech","cjk_width","lowercase"]
+                            }
+                          }
+                        },
+                        "number_of_shards": 1,
+                        "number_of_replicas": 0
+                      },
+                      "mappings": {
+                        "properties": {
+                          "text": {"type": "text", "analyzer": "kuromoji_analyzer"},
+                          "tenant": {"type": "keyword"},
+                          "user_id": {"type": "keyword"},
+                          "doc_id": {"type": "keyword"},
+                          "source": {"type": "keyword"},
+                          "created_at": {"type": "date"}
+                        }
+                      }
+                    }'
+                  echo ""
+                  echo "Index created"
+                fi
+
+                # snapshot repository (MinIO への保存先) 登録 (冪等)
+                if curl -sf http://localhost:9200/_snapshot/minio_repo > /dev/null 2>&1; then
+                  echo "Snapshot repo minio_repo already registered"
+                else
+                  echo "Registering snapshot repo minio_repo..."
+                  curl -X PUT http://localhost:9200/_snapshot/minio_repo \
+                    -H 'Content-Type: application/json' \
+                    -d '{
+                      "type": "s3",
+                      "settings": {
+                        "bucket": "opensearch-snapshots",
+                        "endpoint": "minio.milvus.svc.cluster.local:9000",
+                        "protocol": "http",
+                        "path_style_access": true,
+                        "region": "us-east-1"
+                      }
+                    }'
+                  echo ""
+                  echo "Snapshot repo registered"
+                fi
+              ) &
+
+
+              echo "Starting OpenSearch..."
+
+              /usr/share/opensearch/opensearch-docker-entrypoint.sh opensearch
+          env:
+            - name: discovery.type
+              value: single-node
+            - name: DISABLE_SECURITY_PLUGIN
+              value: 'true'
+            - name: OPENSEARCH_JAVA_OPTS
+              value: '-Xms512m -Xmx512m'
+            - name: cluster.name
+              value: rag-opensearch
+            - name: node.name
+              value: opensearch-node1
+            - name: bootstrap.memory_lock
+              value: 'false'
+          image: opensearchproject/opensearch:2.18.0
+          imagePullPolicy: IfNotPresent
+          livenessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /_cluster/health
+              port: 9200
+              scheme: HTTP
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            successThreshold: 1
+            timeoutSeconds: 5
+          name: opensearch
+          ports:
+            - containerPort: 9200
+              name: http
+              protocol: TCP
+            - containerPort: 9300
+              name: transport
+              protocol: TCP
+          readinessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /_cluster/health
+              port: 9200
+              scheme: HTTP
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 5
+          resources:
+            limits:
+              cpu: '2'
+              memory: 1536Mi
+            requests:
+              cpu: 200m
+              memory: 768Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+            - mountPath: /usr/share/opensearch/data
+              name: opensearch-data
+              subPath: data
+            - mountPath: /shared-config
+              name: shared-config
+      dnsPolicy: ClusterFirst
+      initContainers:
+        - command:
+            - bash
+            - '-c'
+            - >
+              # 1. analysis-kuromoji (日本語形態素解析、 既存)
+
+              if /usr/share/opensearch/bin/opensearch-plugin list | grep -q
+              analysis-kuromoji; then
+                echo "analysis-kuromoji already installed"
+              else
+                echo "Installing analysis-kuromoji plugin..."
+                /usr/share/opensearch/bin/opensearch-plugin install --batch analysis-kuromoji
+                echo "Plugin installed successfully"
+              fi
+
+              cp -r /usr/share/opensearch/plugins/opensearch-analysis-kuromoji
+              /data/plugins-kuromoji 2>/dev/null || true
+
+              # 2. repository-s3 (MinIO への snapshot 保存用)
+
+              if /usr/share/opensearch/bin/opensearch-plugin list | grep -q
+              repository-s3; then
+                echo "repository-s3 already installed"
+              else
+                echo "Installing repository-s3 plugin..."
+                /usr/share/opensearch/bin/opensearch-plugin install --batch repository-s3
+                echo "Plugin installed successfully"
+              fi
+
+              cp -r /usr/share/opensearch/plugins/repository-s3
+              /data/plugins-repository-s3 2>/dev/null || true
+
+              # 3. opensearch.keystore に MinIO 認証情報を投入し、 emptyDir 経由で main
+              container に渡す
+
+              echo "Creating opensearch.keystore with MinIO credentials..."
+
+              /usr/share/opensearch/bin/opensearch-keystore create
+
+              echo -n "minioadmin" |
+              /usr/share/opensearch/bin/opensearch-keystore add --force --stdin
+              s3.client.default.access_key
+
+              echo -n "minioadminpassword" |
+              /usr/share/opensearch/bin/opensearch-keystore add --force --stdin
+              s3.client.default.secret_key
+
+              cp /usr/share/opensearch/config/opensearch.keystore
+              /shared-config/opensearch.keystore
+
+              echo "Keystore saved to shared config"
+
+              # 4. opensearch.yml に S3 endpoint 設定 (MinIO 接続用) を書き出す
+
+              # s3.client.default.{endpoint,protocol,path_style_access} は
+              keystore ではなく
+
+              # opensearch.yml に書く必要がある (公式仕様)。
+
+              # MinIO は path-style access 必須 (バケット名がサブドメインにならない)。
+
+              # region は MinIO では実質無視されるが、 AWS SDK v2 が必須項目として要求するためダミーを設定。
+
+              cat > /shared-config/opensearch.yml <<EOF
+
+              cluster.name: rag-opensearch
+
+              node.name: opensearch-node1
+
+              discovery.type: single-node
+
+              plugins.security.disabled: true
+
+              network.host: 0.0.0.0
+
+              # MinIO への snapshot 保存用 S3 client 設定
+
+              s3.client.default.endpoint: minio.milvus.svc.cluster.local:9000
+
+              s3.client.default.protocol: http
+
+              s3.client.default.path_style_access: true
+
+              s3.client.default.region: us-east-1
+
+              EOF
+
+              echo "opensearch.yml saved to shared config"
+          image: opensearchproject/opensearch:2.18.0
+          imagePullPolicy: IfNotPresent
+          name: install-plugins
+          resources: {}
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+            - mountPath: /data
+              name: opensearch-data
+            - mountPath: /shared-config
+              name: shared-config
+        - command:
+            - sh
+            - '-c'
+            - |
+              chown -R 1000:1000 /data
+          image: busybox:1.36
+          imagePullPolicy: IfNotPresent
+          name: fix-permissions
+          resources: {}
+          securityContext:
+            runAsUser: 0
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+            - mountPath: /data
+              name: opensearch-data
+        - command:
+            - sh
+            - '-c'
+            - |
+              # MinIO bucket (snapshot 保存先) を冪等に作成
+              # mc は alias 登録のみで mb は --ignore-existing で 2 回目以降 no-op
+              mc alias set local http://minio.milvus.svc.cluster.local:9000 minioadmin minioadminpassword
+              mc mb --ignore-existing local/opensearch-snapshots
+              echo "Bucket opensearch-snapshots ensured"
+          image: minio/mc:latest
+          imagePullPolicy: IfNotPresent
+          name: minio-bucket-ensure
+          resources: {}
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
+      volumes:
+        - name: opensearch-data
+          persistentVolumeClaim:
+            claimName: opensearch-data
+        - emptyDir: {}
+          name: shared-config

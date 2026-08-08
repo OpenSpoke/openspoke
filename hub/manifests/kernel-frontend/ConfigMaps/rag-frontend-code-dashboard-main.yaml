@@ -1,0 +1,157 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-frontend-code-dashboard-main
+  namespace: rag-company1
+data:
+  .streamlit-config.toml: |
+    [theme]
+    base = "light"
+
+    [server]
+    headless = true
+
+  app.py: |
+    """OpenSpoke — Hub & Spoke + Fleet ダッシュボード エントリポイント.
+
+    sidebar の view 切替で view_topology / view_fleet / view_nodes を呼ぶ。
+    各 view は別 ConfigMap (rag-frontend-code-dashboard-*) として配布。
+
+    URL routing:
+      ?view=topology  → Hub & Spoke Topology
+      ?view=fleet     → Fleet GitOps
+      ?view=nodes     → Node Inventory
+
+    ビュー切替時の挙動:
+      Streamlit の差分更新は前ビューの widget (特に components.html iframe や
+      st.table) を DOM に残すことがある。 これを避けるため、 ビュー変更検知時に
+      meta refresh で full reload する (手動リロード相当)。 URL を真として
+      radio との不一致を検出する。
+    """
+    import streamlit as st
+
+    import view_topology
+    import view_fleet
+    import view_nodes
+    import view_clusters
+    import view_modules
+    import view_users
+    import user_scope
+
+    st.set_page_config(
+        page_title="OpenSpoke",
+        layout="wide",
+    )
+
+    # URL <-> ビュー表示名のマッピング (admin だけが Users を見られる)
+    URL_TO_VIEW_FULL = {
+        "topology": "Spokes",
+        "fleet":    "Fleet",
+        "clusters": "Clusters",
+        "nodes":    "Nodes",
+        "modules":  "Modules",
+        "users":    "Users",
+    }
+    # 現在のユーザーのスコープを計算 (これより前に view_X.render() を呼ぶ場合は
+    # その render() 内でも user_scope.get_current_scope() を呼ぶこと)
+    _scope = user_scope.get_current_scope()
+
+    if _scope.get("is_admin"):
+        URL_TO_VIEW = URL_TO_VIEW_FULL
+    else:
+        URL_TO_VIEW = {k: v for k, v in URL_TO_VIEW_FULL.items() if k != "users"}
+    VIEW_TO_URL = {v: k for k, v in URL_TO_VIEW.items()}
+    ALL_VIEWS = list(URL_TO_VIEW.values())
+
+    # URL から現在のビューを取得 (デフォルトは topology)
+    url_view = st.query_params.get("view", "topology")
+    default_view = URL_TO_VIEW.get(url_view, ALL_VIEWS[0])
+
+    st.sidebar.title("OpenSpoke")
+
+    # --- ログイン中アカウントと ログアウト リンク ---
+    # oauth2-proxy が --set-xauthrequest=true で注入する HTTP ヘッダを読む。
+    # Streamlit のバージョン / 接続経路によって header 取得が失敗しても落ちないように
+    # try/except で防御。 case-insensitive 比較で複数候補をフォールバック。
+    def _read_login_identity():
+        try:
+            headers = dict(st.context.headers)
+        except Exception:
+            return {}, "", ""
+        lower_map = {k.lower(): v for k, v in headers.items()}
+        def _get(*names):
+            for n in names:
+                v = lower_map.get(n.lower(), "") or ""
+                if v:
+                    return v
+            return ""
+        email = _get(
+            "X-Auth-Request-Email",
+            "X-Forwarded-Email",
+            "X-Auth-Email",
+        )
+        user = _get(
+            "X-Forwarded-Preferred-Username",
+            "X-Auth-Request-Preferred-Username",
+            "X-Forwarded-Email",
+            "X-Auth-Request-Email",
+            "X-Forwarded-User",
+            "X-Auth-Request-User",
+            "X-Auth-User",
+        )
+        return headers, user, email
+
+    _login_headers, _login_user, _login_email = _read_login_identity()
+    if _login_user or _login_email:
+        if _login_user:
+            st.sidebar.markdown(f"👤 **{_login_user}**")
+        if _login_email and _login_email.lower() != (_login_user or "").lower():
+            st.sidebar.caption(_login_email)
+    else:
+        st.sidebar.caption("👤 (login info 未取得)")
+
+    st.sidebar.markdown("---")
+
+    view = st.sidebar.radio(
+        "ビュー",
+        ALL_VIEWS,
+        index=ALL_VIEWS.index(default_view),
+        key="view_selector",
+    )
+
+    # radio の選択と URL が一致しない場合は full reload を強制する.
+    # Streamlit の通常 rerun では前ビューの widget が DOM に残るため.
+    selected_url = VIEW_TO_URL[view]
+    if selected_url != url_view:
+        st.markdown(
+            f'<meta http-equiv="refresh" content="0; url=?view={selected_url}">',
+            unsafe_allow_html=True,
+        )
+        st.stop()
+
+    st.sidebar.markdown("---")
+
+    user_scope.render_scope_banner(_scope, on="sidebar")
+    st.sidebar.markdown("---")
+
+    # ログアウト: oauth2-proxy の cookie だけクリア (OpenSpoke だけのログアウト).
+    # Keycloak SSO はそのまま残るので、 直後に再アクセスすると
+    # 自動的に同じ identity でログインし直されます。
+    # アカウント切り替えや role 変更反映が必要な場合は、 別途 Keycloak の
+    # logout (https://keycloak.example.com/realms/rag/protocol/openid-connect/logout)
+    # を経由してください。
+    _logout_url = "/oauth2/sign_out"
+    st.sidebar.markdown(f"[🚪 ログアウト]({_logout_url})")
+
+    if view == "Spokes":
+        view_topology.render()
+    elif view == "Fleet":
+        view_fleet.render()
+    elif view == "Clusters":
+        view_clusters.render()
+    elif view == "Nodes":
+        view_nodes.render()
+    elif view == "Modules":
+        view_modules.render()
+    elif view == "Users":
+        view_users.render()

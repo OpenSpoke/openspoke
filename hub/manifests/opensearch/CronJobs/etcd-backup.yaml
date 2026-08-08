@@ -1,0 +1,129 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: etcd-backup
+  namespace: milvus
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: etcd-backup
+  namespace: milvus
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: etcd-backup
+  namespace: milvus
+subjects:
+  - kind: ServiceAccount
+    name: etcd-backup
+    namespace: milvus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: etcd-backup
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: etcd-backup
+  namespace: milvus
+spec:
+  # Phase 0: 直接 EFS への書き込みを廃止し、 MinIO バケットに集約。
+  # minio-mirror (19:30 UTC) が後段で EFS にミラー。
+  schedule: "30 18 * * *"
+  startingDeadlineSeconds: 600
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          serviceAccountName: etcd-backup
+          restartPolicy: OnFailure
+          terminationGracePeriodSeconds: 30
+          containers:
+            - name: backup
+              image: alpine/k8s:1.33.0
+              imagePullPolicy: IfNotPresent
+              env:
+                - name: NS
+                  value: milvus
+                - name: BUCKET
+                  value: "etcd-backups"
+                - name: MC_HOST_dst
+                  value: "http://minioadmin:minioadminpassword@minio.milvus.svc.cluster.local:9000"
+              command:
+                - sh
+                - -c
+                - |
+                  set -e
+                  TS=$(date -u +%Y%m%d-%H%M%S)
+                  echo "[$(date -u +%FT%TZ)] Starting etcd backup ts=${TS}"
+
+                  # mc が無ければ install
+                  if ! command -v mc >/dev/null 2>&1; then
+                    command -v curl >/dev/null 2>&1 || apk add --no-cache curl
+                    curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc
+                    chmod +x /usr/local/bin/mc
+                  fi
+
+                  # バケット作成 (idempotent)
+                  mc mb --ignore-existing "dst/${BUCKET}"
+
+                  ETCD_POD=$(kubectl -n "${NS}" get pod -l app.kubernetes.io/name=etcd \
+                    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+                  if [ -z "${ETCD_POD}" ]; then
+                    ETCD_POD=$(kubectl -n "${NS}" get pod \
+                      -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' \
+                      | grep -E '^etcd-' | head -1 || true)
+                  fi
+                  if [ -z "${ETCD_POD}" ]; then
+                    echo "[$(date -u +%FT%TZ)] ERROR: etcd pod not found"
+                    exit 1
+                  fi
+                  echo "[$(date -u +%FT%TZ)] Target pod: ${ETCD_POD}"
+
+                  REMOTE_SNAP="/tmp/etcd-snapshot-${TS}.db"
+                  LOCAL_SNAP="/tmp/etcd-snapshot-${TS}.db"
+
+                  # etcd pod 内でスナップショット作成
+                  kubectl -n "${NS}" exec "${ETCD_POD}" -- sh -c \
+                    "ETCDCTL_API=3 etcdctl --endpoints=http://127.0.0.1:2379 snapshot save ${REMOTE_SNAP}"
+
+                  # ローカルに取得
+                  kubectl -n "${NS}" cp "${ETCD_POD}:${REMOTE_SNAP}" "${LOCAL_SNAP}"
+
+                  # etcd pod 内の一時ファイル削除
+                  kubectl -n "${NS}" exec "${ETCD_POD}" -- rm -f "${REMOTE_SNAP}" || true
+
+                  # MinIO に upload
+                  echo "[$(date -u +%FT%TZ)] Uploading to MinIO bucket: ${BUCKET}"
+                  mc cp "${LOCAL_SNAP}" "dst/${BUCKET}/etcd-snapshot-${TS}.db"
+
+                  # ローカルクリーンアップ
+                  rm -f "${LOCAL_SNAP}"
+
+                  # 30 日より古いスナップショットを削除
+                  mc rm --recursive --force --older-than 30d "dst/${BUCKET}/" 2>/dev/null || true
+
+                  echo "[$(date -u +%FT%TZ)] Current bucket contents:"
+                  mc ls "dst/${BUCKET}/" | tail -10
+                  echo "[$(date -u +%FT%TZ)] Done"
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi

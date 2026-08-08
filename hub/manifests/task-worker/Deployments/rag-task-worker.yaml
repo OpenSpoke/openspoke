@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-task-worker
+  namespace: rag-company1
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app: rag-task-worker
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: rag-task-worker
+      annotations:
+        restarted-at: "2026-06-03T02:00:00Z"
+    spec:
+      containers:
+        - name: worker
+          image: python:3.12-slim
+          imagePullPolicy: IfNotPresent
+          command:
+            - bash
+            - "-c"
+            - |
+              set -e
+              echo "[bootstrap] installing runtime deps..."
+              pip install --no-cache-dir --quiet \
+                redis==5.0.1 \
+                fastapi==0.115.0 \
+                uvicorn==0.30.6 \
+                anthropic==0.45.0
+              echo "[bootstrap] starting worker..."
+              exec python3 /app/main.py
+          env:
+            - name: KV_VALKEY_HOST
+              value: valkey.valkey.svc.cluster.local
+            - name: KV_VALKEY_PORT
+              value: "6379"
+            - name: TASK_STATE_TTL_SEC
+              value: "604800"
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: anthropic-api-key
+                  key: api-key
+                  optional: true
+            - name: MCP_SERVER_URL
+              value: http://mcp-company1.mcp.svc.cluster.local:8000/sse
+          ports:
+            - containerPort: 8000
+              name: http
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 3
+          volumeMounts:
+            - name: code
+              mountPath: /app
+              readOnly: true
+      volumes:
+        - name: code
+          configMap:
+            name: rag-task-worker
+            defaultMode: 420

@@ -1,0 +1,411 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcp-github-checkpoint
+  namespace: mcp
+data:
+  github_checkpoint.py: |
+    """
+    GitHub checkpoint / restore ツール (Phase A)。
+
+    大きなファイルを編集する前に lightweight tag を打って、 もし編集が
+    壊れたらその tag に戻せるようにする。 GitOps 配下なので reset ではなく
+    forward commit 方式 (履歴は消さない)。
+
+    mcp_server.py から register_github_checkpoint_tools(mcp, ensure_kernel_url)
+    で登録する。
+
+    typing.Dict / List / Optional は使わない (mcp_server.py と同じ規約。
+    builtin dict / list / "X | None" を使う)。
+    """
+
+    import httpx as _httpx
+
+
+    _TAG_PREFIX = "checkpoint/claude/"
+
+
+    def _tag_name(label):
+        """label から完全な tag 名を組み立てる。
+        label がすでに prefix を含んでいればそのまま使う。
+        """
+        label = (label or "").strip()
+        if label.startswith(_TAG_PREFIX):
+            return label
+        return _TAG_PREFIX + label
+
+
+    def register_github_checkpoint_tools(mcp, ensure_kernel_url):
+        """GitHub checkpoint 系ツールを mcp に登録する。
+
+        Args:
+            mcp: FastMCP インスタンス
+            ensure_kernel_url: () -> str。 KERNEL_URL を検証して返す関数。
+        """
+
+        async def _post(kernel, endpoint, body):
+            async with _httpx.AsyncClient(timeout=180.0) as client:
+                r = await client.post(kernel + endpoint, json=body)
+            r.raise_for_status()
+            return r.json()
+
+        @mcp.tool()
+        async def github_checkpoint_create(
+            owner: str,
+            repo: str,
+            label: str,
+            ref: str = "",
+            user_id: str = "",
+        ) -> str:
+            """指定 branch (or commit) の HEAD に checkpoint tag を打つ。
+
+            ファイルを大きく書き換える前にこれを呼んでおくと、 後で
+            github_checkpoint_restore でその時点の内容に戻せる。
+            tag 名は内部的に "checkpoint/claude/{label}" として保存される
+            (他用途の tag と混じらないよう prefix を固定)。
+
+            Args:
+                owner: リポジトリ owner (例 "your-org")
+                repo: リポジトリ名 (例 "rag")
+                label: checkpoint 識別ラベル (例 "before_phaseA_rewrite")。
+                       label に "/" を含めてもよい (例 "20260601/kernel_edit")
+                ref: branch 名 (例 "main") or 40 桁 commit SHA。
+                     省略時は default branch HEAD
+                user_id: the assistant system利用者 ID (任意)
+            Returns:
+                "OK: {tag} -> {sha[:12]}" or "NG: {error}"
+            """
+            owner = (owner or "").strip()
+            repo = (repo or "").strip()
+            label = (label or "").strip()
+            if not owner or not repo or not label:
+                return "NG: owner, repo, label は必須"
+            try:
+                kernel = ensure_kernel_url()
+            except Exception as e:
+                return f"NG: KERNEL_URL 未設定: {e}"
+
+            tag = _tag_name(label)
+            try:
+                d = await _post(kernel, "/core/github/create-tag", {
+                    "owner": owner, "repo": repo, "tag": tag,
+                    "ref": ref if ref else None,
+                    "user_id": user_id,
+                })
+            except Exception as e:
+                return f"NG: 通信失敗: {type(e).__name__}: {e}"
+            if not d.get("ok"):
+                return "NG: " + str(d.get("error", "unknown"))
+            sha = str(d.get("sha", ""))
+            return f"OK: {tag} -> {sha[:12]}"
+
+        @mcp.tool()
+        async def github_checkpoint_list(
+            owner: str,
+            repo: str,
+            label_prefix: str = "",
+            limit: int = 20,
+            user_id: str = "",
+        ) -> str:
+            """checkpoint tag の一覧を返す (新しい順)。
+
+            内部 tag 名は "checkpoint/claude/{label}" だが、 出力では
+            label 部分だけを表示する (前置の "checkpoint/claude/" は省略)。
+            label_prefix も label 部分への絞り込み (例 "before_" で
+            "before_phaseA"\u3001 "before_kernel" が引っかかる)。
+
+            Args:
+                owner: リポジトリ owner
+                repo: リポジトリ名
+                label_prefix: label の前方一致絞り込み (省略可)
+                limit: 最大件数 (default 20、 max 200)
+                user_id: the assistant system利用者 ID
+            Returns:
+                複数行テキスト。 1 行 = "{label}\\t{sha[:12]}\\t{committed_date}"
+                該当なしの場合は "(checkpoint なし)"
+            """
+            owner = (owner or "").strip()
+            repo = (repo or "").strip()
+            if not owner or not repo:
+                return "NG: owner, repo は必須"
+            limit = max(1, min(200, int(limit or 20)))
+            try:
+                kernel = ensure_kernel_url()
+            except Exception as e:
+                return f"NG: KERNEL_URL 未設定: {e}"
+
+            full_prefix = _TAG_PREFIX + (label_prefix or "")
+            try:
+                d = await _post(kernel, "/core/github/list-tags", {
+                    "owner": owner, "repo": repo,
+                    "prefix": full_prefix,
+                    "limit": limit,
+                    "user_id": user_id,
+                })
+            except Exception as e:
+                return f"NG: 通信失敗: {type(e).__name__}: {e}"
+            if not d.get("ok"):
+                return "NG: " + str(d.get("error", "unknown"))
+            tags = d.get("tags") or []
+            if not tags:
+                return "(checkpoint なし)"
+            out = []
+            for t in tags:
+                name = str(t.get("name", ""))
+                sha = str(t.get("sha", ""))
+                date = str(t.get("date", ""))
+                if name.startswith(_TAG_PREFIX):
+                    name = name[len(_TAG_PREFIX):]
+                out.append(f"{name}\t{sha[:12]}\t{date}")
+            return "\n".join(out)
+
+        @mcp.tool()
+        async def github_checkpoint_delete(
+            owner: str,
+            repo: str,
+            label: str,
+            user_id: str = "",
+        ) -> str:
+            """checkpoint tag を削除する。
+
+            Args:
+                owner: リポジトリ owner
+                repo: リポジトリ名
+                label: 削除する checkpoint label
+                user_id: the assistant system利用者 ID
+            Returns:
+                "OK: deleted {tag}" / "OK: not found" / "NG: {error}"
+            """
+            owner = (owner or "").strip()
+            repo = (repo or "").strip()
+            label = (label or "").strip()
+            if not owner or not repo or not label:
+                return "NG: owner, repo, label は必須"
+            try:
+                kernel = ensure_kernel_url()
+            except Exception as e:
+                return f"NG: KERNEL_URL 未設定: {e}"
+            tag = _tag_name(label)
+            try:
+                d = await _post(kernel, "/core/github/delete-tag", {
+                    "owner": owner, "repo": repo, "tag": tag,
+                    "user_id": user_id,
+                })
+            except Exception as e:
+                return f"NG: 通信失敗: {type(e).__name__}: {e}"
+            if not d.get("ok"):
+                return "NG: " + str(d.get("error", "unknown"))
+            if d.get("deleted"):
+                return f"OK: deleted {tag}"
+            return f"OK: not found ({tag})"
+
+        @mcp.tool()
+        async def github_checkpoint_restore(
+            owner: str,
+            repo: str,
+            label: str,
+            message: str,
+            paths: str = "",
+            branch: str = "",
+            user_id: str = "",
+        ) -> str:
+            """checkpoint 時点の内容で指定 paths を branch に forward commit する。
+
+            指定 paths のファイルだけを checkpoint 時点に戻す。 履歴は消えず、
+            新しい commit が積まれる (GitOps 配下なので reset しない)。
+
+            paths が空の場合はエラーになる (broad な復元は事故防止)。
+
+            tag 時点に存在しなかったファイルを paths に含めると、 そのファイルは
+            「削除」 として扱われる (新 commit でファイルが消える)。
+
+            Args:
+                owner: リポジトリ owner
+                repo: リポジトリ名
+                label: 復元元 checkpoint label
+                message: commit message (必須)
+                paths: カンマ区切りのファイルパス一覧。 例:
+                       "your-path/manifests/foo.yaml,your-path/manifests/bar.yaml"
+                       1 ファイルだけなら "your-path/manifests/foo.yaml"
+                branch: 適用先 branch (省略時は default branch)
+                user_id: the assistant system利用者 ID
+            Returns:
+                "OK: restored N file(s) (deleted M file(s)) -> {sha[:12]}\\n{url}"
+                or "NG: {error}"
+            """
+            owner = (owner or "").strip()
+            repo = (repo or "").strip()
+            label = (label or "").strip()
+            message = (message or "").strip()
+            paths_raw = (paths or "").strip()
+            if not owner or not repo or not label or not message:
+                return "NG: owner, repo, label, message は必須"
+            if not paths_raw:
+                return "NG: paths は必須 (broad な復元は事故防止のため不可)"
+            path_list = [p.strip() for p in paths_raw.split(",") if p.strip()]
+            if not path_list:
+                return "NG: paths が空"
+            try:
+                kernel = ensure_kernel_url()
+            except Exception as e:
+                return f"NG: KERNEL_URL 未設定: {e}"
+            tag = _tag_name(label)
+            try:
+                d = await _post(kernel, "/core/github/restore-from-tag", {
+                    "owner": owner, "repo": repo, "tag": tag,
+                    "paths": path_list,
+                    "message": message,
+                    "branch": branch if branch else None,
+                    "user_id": user_id,
+                })
+            except Exception as e:
+                return f"NG: 通信失敗: {type(e).__name__}: {e}"
+            if not d.get("ok"):
+                return "NG: " + str(d.get("error", "unknown"))
+            restored = d.get("restored_paths") or []
+            deleted = d.get("deleted_paths") or []
+            sha = str(d.get("commit_sha", ""))
+            url = str(d.get("html_url", ""))
+            head = f"OK: restored {len(restored)} file(s)"
+            if deleted:
+                head += f" (deleted {len(deleted)} file(s))"
+            head += f" -> {sha[:12]}"
+            if url:
+                head += "\n" + url
+            return head
+
+        @mcp.tool()
+        async def github_autockpt_list(
+            owner: str,
+            repo: str,
+            path: str = "",
+            branch: str = "",
+            limit: int = 20,
+            user_id: str = "",
+        ) -> str:
+            """auto-checkpoint (write 前の commit SHA) の一覧を新しい順に返す。
+
+            put_file / delete_file / apply_str_replace / move_block を呼ぶたびに
+            kernel が自動的に「直前の commit SHA」 を OpenSearch に記録している。
+            それを path で絞り込んで取得する。
+
+            戻った id を github_restore_from_sha の sha 引数に使えば
+            その時点に巻き戻せる (forward commit、 履歴は消えない)。
+
+            Args:
+                owner: リポジトリ owner
+                repo: リポジトリ名
+                path: 特定のファイルパスに絞り込み (省略時は repo 全体)
+                branch: branch 絞り込み (省略時は全 branch)
+                limit: 最大件数 (default 20、 max 200)
+                user_id: the assistant system利用者 ID
+            Returns:
+                複数行テキスト。 1 行 = "{pre_sha[:12]}\\t{path}\\t{tool}\\t{created_at}\\t{message[:60]}"
+                該当なしなら "(autockpt なし)"
+            """
+            owner = (owner or "").strip()
+            repo = (repo or "").strip()
+            if not owner or not repo:
+                return "NG: owner, repo は必須"
+            limit = max(1, min(200, int(limit or 20)))
+            try:
+                kernel = ensure_kernel_url()
+            except Exception as e:
+                return f"NG: KERNEL_URL 未設定: {e}"
+            try:
+                d = await _post(kernel, "/core/github/autockpt-list", {
+                    "owner": owner, "repo": repo,
+                    "path": path, "branch": branch,
+                    "limit": limit, "user_id": user_id,
+                })
+            except Exception as e:
+                return f"NG: 通信失敗: {type(e).__name__}: {e}"
+            if not d.get("ok"):
+                return "NG: " + str(d.get("error", "unknown"))
+            items = d.get("items") or []
+            if not items:
+                return "(autockpt なし)"
+            out = []
+            for it in items:
+                sha = str(it.get("pre_commit_sha", ""))
+                p = str(it.get("path", ""))
+                tool = str(it.get("tool", ""))
+                created = str(it.get("created_at", ""))
+                msg = str(it.get("commit_message", ""))[:60].replace("\n", " ")
+                out.append(f"{sha[:12]}\t{p}\t{tool}\t{created}\t{msg}")
+            return "\n".join(out)
+
+        @mcp.tool()
+        async def github_restore_from_sha(
+            owner: str,
+            repo: str,
+            sha: str,
+            message: str,
+            paths: str = "",
+            branch: str = "",
+            user_id: str = "",
+        ) -> str:
+            """commit SHA 時点の内容で paths を branch に forward commit する。
+
+            github_autockpt_list で得た pre_commit_sha を使って「直前の状態に戻す」
+            のが典型用途。 reset ではなく新規 commit で上書きするため、
+            GitOps 配下でも安全。
+
+            paths は明示必須 (broad な復元は事故防止のため不可)。 SHA 時点に
+            存在しなかったファイルを paths に含めると、 そのファイルは
+            復元 commit で「削除」 として扱われる。
+
+            Args:
+                owner: リポジトリ owner
+                repo: リポジトリ名
+                sha: 復元元 commit SHA (40 桁 hex、 pre_commit_sha)
+                message: commit message (必須)
+                paths: カンマ区切りのファイルパス一覧
+                branch: 適用先 branch (省略時は default branch)
+                user_id: the assistant system利用者 ID
+            Returns:
+                "OK: restored N file(s) (deleted M file(s)) -> {sha[:12]}\\n{url}"
+                or "NG: {error}"
+            """
+            owner = (owner or "").strip()
+            repo = (repo or "").strip()
+            sha = (sha or "").strip().lower()
+            message = (message or "").strip()
+            paths_raw = (paths or "").strip()
+            if not owner or not repo or not sha or not message:
+                return "NG: owner, repo, sha, message は必須"
+            if not paths_raw:
+                return "NG: paths は必須 (broad な復元は事故防止のため不可)"
+            if len(sha) != 40 or not all(c in "0123456789abcdef" for c in sha):
+                return "NG: sha は 40 桁 hex でなければならない"
+            path_list = [p.strip() for p in paths_raw.split(",") if p.strip()]
+            if not path_list:
+                return "NG: paths が空"
+            try:
+                kernel = ensure_kernel_url()
+            except Exception as e:
+                return f"NG: KERNEL_URL 未設定: {e}"
+            try:
+                d = await _post(kernel, "/core/github/restore-from-sha", {
+                    "owner": owner, "repo": repo,
+                    "commit_sha": sha,
+                    "paths": path_list,
+                    "message": message,
+                    "branch": branch if branch else None,
+                    "user_id": user_id,
+                })
+            except Exception as e:
+                return f"NG: 通信失敗: {type(e).__name__}: {e}"
+            if not d.get("ok"):
+                return "NG: " + str(d.get("error", "unknown"))
+            restored = d.get("restored_paths") or []
+            deleted = d.get("deleted_paths") or []
+            new_sha = str(d.get("commit_sha", ""))
+            url = str(d.get("html_url", ""))
+            head = f"OK: restored {len(restored)} file(s)"
+            if deleted:
+                head += f" (deleted {len(deleted)} file(s))"
+            head += f" -> {new_sha[:12]}"
+            if url:
+                head += "\n" + url
+            return head

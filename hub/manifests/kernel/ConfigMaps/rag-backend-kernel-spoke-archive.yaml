@@ -1,0 +1,833 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-backend-kernel-spoke-archive
+  namespace: rag-company1
+data:
+  spoke_archive.py: |
+    """spoke_archive.py - Spoke の管理下除外/復帰機能 (可逆).
+
+    ハブ&スポーク構成で 「スポークを OpenSpoke 管理下から外す」 / 「戻す」
+    を可逆的に提供する.
+
+    外す対象:
+      - OpenSearch spoke_clusters index の doc
+      - Fleet GitRepo YAML (個別 GitRepo + fanout 系の cluster-name target エントリ)
+      - Spoke per-cluster bootstrap (OpenSpoke/Core/Spoke/manifests/clusters/<spoke-id>/)
+
+    touch しないもの:
+      - Fleet Cluster CR (fleet-cluster 上の cluster-*)
+      - Cloudflare Tunnel
+      - ledger (fleet_state index)
+      - Application 配信用 GitRepo の manifest 本体
+
+    復元情報は spoke_clusters_archive index の doc に統合保存し、
+    enable で完全に元の状態に戻す.
+
+    公開 endpoint (FastAPI router):
+      POST /core/spoke/disable        body={cluster_name, archived_by}
+      POST /core/spoke/enable         body={cluster_name}
+      GET  /core/spoke/list-archived
+    """
+
+    import base64
+    import datetime as _dt
+    import json
+    import os
+    import re
+    from typing import Optional
+
+    import requests
+    import yaml
+    from fastapi import APIRouter, HTTPException
+
+
+    router = APIRouter()
+
+    OPENSEARCH_URL = os.environ.get(
+        "OPENSEARCH_URL",
+        "http://opensearch.opensearch.svc.cluster.local:9200",
+    )
+    GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+    GH_OWNER = "your-org"
+    GH_REPO = "rag"
+    GH_BRANCH = "main"
+    GITREPOS_DIR = "OpenSpoke/Core/fleet/manifests/managed/GitRepos"
+    CLUSTERS_DIR = "OpenSpoke/Core/Spoke/manifests/clusters"
+
+    INDEX_ACTIVE = "spoke_clusters"
+    INDEX_ARCHIVE = "spoke_clusters_archive"
+
+    GH_API = "https://api.github.com"
+
+
+    # ============================================================
+    # OpenSearch helpers
+    # ============================================================
+
+    def _os_get(index, doc_id):
+        url = f"{OPENSEARCH_URL}/{index}/_doc/{doc_id}"
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        body = resp.json()
+        return body.get("_source") if body.get("found") else None
+
+
+    def _os_put(index, doc_id, source):
+        url = f"{OPENSEARCH_URL}/{index}/_doc/{doc_id}?refresh=wait_for"
+        resp = requests.put(url, json=source, timeout=15)
+        resp.raise_for_status()
+        return resp.json()
+
+
+    def _os_delete(index, doc_id):
+        url = f"{OPENSEARCH_URL}/{index}/_doc/{doc_id}?refresh=wait_for"
+        resp = requests.delete(url, timeout=10)
+        if resp.status_code == 404:
+            return {"result": "not_found"}
+        resp.raise_for_status()
+        return resp.json()
+
+
+    def _os_search_all(index):
+        url = f"{OPENSEARCH_URL}/{index}/_search"
+        body = {"size": 100, "query": {"match_all": {}},
+                "sort": [{"_id": "asc"}]}
+        resp = requests.post(url, json=body, timeout=10)
+        if resp.status_code == 404:
+            return []
+        resp.raise_for_status()
+        out = []
+        for h in resp.json().get("hits", {}).get("hits", []) or []:
+            d = dict(h.get("_source", {}) or {})
+            d["_id"] = h.get("_id")
+            out.append(d)
+        return out
+
+
+    def _os_delete_by_query(index, query_dsl):
+        url = f"{OPENSEARCH_URL}/{index}/_delete_by_query?refresh=true"
+        body = {"query": query_dsl}
+        resp = requests.post(url, json=body, timeout=30)
+        if resp.status_code == 404:
+            return {"deleted": 0, "result": "index_not_found"}
+        resp.raise_for_status()
+        return resp.json()
+
+
+    # ============================================================
+    # GitHub Contents API helpers
+    # ============================================================
+
+    def _gh_headers():
+        return {
+            "Authorization": f"Bearer {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github.v3+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+
+
+    def _gh_get_content(path):
+        url = f"{GH_API}/repos/{GH_OWNER}/{GH_REPO}/contents/{path}?ref={GH_BRANCH}"
+        resp = requests.get(url, headers=_gh_headers(), timeout=15)
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, list):
+            return None
+        raw = base64.b64decode(data.get("content", "")).decode("utf-8")
+        return {"content": raw, "sha": data.get("sha"), "path": path}
+
+
+    def _gh_list_directory(path):
+        url = f"{GH_API}/repos/{GH_OWNER}/{GH_REPO}/contents/{path}?ref={GH_BRANCH}"
+        resp = requests.get(url, headers=_gh_headers(), timeout=15)
+        if resp.status_code == 404:
+            return []
+        resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data, list):
+            return []
+        return data
+
+
+    def _gh_put_content(path, content, message, sha=None):
+        url = f"{GH_API}/repos/{GH_OWNER}/{GH_REPO}/contents/{path}"
+        body = {
+            "message": message,
+            "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
+            "branch": GH_BRANCH,
+        }
+        if sha:
+            body["sha"] = sha
+        resp = requests.put(url, headers=_gh_headers(), json=body, timeout=20)
+        resp.raise_for_status()
+        return resp.json()
+
+
+    def _gh_delete_content(path, sha, message):
+        url = f"{GH_API}/repos/{GH_OWNER}/{GH_REPO}/contents/{path}"
+        body = {"message": message, "sha": sha, "branch": GH_BRANCH}
+        resp = requests.delete(url, headers=_gh_headers(), json=body,
+                               timeout=20)
+        resp.raise_for_status()
+        return resp.json()
+
+
+    # ============================================================
+    # YAML helpers
+    # ============================================================
+
+    def _target_cluster_names(targets):
+        out = []
+        for t in targets or []:
+            cn = (
+                (t or {})
+                .get("clusterSelector", {})
+                .get("matchLabels", {})
+                .get("cluster-name")
+            )
+            out.append(cn)
+        return out
+
+
+    def _analyze_gitrepo_yaml(content, cluster_name):
+        """fleet GitRepo YAML を解析し、 cluster_name target の扱いを決定.
+
+        Returns:
+          ("delete_file", None)               : すべての target が該当 → ファイル削除
+          ("remove_targets", removed_targets) : 一部 target が該当 → 該当だけ削除
+          ("no_match", None)                  : 該当 target なし
+        """
+        try:
+            data = yaml.safe_load(content)
+        except Exception:
+            return ("no_match", None)
+        if not isinstance(data, dict):
+            return ("no_match", None)
+        if data.get("kind") != "GitRepo":
+            return ("no_match", None)
+        targets = data.get("spec", {}).get("targets", [])
+        names = _target_cluster_names(targets)
+        matching = [i for i, n in enumerate(names) if n == cluster_name]
+        if not matching:
+            return ("no_match", None)
+        if len(matching) == len(targets):
+            return ("delete_file", None)
+        removed = [targets[i] for i in matching]
+        return ("remove_targets", removed)
+
+
+    def _yaml_remove_targets(content, cluster_name):
+        data = yaml.safe_load(content)
+        targets = data.get("spec", {}).get("targets", [])
+        data["spec"]["targets"] = [
+            t for t, n in zip(targets, _target_cluster_names(targets))
+            if n != cluster_name
+        ]
+        return yaml.safe_dump(
+            data, sort_keys=False, default_flow_style=False, allow_unicode=True
+        )
+
+
+    def _yaml_add_targets(content, targets_to_add):
+        data = yaml.safe_load(content)
+        if "spec" not in data:
+            data["spec"] = {}
+        if not data["spec"].get("targets"):
+            data["spec"]["targets"] = []
+        data["spec"]["targets"].extend(targets_to_add)
+        return yaml.safe_dump(
+            data, sort_keys=False, default_flow_style=False, allow_unicode=True
+        )
+
+
+    # ============================================================
+    # core impl
+    # ============================================================
+
+    def _extract_spoke_id(spoke_doc):
+        url = spoke_doc.get("url", "") or ""
+        m = re.search(r"(spoke-\d+)", url)
+        return m.group(1) if m else None
+
+
+    def _mcp_call(tool_name, arguments):
+        """中央ハブ MCP の特定 tool を 1 回呼び、 結果テキストを返す.
+
+        SimpleMCPClient は main.py 内に定義済みのため遅延 import する
+        (循環 import を避ける). 接続失敗時は例外を投げる.
+        """
+        from main import (
+            SimpleMCPClient,
+            MCP_SERVER_URL,
+            MCP_API_KEY,
+            MCP_CONNECT_TIMEOUT,
+        )
+        if not MCP_API_KEY or not MCP_SERVER_URL:
+            raise RuntimeError(
+                "MCP config missing (MCP_API_KEY/MCP_SERVER_URL)"
+            )
+        with SimpleMCPClient(
+            MCP_SERVER_URL, MCP_API_KEY, timeout=MCP_CONNECT_TIMEOUT
+        ) as mcp:
+            return mcp.call_tool(tool_name, arguments)
+
+
+    def _parse_mcp_json(text):
+        """MCP tool が返した文字列を JSON として parse. 失敗は None."""
+        if text is None:
+            return None
+        if not isinstance(text, str):
+            return text
+        try:
+            return json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            return None
+
+
+    def _delete_fleet_cluster_cr(cluster_name):
+        """fleet-cluster から該当 cluster の Cluster CR を kubectl delete.
+
+        Returns:
+          - dict: 削除前 Cluster CR 全体 (archive 保存用)
+          - None: 対象 CR が存在しない or 削除スキップ
+        Raises:
+          - 中央ハブ MCP との通信エラー (caller が catch する)
+        """
+        import logging
+        _log = logging.getLogger("main")
+        _log.info(
+            f"[SPOKE_ARCHIVE] _delete_fleet_cluster_cr "
+            f"start: cluster_name={cluster_name}"
+        )
+
+        # 1. cluster-name label で Cluster CR を特定
+        get_result = _mcp_call(
+            "cluster_k8s_get",
+            {
+                "cluster": "fleet-cluster",
+                "api_version": "fleet.cattle.io/v1alpha1",
+                "kind": "Cluster",
+                "namespace": "fleet-default",
+                "label_selector": f"cluster-name={cluster_name}",
+            },
+        )
+        _log.info(
+            f"[SPOKE_ARCHIVE] cluster_k8s_get returned: "
+            f"type={type(get_result).__name__} "
+            f"len={len(get_result) if isinstance(get_result, str) else 'N/A'} "
+            f"preview={str(get_result)[:300]!r}"
+        )
+        clusters = _parse_mcp_json(get_result)
+        _log.info(
+            f"[SPOKE_ARCHIVE] parsed clusters: "
+            f"type={type(clusters).__name__} "
+            f"preview={str(clusters)[:300]!r}"
+        )
+        if not isinstance(clusters, list) or len(clusters) == 0:
+            _log.warning(
+                f"[SPOKE_ARCHIVE] return None: "
+                f"clusters is not non-empty list"
+            )
+            return None
+        cr = clusters[0]
+        cr_name = (
+            (cr or {}).get("metadata", {}).get("name")
+            if isinstance(cr, dict) else None
+        )
+        _log.info(f"[SPOKE_ARCHIVE] cr_name={cr_name!r}")
+        if not cr_name:
+            _log.warning(
+                f"[SPOKE_ARCHIVE] return None: cr_name missing"
+            )
+            return None
+
+        # 2. fleet-cluster の任意のノードを取得
+        nodes_result = _mcp_call(
+            "cluster_node_list", {"cluster": "fleet-cluster"}
+        )
+        _log.info(
+            f"[SPOKE_ARCHIVE] cluster_node_list returned: "
+            f"type={type(nodes_result).__name__} "
+            f"preview={str(nodes_result)[:300]!r}"
+        )
+        nodes = _parse_mcp_json(nodes_result)
+        _log.info(
+            f"[SPOKE_ARCHIVE] parsed nodes: "
+            f"type={type(nodes).__name__} "
+            f"preview={str(nodes)[:300]!r}"
+        )
+        node_name = None
+        if isinstance(nodes, list) and nodes:
+            first = nodes[0]
+            if isinstance(first, str):
+                node_name = first
+            elif isinstance(first, dict):
+                node_name = (
+                    first.get("name")
+                    or first.get("metadata", {}).get("name")
+                )
+        # JSON parse 失敗 or 結果が想定外なら Markdown として parse.
+        # 中央ハブ MCP の cluster_node_list は Markdown 形式の
+        # 人間可読出力 (例: '- node=example-node  podIP=...') を返す.
+        if not node_name and isinstance(nodes_result, str):
+            md_matches = re.findall(r"node=(\S+)", nodes_result)
+            if md_matches:
+                node_name = md_matches[0]
+                _log.info(
+                    f"[SPOKE_ARCHIVE] node_name extracted from "
+                    f"markdown: {node_name!r}"
+                )
+        _log.info(f"[SPOKE_ARCHIVE] node_name={node_name!r}")
+        if not node_name:
+            _log.warning(
+                f"[SPOKE_ARCHIVE] node_name missing, "
+                f"skip kubectl delete (returning None as not deleted)"
+            )
+            return None
+
+        # 3. kubectl delete を node_exec で実行 (idempotent).
+        # rke2 では kubectl は標準 PATH になく、
+        # /var/lib/rancher/rke2/bin/kubectl にある.
+        # kubeconfig も /etc/rancher/rke2/rke2.yaml を明示指定.
+        exec_result = _mcp_call(
+            "cluster_node_exec",
+            {
+                "cluster": "fleet-cluster",
+                "node": node_name,
+                "command": (
+                    f"/var/lib/rancher/rke2/bin/kubectl "
+                    f"--kubeconfig=/etc/rancher/rke2/rke2.yaml "
+                    f"delete cluster.fleet.cattle.io {cr_name} "
+                    f"-n fleet-default --ignore-not-found=true"
+                ),
+                "timeout": 60,
+            },
+        )
+        _log.info(
+            f"[SPOKE_ARCHIVE] cluster_node_exec returned: "
+            f"type={type(exec_result).__name__} "
+            f"preview={str(exec_result)[:300]!r}"
+        )
+        # exit_code を Markdown 出力から抽出して 0 でなければ例外を投げる.
+        # 例: '## node_exec node=example-node  exit_code=127  duration=...'
+        if isinstance(exec_result, str):
+            m = re.search(r"exit_code=(\d+)", exec_result)
+            if m:
+                exit_code = int(m.group(1))
+                if exit_code != 0:
+                    raise RuntimeError(
+                        f"kubectl delete failed: exit_code={exit_code}, "
+                        f"output={exec_result[:300]}"
+                    )
+        return cr
+
+
+    def _spoke_disable_impl(cluster_name, archived_by):
+        # 1. spoke_clusters から取得
+        src = _os_get(INDEX_ACTIVE, cluster_name)
+        if src is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"spoke '{cluster_name}' not found in {INDEX_ACTIVE}",
+            )
+        spoke_id = _extract_spoke_id(src)
+
+        # 2. archive 用の git_archive 構築 (実 git 操作はまだ)
+        deleted_files = {}
+        fanout_targets_removed = {}
+
+        repo_entries = _gh_list_directory(GITREPOS_DIR)
+        for entry in repo_entries:
+            if entry.get("type") != "file":
+                continue
+            name = entry.get("name", "")
+            if not (name.endswith(".yaml") or name.endswith(".yml")):
+                continue
+            path = entry.get("path") or f"{GITREPOS_DIR}/{name}"
+            got = _gh_get_content(path)
+            if got is None:
+                continue
+            action, removed = _analyze_gitrepo_yaml(got["content"], cluster_name)
+            if action == "delete_file":
+                deleted_files[path] = {
+                    "content": got["content"], "sha": got["sha"],
+                }
+            elif action == "remove_targets":
+                fanout_targets_removed[path] = removed
+
+        if spoke_id:
+            cluster_dir = f"{CLUSTERS_DIR}/{spoke_id}"
+            for entry in _gh_list_directory(cluster_dir):
+                if entry.get("type") != "file":
+                    continue
+                path = (entry.get("path")
+                        or f"{cluster_dir}/{entry.get('name', '')}")
+                got = _gh_get_content(path)
+                if got is None:
+                    continue
+                deleted_files[path] = {
+                    "content": got["content"], "sha": got["sha"],
+                }
+
+        # 3. archive doc を OpenSearch に書く (git 操作前)
+        now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        archive_doc = {
+            "cluster_name": cluster_name,
+            "archived_at": now_iso,
+            "archived_by": (archived_by or "anonymous"),
+            "previous_status": src.get("status"),
+            "spoke_clusters_source": src,
+            "git_archive": {
+                "deleted_files": deleted_files,
+                "fanout_targets_removed": fanout_targets_removed,
+            },
+        }
+        _os_put(INDEX_ARCHIVE, cluster_name, archive_doc)
+
+        # 4. git 操作
+        git_results = {"deleted": [], "edited": []}
+        for path, info in deleted_files.items():
+            try:
+                _gh_delete_content(
+                    path, info["sha"],
+                    f"spoke-disable: remove for cluster '{cluster_name}'",
+                )
+                git_results["deleted"].append(path)
+            except requests.HTTPError as e:
+                if e.response.status_code in (404, 409, 422):
+                    git_results["deleted"].append(
+                        f"{path} (skip: HTTP {e.response.status_code})"
+                    )
+                else:
+                    raise
+
+        for path, removed_targets in fanout_targets_removed.items():
+            got_now = _gh_get_content(path)
+            if got_now is None:
+                git_results["edited"].append(f"{path} (skip: not found)")
+                continue
+            new_content = _yaml_remove_targets(got_now["content"], cluster_name)
+            if new_content == got_now["content"]:
+                git_results["edited"].append(f"{path} (skip: no change)")
+                continue
+            _gh_put_content(
+                path, new_content,
+                (f"spoke-disable: remove '{cluster_name}' target "
+                 f"from {os.path.basename(path)}"),
+                sha=got_now["sha"],
+            )
+            git_results["edited"].append(path)
+
+        # 5. spoke_clusters から元 doc 削除
+        _os_delete(INDEX_ACTIVE, cluster_name)
+
+        # 6. nodes_aggregated から orphan を清掃 (best-effort)
+        try:
+            nodes_cleanup = _cleanup_node_orphans_impl()
+        except Exception as e:
+            nodes_cleanup = {
+                "error": f"{type(e).__name__}: {str(e)[:200]}",
+            }
+
+        return {
+            "status": "archived",
+            "cluster_name": cluster_name,
+            "archived_at": now_iso,
+            "git_changes": git_results,
+            "nodes_cleanup": nodes_cleanup,
+        }
+
+
+    def _cleanup_node_orphans_impl():
+        """nodes_aggregated から spoke_clusters に entry が無い
+        cluster_name の node doc を物理削除する.
+
+        archive (spoke_disable) で残った orphan を一括清掃する用途.
+        spoke_clusters を真実源とする.
+        """
+        active_docs = _os_search_all(INDEX_ACTIVE)
+        active_names = sorted({
+            d.get("cluster_name", "")
+            for d in active_docs
+            if d.get("cluster_name")
+        })
+
+        # safety guard: active spoke が 0 件のときは何もしない
+        # (真実源の取得失敗かもしれず、 全削除を防止)
+        if not active_names:
+            return {
+                "deleted": 0,
+                "removed_clusters": [],
+                "active_clusters": [],
+                "skipped": "no active spokes (safety guard)",
+            }
+
+        orphan_query = {
+            "bool": {
+                "must_not": [
+                    {"terms": {"cluster_name.keyword": active_names}}
+                ]
+            }
+        }
+
+        # 削除対象 cluster_name 一覧を集計 (戻り値用)
+        agg_url = f"{OPENSEARCH_URL}/nodes_aggregated/_search"
+        agg_body = {
+            "size": 0,
+            "query": orphan_query,
+            "aggs": {
+                "orphans": {
+                    "terms": {"field": "cluster_name.keyword", "size": 100}
+                }
+            },
+        }
+        agg_resp = requests.post(agg_url, json=agg_body, timeout=10)
+        removed_clusters = []
+        if agg_resp.status_code != 404:
+            agg_resp.raise_for_status()
+            buckets = (
+                agg_resp.json()
+                .get("aggregations", {})
+                .get("orphans", {})
+                .get("buckets", [])
+                or []
+            )
+            removed_clusters = [b["key"] for b in buckets]
+
+        delete_result = _os_delete_by_query(
+            "nodes_aggregated", orphan_query
+        )
+
+        return {
+            "deleted": delete_result.get("deleted", 0),
+            "removed_clusters": removed_clusters,
+            "active_clusters": active_names,
+        }
+
+
+    def _spoke_enable_impl(cluster_name):
+        arc = _os_get(INDEX_ARCHIVE, cluster_name)
+        if arc is None:
+            raise HTTPException(
+                status_code=404,
+                detail=(f"archive for '{cluster_name}' "
+                        f"not found in {INDEX_ARCHIVE}"),
+            )
+
+        git_archive = arc.get("git_archive", {}) or {}
+        deleted_files = git_archive.get("deleted_files", {}) or {}
+        fanout_targets_removed = (
+            git_archive.get("fanout_targets_removed", {}) or {}
+        )
+
+        git_results = {"restored": [], "edited": []}
+
+        # 1. 削除されたファイルを戻す
+        for path, info in deleted_files.items():
+            content = info.get("content", "")
+            existing = _gh_get_content(path)
+            sha = existing.get("sha") if existing else None
+            _gh_put_content(
+                path, content,
+                (f"spoke-enable: restore {os.path.basename(path)} "
+                 f"for '{cluster_name}'"),
+                sha=sha,
+            )
+            git_results["restored"].append(path)
+
+        # 2. fanout target を戻す
+        for path, removed_targets in fanout_targets_removed.items():
+            got = _gh_get_content(path)
+            if got is None:
+                git_results["edited"].append(f"{path} (skip: not found)")
+                continue
+            new_content = _yaml_add_targets(got["content"], removed_targets)
+            if new_content == got["content"]:
+                git_results["edited"].append(f"{path} (skip: no change)")
+                continue
+            _gh_put_content(
+                path, new_content,
+                (f"spoke-enable: restore '{cluster_name}' target "
+                 f"to {os.path.basename(path)}"),
+                sha=got["sha"],
+            )
+            git_results["edited"].append(path)
+
+        # 3. spoke_clusters に復元
+        src = dict(arc.get("spoke_clusters_source") or {})
+        prev = arc.get("previous_status")
+        if prev:
+            src["status"] = prev
+        _os_put(INDEX_ACTIVE, cluster_name, src)
+
+        # 4. archive 削除
+        _os_delete(INDEX_ARCHIVE, cluster_name)
+
+        return {
+            "status": "restored",
+            "cluster_name": cluster_name,
+            "git_changes": git_results,
+        }
+
+
+    def _list_archived_impl():
+        return _os_search_all(INDEX_ARCHIVE)
+
+
+    # ============================================================
+    # FastAPI endpoints
+    # ============================================================
+
+    @router.post("/core/spoke/disable")
+    async def core_spoke_disable(request: dict):
+        """spoke を管理下から外す.
+
+        body:
+          cluster_name (str): 必須
+          archived_by  (str): 任意 (操作者識別、 監査用)
+        """
+        cluster_name = (request.get("cluster_name") or "").strip()
+        archived_by = (request.get("archived_by") or "").strip()
+        if not cluster_name:
+            raise HTTPException(status_code=400,
+                                detail="cluster_name is required")
+        try:
+            return _spoke_disable_impl(cluster_name, archived_by)
+        except HTTPException:
+            raise
+        except requests.HTTPError as e:
+            raise HTTPException(
+                status_code=502,
+                detail=(f"upstream HTTP error: "
+                        f"{e.response.status_code} {str(e)[:200]}"),
+            )
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=(f"spoke_disable failed: "
+                        f"{type(e).__name__}: {str(e)[:200]}"),
+            )
+
+
+    @router.post("/core/spoke/enable")
+    async def core_spoke_enable(request: dict):
+        """spoke を管理下に戻す.
+
+        body:
+          cluster_name (str): 必須
+        """
+        cluster_name = (request.get("cluster_name") or "").strip()
+        if not cluster_name:
+            raise HTTPException(status_code=400,
+                                detail="cluster_name is required")
+        try:
+            return _spoke_enable_impl(cluster_name)
+        except HTTPException:
+            raise
+        except requests.HTTPError as e:
+            raise HTTPException(
+                status_code=502,
+                detail=(f"upstream HTTP error: "
+                        f"{e.response.status_code} {str(e)[:200]}"),
+            )
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=(f"spoke_enable failed: "
+                        f"{type(e).__name__}: {str(e)[:200]}"),
+            )
+
+
+    @router.get("/core/spoke/list-archived")
+    async def core_spoke_list_archived():
+        """archive 一覧."""
+        try:
+            return _list_archived_impl()
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=(f"list_archived failed: "
+                        f"{type(e).__name__}: {str(e)[:200]}"),
+            )
+
+
+    @router.post("/core/spoke/cleanup-node-orphans")
+    def core_spoke_cleanup_node_orphans():
+        """nodes_aggregated から orphan を一括清掃する独立 endpoint.
+
+        spoke_clusters を真実源とし、 entry が無い cluster_name の
+        node doc を物理削除する。 通常は disable 時に自動実行されるが、
+        過去の orphan (改修前の archive 操作で残ったもの) は
+        この endpoint を手動 trigger することで清掃できる.
+        """
+        try:
+            return _cleanup_node_orphans_impl()
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=(f"cleanup_node_orphans failed: "
+                        f"{type(e).__name__}: {str(e)[:200]}"),
+            )
+
+
+    @router.post("/core/spoke/delete-cluster-cr")
+    def core_spoke_delete_cluster_cr(request: dict):
+        """fleet-cluster の Cluster CR を kubectl delete する独立 endpoint.
+
+        disable と分離されており、 frontend から別の API call で呼ばれる.
+        backend kernel ↔ 中央ハブ MCP の循環依存による HTTP デッドロック
+        様状況を、 同期処理タイミングの分離により回避する.
+
+        Body:
+            {"cluster_name": "..."}
+        Returns:
+            {"cluster_name": "...",
+             "fleet_cluster_cr_removed": <CR 名 or null>,
+             "fleet_cluster_cr_error": <エラー文字列 or null>}
+        """
+        cluster_name = (request or {}).get("cluster_name") or ""
+        if not cluster_name:
+            raise HTTPException(
+                status_code=400,
+                detail="cluster_name is required",
+            )
+
+        fleet_cluster_cr_removed = None
+        fleet_cluster_cr_error = None
+        try:
+            fleet_cluster_cr_removed = _delete_fleet_cluster_cr(
+                cluster_name
+            )
+            # archive doc に情報を保存 (best-effort、 失敗しても無視)
+            if fleet_cluster_cr_removed:
+                try:
+                    archive_doc = _os_get(INDEX_ARCHIVE, cluster_name)
+                    if archive_doc is not None:
+                        archive_doc["fleet_cluster_cr_removed"] = (
+                            fleet_cluster_cr_removed
+                        )
+                        _os_put(
+                            INDEX_ARCHIVE, cluster_name, archive_doc
+                        )
+                except Exception:
+                    pass
+        except Exception as e:
+            fleet_cluster_cr_error = (
+                f"{type(e).__name__}: {str(e)[:200]}"
+            )
+
+        cr_name_display = None
+        if isinstance(fleet_cluster_cr_removed, dict):
+            cr_name_display = (
+                fleet_cluster_cr_removed.get("metadata", {}).get("name")
+            )
+        return {
+            "cluster_name": cluster_name,
+            "fleet_cluster_cr_removed": cr_name_display,
+            "fleet_cluster_cr_error": fleet_cluster_cr_error,
+        }

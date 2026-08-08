@@ -1,0 +1,53 @@
+# 既存スポーク用 cloudflared (cloudflared namespace, tunnel=your-tunnel-id) とは
+# 完全に分離した、 fleet-ui 専用の cloudflared。
+# the operatorが Cloudflare ダッシュボードで作成する別 tunnel に接続する。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloudflared
+  namespace: fleet-ui
+  labels:
+    app: cloudflared
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cloudflared
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+  template:
+    metadata:
+      labels:
+        app: cloudflared
+    spec:
+      containers:
+        - name: cloudflared
+          image: cloudflare/cloudflared:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - tunnel
+            - --no-autoupdate
+            - --config
+            - /etc/cloudflared/config.yaml
+            - run
+            - 00000000-0000-0000-0000-000000000000
+          env:
+            - name: TUNNEL_METRICS
+              value: 0.0.0.0:2000
+          ports:
+            - name: metrics
+              containerPort: 2000
+              protocol: TCP
+          volumeMounts:
+            - name: cloudflared-bundle
+              mountPath: /etc/cloudflared
+              readOnly: true
+          resources: {}
+      volumes:
+        - name: cloudflared-bundle
+          secret:
+            secretName: cloudflared-bundle
+            defaultMode: 420

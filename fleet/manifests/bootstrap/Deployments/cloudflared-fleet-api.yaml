@@ -1,0 +1,59 @@
+# cloudflared Deployment that exposes the fleet-cluster kube-apiserver via a
+# Cloudflare Tunnel (independent from any other cloudflared Pod that may be
+# exposing the Fleet UI).
+#
+# Customize the tunnel credentials via the referenced Secret. When migrating
+# an existing tunnel to a new cluster, create a fresh tunnel in the
+# Cloudflare dashboard and swap the credentials rather than running the same
+# tunnel ID from two clusters simultaneously (which would split connections
+# on the Cloudflare side).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloudflared-fleet-api
+  namespace: fleet-ui
+  labels:
+    app: cloudflared-fleet-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cloudflared-fleet-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+  template:
+    metadata:
+      labels:
+        app: cloudflared-fleet-api
+    spec:
+      containers:
+        - name: cloudflared
+          image: cloudflare/cloudflared:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - tunnel
+            - --no-autoupdate
+            - --config
+            - /etc/cloudflared/config.yaml
+            - run
+            - 00000000-0000-0000-0000-000000000001
+          env:
+            - name: TUNNEL_METRICS
+              value: 0.0.0.0:2000
+          ports:
+            - name: metrics
+              containerPort: 2000
+              protocol: TCP
+          volumeMounts:
+            - name: cloudflared-bundle
+              mountPath: /etc/cloudflared
+              readOnly: true
+          resources: {}
+      volumes:
+        - name: cloudflared-bundle
+          secret:
+            secretName: cloudflared-fleet-api-bundle
+            defaultMode: 420
