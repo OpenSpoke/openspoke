@@ -113,12 +113,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   credentials store) and `/core/gitlab/*` (read/write on files,
   directories, and branches over the GitLab v4 REST API).
 
-- **Native spoke on macOS (nsmt)** —
+- **Native spoke on macOS (nsmt), hub side** —
   `rag-backend-kernel-native-spoke-mac.yaml` adds `native_spoke_mac.py`,
   the hub-side receiver for `nsmt`, the OS-native (no Kubernetes)
   spoke variant. Spokes register with a `nsmt-` prefixed `SPOKE_ID`
   and reach the hub over the same reverse tunnel used by Kubernetes
-  spokes. See
+  spokes. The `nsmt` daemon itself is a **C# / .NET 10** executable
+  and is scheduled to ship in the next release (**v3.1**); v3.0 puts
+  the hub-side receiver in place so v3.1 becomes a drop-in
+  addition. See
   [`docs/concepts/native-spoke.md`](docs/concepts/native-spoke.md).
 
 - **Application spokes** — a second, lighter kind of spoke: one per
