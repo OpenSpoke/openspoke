@@ -10,6 +10,12 @@ option go_package = "github.com/openspoke/openspoke-tunnel/proto;tunnelpb";
 // stream is up, the hub can create any number of virtual TCP streams
 // that terminate at the spoke's configured target (default:
 // mcp-company1:8000).
+//
+// v3.0 adds a second mode that shares the same Connect(stream): an
+// HTTP proxy from spoke to hub, used by application spokes to call
+// hub-kernel endpoints without any hub-side machinery on the spoke
+// cluster. See docs/concepts/reverse-tunnel.md, section
+// "HTTP-proxy mode (v3.0)".
 service Tunnel {
   rpc Connect(stream ClientFrame) returns (stream ServerFrame);
 }
@@ -17,7 +23,9 @@ service Tunnel {
 // hub -> spoke frames.
 message ServerFrame {
   // Hub-assigned virtual TCP stream id. Zero is reserved for control
-  // frames (handshake / ping).
+  // frames (handshake / ping). For HTTP-proxy responses the spoke's
+  // request stream id is echoed back unchanged, so it is guaranteed
+  // to be >= 2^63 (see ClientFrame.http_request below).
   uint64 stream_id = 1;
 
   oneof kind {
@@ -26,6 +34,9 @@ message ServerFrame {
     Data data = 21;
     CloseStream close = 22;
     Ping ping = 30;
+    // v3.0: response to a spoke-originated HttpRequest. The stream_id
+    // matches the request.
+    HttpResponse http_response = 40;
   }
 }
 
@@ -38,6 +49,11 @@ message ClientFrame {
     Data data = 21;
     CloseStream close = 22;
     Pong pong = 30;
+    // v3.0: one HTTP request from an application spoke targeting the
+    // hub kernel. stream_id is assigned by the spoke from the top
+    // half of the uint64 range (>= 2^63) so it never collides with
+    // hub-assigned TCP stream ids.
+    HttpRequest http_request = 40;
   }
 }
 
@@ -66,3 +82,28 @@ message Data { bytes payload = 1; }
 message CloseStream { bool half = 1; string reason = 2; }
 message Ping { int64 sent_at = 1; }
 message Pong { int64 sent_at = 1; }
+
+// spoke -> hub: one HTTP request from an application spoke aimed at
+// the hub kernel (v3.0). tunnel-server enforces a three-stage check
+// -- SPOKE_ID prefix, spoke_clusters.kind, and a per-kind path
+// allowlist -- before forwarding the request to the hub kernel
+// (KERNEL_URL, cluster-internal). The host and scheme are pinned by
+// tunnel-server; the spoke cannot direct the request elsewhere.
+message HttpRequest {
+  string method = 1;      // "GET", "POST", "DELETE", ...
+  string path = 2;        // e.g. "/core/chat/complete"
+  map<string, string> headers = 3;
+  bytes body = 4;
+}
+
+// hub -> spoke: response to an HttpRequest (v3.0). Errors that
+// prevented the request from reaching the hub kernel (allowlist
+// refusal, kernel unreachable, timeout) are surfaced via `error`
+// with status 0; kernel-produced HTTP responses set `status` and
+// leave `error` empty.
+message HttpResponse {
+  int32 status = 1;
+  map<string, string> headers = 2;
+  bytes body = 3;
+  string error = 4;
+}
