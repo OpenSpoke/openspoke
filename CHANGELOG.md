@@ -148,10 +148,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   chat view: it selects the model (Claude family or `gemma2`
   orchestrator), forwards the conversation, and records per-message
   token and cost so the dashboard can render them. Optional Jev
-  (TypeSafe) integration provides prep/record helpers; the
-  response schema uses `user_report` as the canonical field, with
-  `aki_report` kept as a same-value alias for backward compatibility
-  with existing callers. See
+  (TypeSafe) integration provides prep/record helpers; each
+  response exposes a `user_report` field alongside the streamed
+  content. See
   [`docs/concepts/chat.md`](docs/concepts/chat.md).
 
 - **Deployment templates for v3.0 additions** — a new
