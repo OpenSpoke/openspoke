@@ -1,0 +1,362 @@
+---
+# Source-scanner runner (Python).
+#
+# Reads targets from mobile-scan-targets, shallow-clones each enabled
+# entry from GitHub, runs mobile_scan.py, and POSTs the results to
+# the kernel at /core/security/events.
+#
+# No Mac or MCP dependency: this runs entirely inside a Kubernetes
+# container (git + python3 + urllib).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mobile-scan-runner
+  namespace: security-mobile
+  labels:
+    purpose: mobile-vulnerability-scan-runner
+data:
+  scan_runner.py: |
+    #!/usr/bin/env python3
+    """Mobile-app source-scanner runner.
+
+    Runs as a K8s Job / CronJob inside the security-mobile Fleet module.
+
+    Steps:
+      1. Load scan targets from /config/targets.yaml.
+      2. For each enabled: true target:
+         a. Shallow-clone target.repo into /tmp/scan/<repo-slug> using
+            a token fetched from the kernel.
+         b. Invoke /scripts/mobile_scan.py as a subprocess.
+         c. Parse the JSON printed to stdout.
+         d. POST it to the kernel at /core/security/events.
+      3. Write a summary to stdout.
+
+    Environment variables:
+      KERNEL_URL           : kernel Service URL
+                             (default: http://rag-backend-kernel.rag-company1.svc.cluster.local:8000)
+      TARGETS_CONFIG_PATH  : targets.yaml (default: /config/targets.yaml)
+      SCANNER_SCRIPT_PATH  : mobile_scan.py (default: /scripts/mobile_scan.py)
+      DRY_RUN              : "true" skips the POST and only prints the JSON to stdout.
+
+    Authentication:
+      GitHub PATs are stored in the kernel's Git credentials store,
+      not in a Kubernetes Secret. The runner asks the kernel's
+      internal endpoint POST /core/git_credentials/github/org/{owner}/token
+      for a per-owner PAT and uses it to clone. Tokens are cached
+      per owner to avoid bumping last_used_at on every target.
+    """
+    import json
+    import os
+    import subprocess
+    import sys
+    import tempfile
+    import urllib.request
+    import urllib.error
+    from datetime import datetime, timezone
+    from pathlib import Path
+    from urllib.parse import quote
+
+    import yaml  # PyYAML
+
+    TARGETS_CONFIG_PATH = os.environ.get("TARGETS_CONFIG_PATH", "/config/targets.yaml")
+    SCANNER_SCRIPT_PATH = os.environ.get("SCANNER_SCRIPT_PATH", "/scripts/mobile_scan.py")
+    KERNEL_URL = os.environ.get(
+        "KERNEL_URL",
+        "http://rag-backend-kernel.rag-company1.svc.cluster.local:8000",
+    )
+    DRY_RUN = os.environ.get("DRY_RUN", "").lower() == "true"
+
+    # Per-owner (GitHub org) PAT cache, populated by fetch_github_token.
+    _token_cache: dict = {}
+
+
+    def fetch_github_token(owner: str):
+        """Fetch the owner's PAT from the kernel's internal endpoint. Same owner is cached."""
+        if owner in _token_cache:
+            return _token_cache[owner]
+        url = f"{KERNEL_URL}/core/git_credentials/github/org/{quote(owner)}/token"
+        req = urllib.request.Request(url, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                data = json.loads(r.read())
+                token = data.get("token")
+                if not token:
+                    print(f"[error] git_credentials/{owner}: token not in response", file=sys.stderr)
+                    return None
+                _token_cache[owner] = token
+                return token
+        except urllib.error.HTTPError as e:
+            print(f"[error] git_credentials/{owner} HTTP {e.code}: {e.read().decode()[:200]}", file=sys.stderr)
+            return None
+        except Exception as e:
+            print(f"[error] git_credentials/{owner} {type(e).__name__}: {e}", file=sys.stderr)
+            return None
+
+
+    def clone_repo(owner_repo: str, dest: Path) -> bool:
+        """Shallow-clone owner_repo into dest, or fetch if it already exists.
+
+        The PAT is fetched from the kernel's Git credentials store, per owner.
+        """
+        owner = owner_repo.split("/", 1)[0]
+        token = fetch_github_token(owner)
+        if not token:
+            return False
+        if (dest / ".git").exists():
+            r = subprocess.run(
+                ["git", "-C", str(dest), "fetch", "--depth", "1", "--quiet"],
+                capture_output=True, text=True,
+            )
+            return r.returncode == 0
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        url = f"https://x-access-token:{token}@github.com/{owner_repo}.git"
+        r = subprocess.run(
+            ["git", "clone", "--depth", "1", "--quiet", url, str(dest)],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            # Do not log the URL; it contains the token.
+            err = r.stderr.replace(token, "***")
+            print(f"[error] clone {owner_repo}: {err[:200]}", file=sys.stderr)
+            return False
+        return True
+
+
+    def run_scanner(root: Path, target: dict) -> dict | None:
+        """Invoke mobile_scan.py and return the parsed JSON."""
+        args = [
+            sys.executable, SCANNER_SCRIPT_PATH,
+            "--root", str(root),
+            "--platform", target["platform"],
+        ]
+        if target.get("app_version"):
+            args += ["--app-version", target["app_version"]]
+        if target.get("bundle_id"):
+            args += ["--bundle-id", target["bundle_id"]]
+        if target.get("package_name"):
+            args += ["--package-name", target["package_name"]]
+        r = subprocess.run(args, capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f"[error] scan failed (rc={r.returncode}): {r.stderr[:200]}", file=sys.stderr)
+            return None
+        try:
+            return json.loads(r.stdout)
+        except json.JSONDecodeError as e:
+            print(f"[error] JSON decode: {e}", file=sys.stderr)
+            return None
+
+
+    def post_event(mobile_detected: dict, module_id) -> str | None:
+        """POST to the kernel at /core/security/events and return the event_id.
+
+        Include module_id (which matches category/module_name in the
+        ledger) in the payload so the ACL path is_module_allowed can
+        filter results per viewer.
+        """
+        if module_id:
+            mobile_detected = dict(mobile_detected)
+            mobile_detected["module_id"] = module_id
+        body = {
+            "event_type": "detected",
+            "target_type": "mobile_app",
+            "cluster": "rag",
+            "mobile_detected": mobile_detected,
+        }
+        req = urllib.request.Request(
+            f"{KERNEL_URL}/core/security/events",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.loads(r.read())["event_id"]
+        except urllib.error.HTTPError as e:
+            print(f"[error] kernel POST {e.code}: {e.read().decode()[:200]}", file=sys.stderr)
+            return None
+        except Exception as e:
+            print(f"[error] kernel POST: {e}", file=sys.stderr)
+            return None
+
+
+    # Detail findings are stored separately from the events. Events
+    # go to the kernel's vuln_events index; mobile-scan detail
+    # findings go to vuln_findings_mobile. As with the container
+    # scanner, this runner writes to OpenSearch directly without
+    # going through the kernel.
+    OPENSEARCH_URL = os.environ.get(
+        "OPENSEARCH_URL", "http://opensearch.opensearch.svc.cluster.local:9200")
+    FINDINGS_INDEX = "vuln_findings_mobile"
+    _FINDINGS_MAPPING = {"mappings": {"properties": {
+        "event_id": {"type": "keyword"}, "scan_id": {"type": "keyword"},
+        "scan_kind": {"type": "keyword"}, "module_id": {"type": "keyword"},
+        "app_name": {"type": "keyword"}, "platform": {"type": "keyword"},
+        "bundle_id": {"type": "keyword"}, "package_name": {"type": "keyword"},
+        "app_version": {"type": "keyword"}, "artifact_path": {"type": "keyword"},
+        "finding_type": {"type": "keyword"}, "severity": {"type": "keyword"},
+        "severity_rank": {"type": "integer"},
+        "file": {"type": "keyword"}, "line": {"type": "integer"},
+        "snippet": {"type": "text"}, "description": {"type": "text"},
+        "timestamp": {"type": "date"},
+    }}}
+    _SEV_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+    _findings_index_ready = False
+
+
+    def _os_call(method: str, path: str, body=None, ndjson=None) -> dict:
+        if ndjson is not None:
+            data, ctype = ndjson.encode(), "application/x-ndjson"
+        else:
+            data = json.dumps(body).encode() if body is not None else None
+            ctype = "application/json"
+        req = urllib.request.Request(f"{OPENSEARCH_URL}{path}", data=data, method=method,
+                                     headers={"Content-Type": ctype})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            raw = r.read()
+        return json.loads(raw) if raw else {}
+
+
+    def _ensure_findings_index() -> None:
+        global _findings_index_ready
+        if _findings_index_ready:
+            return
+        try:
+            _os_call("HEAD", f"/{FINDINGS_INDEX}")
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise
+            try:
+                _os_call("PUT", f"/{FINDINGS_INDEX}", _FINDINGS_MAPPING)
+            except urllib.error.HTTPError as e2:
+                if e2.code != 400:  # 400 = index created concurrently (resource_already_exists)
+                    raise
+        _findings_index_ready = True
+
+
+    def index_findings(findings: list, event_id: str, module_id, md: dict,
+                       app_name: str, scan_kind: str) -> int:
+        """Store the detail findings as one document per finding, with
+        _id = event_id-<index> so a re-run does not duplicate them. If
+        this fails the event is already registered, so log a warning
+        and continue."""
+        if not findings:
+            return 0
+        try:
+            _ensure_findings_index()
+            ts = datetime.now(timezone.utc).isoformat()
+            common = {
+                "event_id": event_id, "scan_id": md.get("scan_id"), "scan_kind": scan_kind,
+                "module_id": module_id, "app_name": app_name, "platform": md.get("platform"),
+                "bundle_id": md.get("bundle_id"), "package_name": md.get("package_name"),
+                "app_version": md.get("app_version"), "artifact_path": md.get("artifact_path"),
+                "timestamp": ts,
+            }
+            lines = []
+            for i, f in enumerate(findings):
+                sev = f.get("severity") or "info"
+                doc = dict(common)
+                doc.update({
+                    "finding_type": f.get("finding_type"), "severity": sev,
+                    "severity_rank": _SEV_RANK.get(sev, 5),
+                    "file": f.get("file"), "line": int(f.get("line") or 0),
+                    "snippet": str(f.get("snippet") or "")[:1000],
+                    "description": str(f.get("description") or "")[:1000],
+                })
+                lines.append(json.dumps({"index": {"_index": FINDINGS_INDEX,
+                                                   "_id": f"{event_id}-{i:04d}"}}))
+                lines.append(json.dumps(doc, ensure_ascii=False))
+            res = _os_call("POST", "/_bulk?refresh=true", ndjson="\n".join(lines) + "\n")
+            if res.get("errors"):
+                bad = [it for it in res.get("items", []) if it.get("index", {}).get("error")]
+                print(f"[warn] some detail findings failed to store ({event_id}): "
+                      f"{len(bad)} item(s), sample {str(bad[:1])[:300]}", file=sys.stderr)
+                return len(findings) - len(bad)
+            return len(findings)
+        except Exception as e:
+            print(f"[warn] failed to store detail findings ({event_id}): {type(e).__name__}: {e}", file=sys.stderr)
+            return 0
+
+
+    def main():
+        if not Path(TARGETS_CONFIG_PATH).exists():
+            print(f"[fatal] no targets config: {TARGETS_CONFIG_PATH}", file=sys.stderr)
+            sys.exit(2)
+        if not Path(SCANNER_SCRIPT_PATH).exists():
+            print(f"[fatal] no scanner script: {SCANNER_SCRIPT_PATH}", file=sys.stderr)
+            sys.exit(2)
+
+        with open(TARGETS_CONFIG_PATH) as f:
+            config = yaml.safe_load(f)
+
+        modules = [m for m in config.get("modules", []) if m.get("enabled")]
+        # Also count the number of apps for cross-module aggregation.
+        total_apps = sum(len(m.get("apps", [])) for m in modules)
+        print(f"[info] {len(modules)} module(s) enabled ({total_apps} apps), dry_run={DRY_RUN}", flush=True)
+
+        workdir = Path(tempfile.mkdtemp(prefix="mobile-scan-"))
+        print(f"[info] workdir: {workdir}", flush=True)
+
+        ok = 0
+        fail = 0
+        for module in modules:
+            module_id = module.get("module_id")
+            display_name = module.get("display_name") or module_id or "?"
+            repo = module.get("repo")
+            print(f"[info] module={module_id} ({display_name}) repo={repo}", flush=True)
+            if not repo:
+                print(f"[error] {module_id}: no repo configured", file=sys.stderr)
+                fail += len(module.get("apps", []))
+                continue
+
+            # 1. clone (shared across apps in this module).
+            repo_dir = workdir / repo.replace("/", "_")
+            if not clone_repo(repo, repo_dir):
+                fail += len(module.get("apps", []))
+                continue
+
+            for target in module.get("apps", []):
+                name = target["name"]
+                subpath = target["subpath"]
+                print(f"[info]   scanning {name} (subpath={subpath})", flush=True)
+
+                # 2. scan
+                scan_root = repo_dir / subpath
+                if not scan_root.is_dir():
+                    print(f"[error]   subpath not exist: {scan_root}", file=sys.stderr)
+                    fail += 1
+                    continue
+                result = run_scanner(scan_root, target)
+                if result is None:
+                    fail += 1
+                    continue
+
+                total = result.get("total_findings", 0)
+                severity = result["mobile_detected"].get("severity_counts", {})
+
+                # 3. POST to kernel (skip when dry_run).
+                if DRY_RUN:
+                    print(f"[dry-run]   {name}: total={total} severity={severity}", flush=True)
+                    ok += 1
+                    continue
+
+                event_id = post_event(result["mobile_detected"], module_id)
+                if event_id is None:
+                    fail += 1
+                    continue
+                n_saved = index_findings(result.get("detail_findings") or [], event_id,
+                                         module_id, result["mobile_detected"], name, "source")
+                print(f"[info]   stored {n_saved} finding(s) in {FINDINGS_INDEX}", flush=True)
+
+                print(
+                    f"[ok]   {name}: total={total} severity={severity} "
+                    f"event_id={event_id}",
+                    flush=True,
+                )
+                ok += 1
+
+        print(f"[summary] ok={ok} fail={fail}", flush=True)
+        sys.exit(0 if fail == 0 else 1)
+
+
+    if __name__ == "__main__":
+        main()
