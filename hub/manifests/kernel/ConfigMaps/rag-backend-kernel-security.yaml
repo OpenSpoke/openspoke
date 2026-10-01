@@ -1,0 +1,933 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-backend-kernel-security
+  namespace: rag-company1
+data:
+  security_endpoints.py: |
+    """
+    security_endpoints.py
+    ====================================================================
+    脆弱性診断 (openspoke-vuln-scanner) のオンデマンド絞込スキャンを
+    発火するためのエンドポイント。
+
+    エンドポイント (prefix=/core/security):
+      - POST /scan/trigger         絞込スキャン Job を security namespace に発火
+      - GET  /scan/job/{job_name}  発火した Job のステータス取得
+
+    設計方針:
+      - 一時 Job (metadata.name = vuln-scanner-triggered-<epoch>) を security
+        namespace に kubernetes API で作成する。 Fleet 管理下の
+        vuln-scanner Job (metadata.name=vuln-scanner) とは metadata.name が
+        異なるので衝突しない。
+      - Job spec は Fleet 管理下 Job と同等: script は共通の
+        vuln-scanner-script ConfigMap を volume mount で共用、
+        ServiceAccount は security 側の vuln-scanner を継承。
+      - env に TARGET_IMAGE_PATTERNS を渡し、 スキャン対象を絞る。
+      - ttlSecondsAfterFinished=604800 で 7 日後に自動削除。
+      - RBAC は別途 security ネームスペースの Role/RoleBinding
+        (rag-backend-kernel-scanner) で kernel に付与済み。
+
+    依存: kubernetes==31.0.0 (kernel Pod の initContainer で投入済)
+    """
+    from __future__ import annotations
+
+    import json
+    import logging
+    import os
+    import time
+    import uuid
+    from datetime import datetime, timezone
+    from typing import Any, Dict, List, Optional
+
+    from fastapi import APIRouter, HTTPException
+    from pydantic import BaseModel
+
+    logger = logging.getLogger(__name__)
+
+    # ── kubernetes client (遅延 import) ──
+    try:
+        from kubernetes import client as k8s_client
+        from kubernetes import config as k8s_config
+        from kubernetes.client.rest import ApiException
+        _K8S_AVAILABLE = True
+    except ImportError as _e:
+        logger.warning(f"[SECURITY] kubernetes library not available: {_e}")
+        _K8S_AVAILABLE = False
+        k8s_client = None
+        k8s_config = None
+        ApiException = Exception
+
+
+    router = APIRouter(prefix="/core/security", tags=["security"])
+
+
+    # ── 定数 (Fleet 管理下の vuln-scanner Job spec に整合) ──
+    _SCANNER_IMAGE = "ghcr.io/openspoke/openspoke-vuln-scanner:0.1.0"
+    _SECURITY_NAMESPACE = "security"
+    _SCRIPT_CONFIGMAP = "vuln-scanner-script"
+    _SERVICE_ACCOUNT = "vuln-scanner"
+    _TRIVY_IMAGE_DIGEST = (
+        "sha256:75ebe8fe37097593f2f4e41a2096c3e9e3bdd2aa45c661f602d7ea6c5b27ed22"
+    )
+
+    _STATIC_ENV = [
+        ("CLUSTER_NAME", "rag"),
+        ("OPENSEARCH_URL", "http://opensearch.opensearch.svc.cluster.local:9200"),
+        ("MINIO_ENDPOINT", "minio.milvus.svc.cluster.local:9000"),
+        ("MINIO_ACCESS_KEY", "minioadmin"),
+        ("MINIO_SECRET_KEY", "minioadminpassword"),
+        ("MINIO_BUCKET", "security-scans"),
+        ("TRIVY_VERSION", "v0.72.0"),
+        ("TRIVY_IMAGE_DIGEST", _TRIVY_IMAGE_DIGEST),
+    ]
+
+
+    # ── リクエスト・レスポンス スキーマ ──
+    class ScanTriggerRequest(BaseModel):
+        image_patterns: List[str]
+
+
+    class ScanTriggerResponse(BaseModel):
+        job_name: str
+        namespace: str
+        image_patterns: List[str]
+        message: str
+
+
+    class ScanJobStatusResponse(BaseModel):
+        job_name: str
+        namespace: str
+        active: int
+        succeeded: int
+        failed: int
+        start_time: Optional[str]
+        completion_time: Optional[str]
+        phase: str  # running / succeeded / failed / unknown
+
+
+    # ── kubernetes API client (遅延初期化) ──
+    _batch_api: Optional[object] = None
+    _core_api: Optional[object] = None
+
+
+    def _ensure_k8s_available() -> None:
+        if not _K8S_AVAILABLE:
+            raise HTTPException(
+                status_code=503,
+                detail="kubernetes client library is not available in this Pod",
+            )
+
+
+    def _load_config_once() -> None:
+        try:
+            k8s_config.load_incluster_config()
+            logger.info("[SECURITY] in-cluster config loaded")
+        except Exception as e:
+            try:
+                k8s_config.load_kube_config()
+                logger.info("[SECURITY] kubeconfig loaded (fallback)")
+            except Exception as e2:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"failed to load kube config: {type(e).__name__}: {e}",
+                )
+
+
+    def _get_batch_api():
+        global _batch_api
+        if _batch_api is None:
+            _ensure_k8s_available()
+            _load_config_once()
+            _batch_api = k8s_client.BatchV1Api()
+        return _batch_api
+
+
+    def _get_core_api():
+        global _core_api
+        if _core_api is None:
+            _ensure_k8s_available()
+            _load_config_once()
+            _core_api = k8s_client.CoreV1Api()
+        return _core_api
+
+
+    def _build_job(job_name: str, image_patterns: List[str]):
+        """一時 Job manifest を組み立てる。 Fleet 管理下 Job spec と揃える。"""
+        env_list = [
+            k8s_client.V1EnvVar(name=name, value=value)
+            for (name, value) in _STATIC_ENV
+        ]
+        env_list.append(
+            k8s_client.V1EnvVar(
+                name="TARGET_IMAGE_PATTERNS",
+                value=",".join(image_patterns),
+            )
+        )
+
+        return k8s_client.V1Job(
+            api_version="batch/v1",
+            kind="Job",
+            metadata=k8s_client.V1ObjectMeta(
+                name=job_name,
+                namespace=_SECURITY_NAMESPACE,
+                labels={
+                    "app": "vuln-scanner",
+                    "scope": "targeted",
+                    "triggered-by": "kernel",
+                },
+            ),
+            spec=k8s_client.V1JobSpec(
+                backoff_limit=0,
+                ttl_seconds_after_finished=604800,
+                template=k8s_client.V1PodTemplateSpec(
+                    metadata=k8s_client.V1ObjectMeta(
+                        labels={
+                            "app": "vuln-scanner",
+                            "scope": "targeted",
+                        },
+                    ),
+                    spec=k8s_client.V1PodSpec(
+                        service_account_name=_SERVICE_ACCOUNT,
+                        restart_policy="Never",
+                        containers=[
+                            k8s_client.V1Container(
+                                name="scanner",
+                                image=_SCANNER_IMAGE,
+                                command=["python3", "/scripts/scan.py"],
+                                env=env_list,
+                                resources=k8s_client.V1ResourceRequirements(
+                                    requests={"cpu": "100m", "memory": "512Mi"},
+                                    limits={"memory": "2Gi"},
+                                ),
+                                volume_mounts=[
+                                    k8s_client.V1VolumeMount(
+                                        name="scripts",
+                                        mount_path="/scripts",
+                                        read_only=True,
+                                    ),
+                                ],
+                            ),
+                        ],
+                        volumes=[
+                            k8s_client.V1Volume(
+                                name="scripts",
+                                config_map=k8s_client.V1ConfigMapVolumeSource(
+                                    name=_SCRIPT_CONFIGMAP,
+                                    default_mode=0o755,
+                                ),
+                            ),
+                        ],
+                    ),
+                ),
+            ),
+        )
+
+
+    @router.post("/scan/trigger", response_model=ScanTriggerResponse)
+    def trigger_scan(req: ScanTriggerRequest):
+        """特定の image パターンを対象に脆弱性スキャン Job を発火する。"""
+        # 入力検証
+        patterns = [p.strip() for p in (req.image_patterns or []) if p and p.strip()]
+        if not patterns:
+            raise HTTPException(
+                status_code=400,
+                detail="image_patterns は空でない文字列を 1 個以上指定してください",
+            )
+        if len(patterns) > 20:
+            raise HTTPException(
+                status_code=400,
+                detail="image_patterns は最大 20 個まで指定できます",
+            )
+        for p in patterns:
+            if "," in p:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"pattern に ',' を含められません: {p!r}",
+                )
+
+        # job_name は epoch 秒で一意化
+        job_name = f"vuln-scanner-triggered-{int(time.time())}"
+
+        api = _get_batch_api()
+        body = _build_job(job_name, patterns)
+
+        try:
+            api.create_namespaced_job(namespace=_SECURITY_NAMESPACE, body=body)
+            logger.info(
+                f"[SECURITY] triggered scan job_name={job_name}, patterns={patterns}"
+            )
+        except ApiException as e:
+            logger.error(f"[SECURITY] create_namespaced_job failed: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Job 作成に失敗しました: {e.reason} (status={e.status})",
+            )
+        except Exception as e:
+            logger.error(f"[SECURITY] create_namespaced_job unexpected error: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Job 作成中に予期しないエラー: {type(e).__name__}: {e}",
+            )
+
+        return ScanTriggerResponse(
+            job_name=job_name,
+            namespace=_SECURITY_NAMESPACE,
+            image_patterns=patterns,
+            message=(
+                "診断 Job を発火しました。 数分で完了しますので、"
+                " 走行一覧タブから scan_id を選んで結果をご確認ください。"
+            ),
+        )
+
+
+    @router.get("/scan/job/{job_name}", response_model=ScanJobStatusResponse)
+    def get_scan_job_status(job_name: str):
+        """発火した Job の進行状況を返す。 UI 側の進捗表示に使う。"""
+        if not job_name or "/" in job_name:
+            raise HTTPException(status_code=400, detail="invalid job_name")
+
+        api = _get_batch_api()
+        try:
+            job = api.read_namespaced_job(name=job_name, namespace=_SECURITY_NAMESPACE)
+        except ApiException as e:
+            if e.status == 404:
+                raise HTTPException(status_code=404, detail=f"Job not found: {job_name}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Job 参照に失敗しました: {e.reason}",
+            )
+
+        status = job.status or k8s_client.V1JobStatus()
+        active = int(status.active or 0)
+        succeeded = int(status.succeeded or 0)
+        failed = int(status.failed or 0)
+        start_time = status.start_time.isoformat() if status.start_time else None
+        completion_time = (
+            status.completion_time.isoformat() if status.completion_time else None
+        )
+
+        if succeeded > 0 and completion_time:
+            phase = "succeeded"
+        elif failed > 0:
+            phase = "failed"
+        elif active > 0:
+            phase = "running"
+        elif start_time and not completion_time:
+            phase = "running"
+        else:
+            phase = "unknown"
+
+        return ScanJobStatusResponse(
+            job_name=job_name,
+            namespace=_SECURITY_NAMESPACE,
+            active=active,
+            succeeded=succeeded,
+            failed=failed,
+            start_time=start_time,
+            completion_time=completion_time,
+            phase=phase,
+        )
+
+
+    # ==============================================================================
+    # 脆弱性対応履歴 (vuln_events)
+    # ==============================================================================
+    # モジュール単位で 3 種類の event を時系列で記録:
+    #   detected: スキャンで脆弱性が検出された
+    #   patched:  修正・パッチが施された (image tag 変更等)
+    #   verified: 修正後スキャンで解消を確認した
+    #
+    # OpenSearch インデックス: vuln_events (初回 POST 時に dynamic mapping で自動作成)
+    # 記録:
+    #   - detected と verified は scan.py 拡張で自動記録 (Phase B、 未実装)
+    #   - patched は UI から手動記録 (Phase D、 未実装)
+    #   - Phase A ではこの API 群 (POST/GET/DELETE) だけを用意する
+    # ==============================================================================
+
+    _OS_URL = os.environ.get(
+        "OPENSEARCH_URL",
+        "http://opensearch.opensearch.svc.cluster.local:9200",
+    )
+    _EVENTS_INDEX = "vuln_events"
+
+
+    class VulnEventDetectedPayload(BaseModel):
+        scan_id: str
+        image_tag: str
+        severity_counts: Dict[str, int] = {}
+        cve_ids: List[str] = []
+
+
+    class LibraryUpdatePayload(BaseModel):
+        """ライブラリー・パッケージのバージョン更新 1 件の記録。"""
+        name: str
+        before_version: Optional[str] = None
+        after_version: Optional[str] = None
+        cve_ids: List[str] = []
+        # os (apt/apk 等)、 language (pip/npm/gem 等)、 application などの層
+        layer: Optional[str] = None
+
+
+    class BaseImageUpdatePayload(BaseModel):
+        """ベースイメージ更新 1 件の記録。"""
+        component: str  # 例: debian, alpine, python, node
+        before: Optional[str] = None  # 例: python:3.12-slim
+        after: Optional[str] = None
+        cve_ids: List[str] = []
+
+
+    class CodeChangePayload(BaseModel):
+        """コード修正 1 件の記録 (Dockerfile も含む)。"""
+        file: str
+        commit: Optional[str] = None
+        description: Optional[str] = None
+        diff_summary: Optional[str] = None
+
+
+    class BuildInfoPayload(BaseModel):
+        """再ビルドの詳細。"""
+        builder: Optional[str] = None  # ビルダ識別 (例: mc-rust-builder-dind)
+        dockerfile_path: Optional[str] = None
+        started_at: Optional[str] = None
+        completed_at: Optional[str] = None
+        image_digest_before: Optional[str] = None
+        image_digest_after: Optional[str] = None
+        registry_url: Optional[str] = None
+
+
+    class RolloutInfoPayload(BaseModel):
+        """rollout (再デプロイ) の詳細。"""
+        deployment_namespace: Optional[str] = None
+        deployment_name: Optional[str] = None
+        started_at: Optional[str] = None
+        completed_at: Optional[str] = None
+        pod_hash_before: Optional[str] = None
+        pod_hash_after: Optional[str] = None
+        restarted_at_annotation: Optional[str] = None
+
+
+    class VerificationStepPayload(BaseModel):
+        """rollout 完了後の検証 1 件の記録 (アプリの動作確認等)。"""
+        step_name: str  # 例: startup_log_check, health_endpoint, api_smoke_test
+        checked_at: Optional[str] = None
+        result: str  # ok / warning / fail
+        details: Optional[str] = None
+
+
+    class VulnEventPatchedPayload(BaseModel):
+        # 基本 (旧フィールド、 後方互換)
+        image_tag_before: Optional[str] = None
+        image_tag_after: Optional[str] = None
+        deployment_ref: Optional[Dict[str, str]] = None
+        actor: Optional[str] = None
+        notes: Optional[str] = None
+        # 克明な記録用の新フィールド (2026-09-21 追加)
+        summary: Optional[str] = None
+        cve_addressed: List[str] = []
+        library_updates: List[LibraryUpdatePayload] = []
+        base_image_updates: List[BaseImageUpdatePayload] = []
+        code_changes: List[CodeChangePayload] = []
+        build_info: Optional[BuildInfoPayload] = None
+        rollout_info: Optional[RolloutInfoPayload] = None
+        # rollout 完了後の動作検証記録 (2026-09-21 追加)
+        verification_steps: List[VerificationStepPayload] = []
+
+
+    class VulnEventVerifiedPayload(BaseModel):
+        scan_id: str
+        patched_event_id: Optional[str] = None
+        severity_counts_before: Dict[str, int] = {}
+        severity_counts_after: Dict[str, int] = {}
+        resolved_cve_ids: List[str] = []
+        remaining_cve_ids: List[str] = []
+
+
+    # ==============================================================================
+    # モバイルアプリスキャン (Phase 4、 2026-09-23 追加) 用の payload。
+    # 既存の container image スキャンとは対象と検出内容が異なるため、
+    # 別 payload として定義。 event は同じ vuln_events index に混在させ、
+    # target_type field で分類する。
+    # ==============================================================================
+
+
+    class MobileFindingSummary(BaseModel):
+        """モバイルアプリスキャン検出項目 1 種類の集約。"""
+        finding_type: str  # 例: hardcoded_secret, weak_crypto, dangerous_api,
+                           #     permission_over_request, tls_config_weak
+        severity: str  # critical / high / medium / low / info
+        count: int
+
+
+    class MobileFixPayload(BaseModel):
+        """モバイルアプリの修正 1 件の記録。"""
+        finding_type: str
+        file: Optional[str] = None
+        commit: Optional[str] = None
+        description: Optional[str] = None
+
+
+    class VulnEventMobileDetectedPayload(BaseModel):
+        """モバイルアプリスキャンで検出された時の payload。"""
+        scan_id: str
+        platform: str  # ios or android
+        bundle_id: Optional[str] = None  # iOS: 例 com.example.storefront
+        package_name: Optional[str] = None  # Android: 例 com.example.storefront
+        app_version: Optional[str] = None  # 例: 2.51.1
+        app_version_code: Optional[str] = None  # Android の versionCode
+        artifact_path: Optional[str] = None  # MinIO 上の .ipa / .apk の path
+        # OpenSpoke 台帳の category/module_name (例: Application/example-org/storefront/StorefrontIos)
+        # user_acl の is_module_allowed にする鍵。 後方互換のため Optional。
+        module_id: Optional[str] = None
+        severity_counts: Dict[str, int] = {}
+        finding_summaries: List[MobileFindingSummary] = []
+
+
+    class VulnEventMobilePatchedPayload(BaseModel):
+        """モバイルアプリ scan の対応記録の payload。"""
+        platform: str  # ios or android
+        bundle_id: Optional[str] = None
+        package_name: Optional[str] = None
+        module_id: Optional[str] = None
+        app_version_before: Optional[str] = None
+        app_version_after: Optional[str] = None
+        actor: Optional[str] = None
+        summary: Optional[str] = None
+        notes: Optional[str] = None
+        fixes: List[MobileFixPayload] = []
+        build_info: Optional[BuildInfoPayload] = None
+        verification_steps: List[VerificationStepPayload] = []
+
+
+    class VulnEventMobileVerifiedPayload(BaseModel):
+        """モバイルアプリ scan 対応後の verified 記録の payload。"""
+        scan_id: str
+        patched_event_id: Optional[str] = None
+        platform: str
+        bundle_id: Optional[str] = None
+        package_name: Optional[str] = None
+        module_id: Optional[str] = None
+        severity_counts_before: Dict[str, int] = {}
+        severity_counts_after: Dict[str, int] = {}
+        resolved_finding_types: List[str] = []
+        remaining_finding_types: List[str] = []
+
+
+    class VulnEventCreate(BaseModel):
+        event_type: str
+        # container image scan の場合の対象 identifier
+        # target_type=container_image の場合は必須、 それ以外の場合は省略可
+        image_repo: Optional[str] = None
+        cluster: str = "rag"
+        timestamp: Optional[str] = None
+        # 対象分類 (Phase 3/4 で追加、 default は既存の container_image で後方互換)
+        target_type: str = "container_image"  # container_image / mobile_app / source_repo
+        # container image scan (既存)
+        detected: Optional[VulnEventDetectedPayload] = None
+        patched: Optional[VulnEventPatchedPayload] = None
+        verified: Optional[VulnEventVerifiedPayload] = None
+        # mobile app scan (Phase 4、 2026-09-23 追加)
+        mobile_detected: Optional[VulnEventMobileDetectedPayload] = None
+        mobile_patched: Optional[VulnEventMobilePatchedPayload] = None
+        mobile_verified: Optional[VulnEventMobileVerifiedPayload] = None
+
+
+    class VulnEventResponse(BaseModel):
+        event_id: str
+        result: str
+
+
+    class VulnEventItem(BaseModel):
+        event_id: str
+        event_type: str
+        image_repo: Optional[str] = None  # target_type=container_image の場合のみ
+        cluster: str
+        timestamp: str
+        target_type: str = "container_image"
+        detected: Optional[Dict[str, Any]] = None
+        patched: Optional[Dict[str, Any]] = None
+        verified: Optional[Dict[str, Any]] = None
+        mobile_detected: Optional[Dict[str, Any]] = None
+        mobile_patched: Optional[Dict[str, Any]] = None
+        mobile_verified: Optional[Dict[str, Any]] = None
+
+
+    class VulnEventListResponse(BaseModel):
+        items: List[VulnEventItem]
+        total: int
+
+
+    _VALID_EVENT_TYPES = frozenset({"detected", "patched", "verified"})
+    _VALID_TARGET_TYPES = frozenset({"container_image", "mobile_app", "source_repo"})
+
+
+    def _os_request(method: str, path: str, body: Optional[dict] = None,
+                    timeout: int = 15) -> dict:
+        """OpenSearch に直接 HTTP リクエストを送るヘルパー。 auth なし。"""
+        import urllib.request
+        import urllib.error
+        url = f"{_OS_URL.rstrip('/')}{path}"
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(
+            url, data=data,
+            headers={"Content-Type": "application/json"},
+            method=method,
+        )
+        try:
+            r = urllib.request.urlopen(req, timeout=timeout)
+            return json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            try:
+                err_body = e.read().decode()
+            except Exception:
+                err_body = str(e)
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"OpenSearch {method} {path}: "
+                    f"HTTP {e.code} {err_body[:400]}"
+                ),
+            )
+        except Exception as e:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"OpenSearch {method} {path}: "
+                    f"{type(e).__name__}: {e}"
+                ),
+            )
+
+
+    @router.post("/events", response_model=VulnEventResponse)
+    def create_vuln_event(req: VulnEventCreate):
+        """脆弱性対応 event を 1 件記録する。 detected/patched/verified の 3 種。
+
+        target_type で対象分類を切替: container_image (既存)、 mobile_app (Phase 4)、
+        source_repo (Phase 3、 未実装)。 default は container_image で後方互換。
+        """
+        if req.event_type not in _VALID_EVENT_TYPES:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "event_type は detected / patched / verified の"
+                    " いずれかを指定してください"
+                ),
+            )
+        if req.target_type not in _VALID_TARGET_TYPES:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "target_type は container_image / mobile_app / source_repo の"
+                    " いずれかを指定してください"
+                ),
+            )
+        # target_type ごとの必須 field チェック
+        if req.target_type == "container_image":
+            if not req.image_repo or not req.image_repo.strip():
+                raise HTTPException(
+                    status_code=400,
+                    detail="target_type=container_image では image_repo は必須です",
+                )
+        elif req.target_type == "mobile_app":
+            mobile_payload = (
+                req.mobile_detected if req.event_type == "detected"
+                else req.mobile_patched if req.event_type == "patched"
+                else req.mobile_verified
+            )
+            if mobile_payload is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"target_type=mobile_app で event_type={req.event_type} には"
+                        f" mobile_{req.event_type} payload が必須です"
+                    ),
+                )
+            if not (mobile_payload.bundle_id or mobile_payload.package_name):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "mobile_app では bundle_id (iOS) または package_name (Android)"
+                        " のいずれかが必須です"
+                    ),
+                )
+
+        event_id = str(uuid.uuid4())
+        timestamp = req.timestamp or datetime.now(timezone.utc).isoformat()
+
+        doc = {
+            "event_id": event_id,
+            "event_type": req.event_type,
+            "cluster": req.cluster,
+            "timestamp": timestamp,
+            "target_type": req.target_type,
+        }
+        if req.image_repo:
+            doc["image_repo"] = req.image_repo.strip()
+
+        # container image scan payload (target_type=container_image で使う)
+        if req.event_type == "detected" and req.detected is not None:
+            doc["detected"] = req.detected.dict()
+        elif req.event_type == "patched" and req.patched is not None:
+            doc["patched"] = req.patched.dict(exclude_none=True)
+        elif req.event_type == "verified" and req.verified is not None:
+            doc["verified"] = req.verified.dict()
+
+        # mobile app scan payload (target_type=mobile_app で使う)
+        if req.event_type == "detected" and req.mobile_detected is not None:
+            doc["mobile_detected"] = req.mobile_detected.dict(exclude_none=True)
+        elif req.event_type == "patched" and req.mobile_patched is not None:
+            doc["mobile_patched"] = req.mobile_patched.dict(exclude_none=True)
+        elif req.event_type == "verified" and req.mobile_verified is not None:
+            doc["mobile_verified"] = req.mobile_verified.dict(exclude_none=True)
+
+        _os_request(
+            "POST",
+            f"/{_EVENTS_INDEX}/_doc/{event_id}?refresh=true",
+            doc,
+        )
+        # log 用 identifier: container_image は image_repo、 mobile_app は bundle_id or package_name
+        _identifier = req.image_repo or "-"
+        if req.target_type == "mobile_app":
+            for _p in (req.mobile_detected, req.mobile_patched, req.mobile_verified):
+                if _p is not None:
+                    _identifier = _p.bundle_id or _p.package_name or "-"
+                    break
+        logger.info(
+            f"[SECURITY] vuln_event created: id={event_id}, "
+            f"type={req.event_type}, target_type={req.target_type}, "
+            f"identifier={_identifier}"
+        )
+        return VulnEventResponse(event_id=event_id, result="created")
+
+
+    @router.get("/events", response_model=VulnEventListResponse)
+    def list_vuln_events(
+        image_repo: Optional[str] = None,
+        event_type: Optional[str] = None,
+        limit: int = 50,
+    ):
+        """脆弱性対応 event の一覧を取得する。 image_repo / event_type でフィルタ可能。"""
+        if limit < 1 or limit > 500:
+            raise HTTPException(
+                status_code=400,
+                detail="limit は 1 から 500 の間で指定してください",
+            )
+        must = []
+        if image_repo:
+            must.append({"term": {"image_repo": image_repo}})
+        if event_type:
+            if event_type not in _VALID_EVENT_TYPES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "event_type は detected / patched / verified の"
+                        " いずれかを指定してください"
+                    ),
+                )
+            must.append({"term": {"event_type": event_type}})
+
+        query = {"bool": {"must": must}} if must else {"match_all": {}}
+        body = {
+            "size": limit,
+            "sort": [{"timestamp": {"order": "desc"}}],
+            "query": query,
+        }
+        try:
+            result = _os_request(
+                "POST",
+                f"/{_EVENTS_INDEX}/_search",
+                body,
+            )
+        except HTTPException as e:
+            # index が存在しない (初回アクセス時) は空リストを返す
+            detail_str = str(e.detail)
+            if "index_not_found" in detail_str or "404" in detail_str:
+                return VulnEventListResponse(items=[], total=0)
+            raise
+
+        hits = result.get("hits", {}).get("hits", []) or []
+        total = int(
+            (result.get("hits", {}).get("total") or {}).get("value") or 0
+        )
+        items = []
+        for h in hits:
+            src = h.get("_source", {}) or {}
+            items.append(VulnEventItem(
+                event_id=src.get("event_id") or h.get("_id") or "",
+                event_type=src.get("event_type") or "",
+                image_repo=src.get("image_repo") or "",
+                cluster=src.get("cluster") or "",
+                timestamp=src.get("timestamp") or "",
+                detected=src.get("detected"),
+                patched=src.get("patched"),
+                verified=src.get("verified"),
+            ))
+        return VulnEventListResponse(items=items, total=total)
+
+
+    @router.get("/events/{event_id}", response_model=VulnEventItem)
+    def get_vuln_event(event_id: str):
+        """特定 event の詳細を取得する。"""
+        try:
+            result = _os_request(
+                "GET",
+                f"/{_EVENTS_INDEX}/_doc/{event_id}",
+            )
+        except HTTPException as e:
+            if "404" in str(e.detail):
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"event not found: {event_id}",
+                )
+            raise
+        src = result.get("_source", {}) or {}
+        return VulnEventItem(
+            event_id=src.get("event_id") or event_id,
+            event_type=src.get("event_type") or "",
+            image_repo=src.get("image_repo") or "",
+            cluster=src.get("cluster") or "",
+            timestamp=src.get("timestamp") or "",
+            detected=src.get("detected"),
+            patched=src.get("patched"),
+            verified=src.get("verified"),
+        )
+
+
+    @router.put("/events/{event_id}", response_model=VulnEventResponse)
+    def update_vuln_event(event_id: str, req: VulnEventCreate):
+        """特定 event を更新する (全体上書き)。
+
+        主用途: patched event に verification_steps を後から追記する場合や、
+        誤登録の訂正で内容を差し替える場合。 event_id は変更しない。
+        timestamp は req.timestamp があればそれを、 無ければ元の timestamp を保つ
+        (client が明示的に指定しない限り 「対応した日時」 は変わらない)。
+        target_type で対象分類を切替 (create_vuln_event と同じルール)。
+        """
+        if req.event_type not in _VALID_EVENT_TYPES:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "event_type は detected / patched / verified の"
+                    " いずれかを指定してください"
+                ),
+            )
+        if req.target_type not in _VALID_TARGET_TYPES:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "target_type は container_image / mobile_app / source_repo の"
+                    " いずれかを指定してください"
+                ),
+            )
+        # target_type ごとの必須 field チェック
+        if req.target_type == "container_image":
+            if not req.image_repo or not req.image_repo.strip():
+                raise HTTPException(
+                    status_code=400,
+                    detail="target_type=container_image では image_repo は必須です",
+                )
+        elif req.target_type == "mobile_app":
+            mobile_payload = (
+                req.mobile_detected if req.event_type == "detected"
+                else req.mobile_patched if req.event_type == "patched"
+                else req.mobile_verified
+            )
+            if mobile_payload is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"target_type=mobile_app で event_type={req.event_type} には"
+                        f" mobile_{req.event_type} payload が必須です"
+                    ),
+                )
+            if not (mobile_payload.bundle_id or mobile_payload.package_name):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "mobile_app では bundle_id (iOS) または package_name (Android)"
+                        " のいずれかが必須です"
+                    ),
+                )
+
+        # 既存 event を取得して timestamp を保つ (client が上書き指定しなければ)
+        prev_ts: Optional[str] = None
+        try:
+            prev = _os_request(
+                "GET",
+                f"/{_EVENTS_INDEX}/_doc/{event_id}",
+            )
+            prev_ts = ((prev.get("_source") or {}).get("timestamp"))
+        except HTTPException as e:
+            if "404" in str(e.detail):
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"event not found: {event_id}",
+                )
+            raise
+
+        timestamp = (
+            req.timestamp or prev_ts
+            or datetime.now(timezone.utc).isoformat()
+        )
+        doc = {
+            "event_id": event_id,
+            "event_type": req.event_type,
+            "cluster": req.cluster,
+            "timestamp": timestamp,
+            "target_type": req.target_type,
+        }
+        if req.image_repo:
+            doc["image_repo"] = req.image_repo.strip()
+
+        # container image scan payload
+        if req.event_type == "detected" and req.detected is not None:
+            doc["detected"] = req.detected.dict()
+        elif req.event_type == "patched" and req.patched is not None:
+            doc["patched"] = req.patched.dict(exclude_none=True)
+        elif req.event_type == "verified" and req.verified is not None:
+            doc["verified"] = req.verified.dict()
+
+        # mobile app scan payload
+        if req.event_type == "detected" and req.mobile_detected is not None:
+            doc["mobile_detected"] = req.mobile_detected.dict(exclude_none=True)
+        elif req.event_type == "patched" and req.mobile_patched is not None:
+            doc["mobile_patched"] = req.mobile_patched.dict(exclude_none=True)
+        elif req.event_type == "verified" and req.mobile_verified is not None:
+            doc["mobile_verified"] = req.mobile_verified.dict(exclude_none=True)
+
+        _os_request(
+            "PUT",
+            f"/{_EVENTS_INDEX}/_doc/{event_id}?refresh=true",
+            doc,
+        )
+        # log 用 identifier
+        _identifier = req.image_repo or "-"
+        if req.target_type == "mobile_app":
+            for _p in (req.mobile_detected, req.mobile_patched, req.mobile_verified):
+                if _p is not None:
+                    _identifier = _p.bundle_id or _p.package_name or "-"
+                    break
+        logger.info(
+            f"[SECURITY] vuln_event updated: id={event_id}, "
+            f"type={req.event_type}, target_type={req.target_type}, "
+            f"identifier={_identifier}"
+        )
+        return VulnEventResponse(event_id=event_id, result="updated")
+
+
+    @router.delete("/events/{event_id}")
+    def delete_vuln_event(event_id: str):
+        """特定 event を削除する (誤登録の訂正用)。"""
+        try:
+            _os_request(
+                "DELETE",
+                f"/{_EVENTS_INDEX}/_doc/{event_id}?refresh=true",
+            )
+        except HTTPException as e:
+            if "404" in str(e.detail):
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"event not found: {event_id}",
+                )
+            raise
+        return {"result": "deleted", "event_id": event_id}
