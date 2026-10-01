@@ -1,0 +1,667 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mobile-scan-script
+  namespace: security-mobile
+  labels:
+    purpose: mobile-vulnerability-scanner
+data:
+  # Mobile-app source-code static scanner.
+  # Target: Swift (iOS), Kotlin/Java (Android), Info.plist,
+  # AndroidManifest.xml, build.gradle.kts.
+  # Output: JSON on stdout that matches the kernel's
+  # VulnEventMobileDetectedPayload contract at /core/security/events.
+  # This ConfigMap is the source of truth for the scanner. The
+  # mobile-scan-runner CronJob mounts it directly. GitOps keeps the
+  # ConfigMap in sync with this file.
+  # Invocation:
+  #   python3 mobile_scan.py --root <dir> --platform ios|android \
+  #     --bundle-id X --app-version Y --scan-id Z
+  mobile_scan.py: |
+    #!/usr/bin/env python3
+    """Mobile-app source-code static scanner.
+
+    Target: Swift (iOS) and Kotlin (Android) source, plus Info.plist
+    and AndroidManifest.xml.
+    Output: JSON on stdout matching the VulnEventMobileDetectedPayload
+    contract.
+
+    Detected finding_type values:
+      - hardcoded_secret: apiKey/password/token/secret with a long
+        string-literal value.
+      - weak_crypto: MD5 / SHA-1 / DES usage.
+      - dangerous_api: NSAllowsArbitraryLoads,
+        setHostnameVerifier(ALLOW_ALL), etc.
+      - permission_over_request: dangerous permission requested in
+        AndroidManifest.
+      - tls_config_weak: cleartextTraffic or embedded http:// URLs.
+      Additional OWASP MASVS-inspired checks:
+      - vulnerable_dependency: declared gradle dependencies checked
+        against OSV (osv.dev).
+      - insecure_storage / keychain_weak_accessibility: credential-
+        shaped values written in cleartext.
+      - sensitive_logging: credentials printed to logs, or OkHttp
+        body logging.
+      - webview_insecure: WebView file access, JavaScript bridges,
+        or UIWebView.
+      - backup_enabled / exported_component / deep_link_custom_scheme
+        / deep_link_entry: exported components, deep links, and
+        backup settings in AndroidManifest.
+
+    Usage: python3 mobile_scan.py --root <dir> \\
+      --platform ios|android --bundle-id X --app-version Y
+    """
+    import argparse
+    import json
+    import os
+    import re
+    import sys
+    import time
+    import uuid
+    import tomllib
+    import urllib.request
+    import plistlib
+    import xml.etree.ElementTree as ET
+    try:
+        import yaml  # For xcodegen project.yml (PyYAML is installed in the runner Pod).
+    except ImportError:
+        yaml = None
+    from collections import Counter
+    from pathlib import Path
+
+    # Detection rules: (finding_type, severity, regex, description).
+    IOS_RULES = [
+        ("hardcoded_secret", "high",
+         r'(?i)\b(?:api[_-]?key|password|secret|token|access[_-]?token)\b\s*[=:]\s*"([A-Za-z0-9+/=_\-]{20,})"',
+         "Potential hardcoded credential in Swift source"),
+        ("weak_crypto", "medium",
+         r'\b(?:CC_MD5|CC_SHA1|kSecAttrKeyTypeDES|CommonCrypto\.MD5|Insecure\.(?:MD5|SHA1))\b',
+         "MD5 / SHA-1 / DES usage"),
+        ("dangerous_api", "high",
+         r'(?:URLSession\.shared\.dataTask.*allowsSelfSignedCert|didReceive\s+challenge.*performDefaultHandling\s*=\s*false)',
+         "Potential URLSession implementation that skips TLS certificate validation"),
+        ("tls_config_weak", "medium",
+         r'"http://[^"\s]+"',
+         "Cleartext HTTP URL embedded in source"),
+        ("cloud_credential_leak", "critical",
+         r'AKIA[0-9A-Z]{16}',
+         "Potential hardcoded AWS Access Key ID"),
+        ("cloud_credential_leak", "critical",
+         r'AIza[0-9A-Za-z_\-]{35}',
+         "Potential hardcoded Google API Key"),
+        ("cloud_credential_leak", "critical",
+         r'(?i)firebase[^"\s]*apiKey\s*[:=]\s*"[A-Za-z0-9_\-]{20,}"',
+         "Potential hardcoded Firebase apiKey"),
+        ("cloud_credential_leak", "critical",
+         r'https://[a-zA-Z0-9]+@[a-zA-Z0-9\-]+\.ingest\.sentry\.io/[0-9]+',
+         "Potential hardcoded Sentry DSN"),
+        # --- MASVS-STORAGE: cleartext storage of sensitive data ---
+        ("insecure_storage", "medium",
+         r'UserDefaults[^\n]*\.set\([^\n]*forKey:\s*"[^"]*(?i:token|password|passwd|secret|session|credential|auth)[^"]*"',
+         "Credential-shaped value stored in UserDefaults in cleartext (use Keychain instead)"),
+        ("insecure_storage", "medium",
+         r'@AppStorage\(\s*"[^"]*(?i:token|password|passwd|secret|session|credential|auth)[^"]*"',
+         "Credential-shaped value stored in @AppStorage (UserDefaults)"),
+        ("keychain_weak_accessibility", "medium",
+         r'\bkSecAttrAccessibleAlways(?:ThisDeviceOnly)?\b',
+         "Keychain item readable even while the device is locked (kSecAttrAccessibleAlways is deprecated)"),
+        # --- MASVS-STORAGE: sensitive data in logs ---
+        ("sensitive_logging", "medium",
+         r'\b(?:print|debugPrint|NSLog|os_log|logger\.\w+|Logger\(\)\.\w+)\([^\n]*(?i:password|passwd|token|secret|authorization|cookie)',
+         "Log statement contains a credential-shaped value"),
+        # --- MASVS-PLATFORM: WebView ---
+        ("webview_insecure", "high",
+         r'\b(?:allowFileAccessFromFileURLs|allowUniversalAccessFromFileURLs)\b',
+         "WKWebView allows access from file:// URLs"),
+        ("webview_insecure", "medium",
+         r'\bUIWebView\b',
+         "Deprecated UIWebView is in use"),
+    ]
+
+    KOTLIN_RULES = [
+        ("hardcoded_secret", "high",
+         r'(?i)\b(?:api[_-]?key|password|secret|token|access[_-]?token)\b\s*=\s*"([A-Za-z0-9+/=_\-]{20,})"',
+         "Potential hardcoded credential in Kotlin source"),
+        ("weak_crypto", "medium",
+         r'MessageDigest\.getInstance\s*\(\s*"(?:MD5|SHA-?1)"\s*\)',
+         "MessageDigest with MD5 / SHA-1"),
+        ("dangerous_api", "high",
+         r'(?:setHostnameVerifier\s*\(\s*(?:HostnameVerifier)?\s*\{\s*_\s*,\s*_\s*->\s*true|ALLOW_ALL_HOSTNAME_VERIFIER|TrustAllX509TrustManager)',
+         "Potential implementation that disables TLS hostname verification"),
+        ("tls_config_weak", "medium",
+         r'"http://[^"\s]+"',
+         "Cleartext HTTP URL embedded in source"),
+        ("cloud_credential_leak", "critical",
+         r'AKIA[0-9A-Z]{16}',
+         "Potential hardcoded AWS Access Key ID"),
+        ("cloud_credential_leak", "critical",
+         r'AIza[0-9A-Za-z_\-]{35}',
+         "Potential hardcoded Google API Key"),
+        ("cloud_credential_leak", "critical",
+         r'(?i)firebase[^"\s]*apiKey\s*[:=]\s*"[A-Za-z0-9_\-]{20,}"',
+         "Potential hardcoded Firebase apiKey"),
+        ("cloud_credential_leak", "critical",
+         r'https://[a-zA-Z0-9]+@[a-zA-Z0-9\-]+\.ingest\.sentry\.io/[0-9]+',
+         "Potential hardcoded Sentry DSN"),
+        # --- MASVS-STORAGE: cleartext storage of sensitive data ---
+        ("insecure_storage", "medium",
+         r'\.put(?:String|Int|Long|Boolean|StringSet)\(\s*"[^"]*(?i:token|password|passwd|secret|session|credential|auth)[^"]*"',
+         "Credential-shaped value stored in SharedPreferences in cleartext (use EncryptedSharedPreferences or Keystore instead)"),
+        ("insecure_storage", "medium",
+         r'\b(?:stringPreferencesKey|stringSetPreferencesKey)\(\s*"[^"]*(?i:token|password|passwd|secret|session|credential|auth)[^"]*"',
+         "Credential-shaped value stored in cleartext DataStore"),
+        ("insecure_storage", "high",
+         r'\bMODE_WORLD_(?:READABLE|WRITEABLE)\b',
+         "World-readable or world-writeable file / setting"),
+        # --- MASVS-STORAGE: sensitive data in logs ---
+        ("sensitive_logging", "medium",
+         r'\b(?:Log\.[vdiwe]|println|Timber\.[vdiwe])\([^\n]*(?i:password|passwd|token|secret|authorization|cookie)',
+         "Log statement contains a credential-shaped value"),
+        ("sensitive_logging", "medium",
+         r'HttpLoggingInterceptor\.Level\.(?:BODY|HEADERS)\b',
+         "OkHttp interceptor logs the request body or headers (which may contain credentials)"),
+        # --- MASVS-PLATFORM: WebView ---
+        ("webview_insecure", "high",
+         r'(?:allowFileAccessFromFileURLs|allowUniversalAccessFromFileURLs)\s*=\s*true|setAllow(?:FileAccessFromFileURLs|UniversalAccessFromFileURLs)\(\s*true',
+         "WebView allows access from file:// URLs"),
+        ("webview_insecure", "medium",
+         r'\baddJavascriptInterface\(',
+         "WebView exposes native methods callable from JavaScript"),
+        ("webview_insecure", "low",
+         r'\bjavaScriptEnabled\s*=\s*true|setJavaScriptEnabled\(\s*true',
+         "JavaScript enabled in WebView (verify that loaded URLs are restricted)"),
+        # --- MASVS-NETWORK: TLS errors ignored ---
+        ("dangerous_api", "critical",
+         r'onReceivedSslError[\s\S]{0,300}?\.proceed\(\)',
+         "WebView ignores TLS errors and continues"),
+    ]
+
+    # Rules specific to Android build.gradle(.kts).
+    # Catches weak release-build settings.
+    GRADLE_RULES = [
+        ("build_config_weak", "high",
+         r'(?s)release\s*\{[^}]*?(?:isDebuggable|debuggable)\s*=\s*true',
+         "Release build has debuggable=true"),
+        ("build_config_weak", "medium",
+         r'(?s)release\s*\{[^}]*?(?:isMinifyEnabled|minifyEnabled)\s*=\s*false',
+         "Release build has minifyEnabled=false (no ProGuard/R8)"),
+        ("build_config_weak", "medium",
+         r'(?s)release\s*\{[^}]*?(?:isShrinkResources|shrinkResources)\s*=\s*false',
+         "Release build has shrinkResources=false"),
+    ]
+
+    # Dangerous Android permissions used by the AndroidManifest check
+    # (per the Android docs; abridged).
+    ANDROID_DANGEROUS_PERMISSIONS = {
+        "android.permission.READ_CONTACTS",
+        "android.permission.WRITE_CONTACTS",
+        "android.permission.READ_SMS",
+        "android.permission.SEND_SMS",
+        "android.permission.READ_CALL_LOG",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.CAMERA",
+    }
+
+
+    def scan_source_files(root: Path, exts: set, rules: list) -> list:
+        findings = []
+        for path in root.rglob("*"):
+            if path.suffix not in exts or not path.is_file():
+                continue
+            # Skip generated / build artefacts.
+            if any(seg in path.parts for seg in ("build", ".gradle", "DerivedData", ".swiftpm")):
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            rel = path.relative_to(root).as_posix()
+            for finding_type, severity, pattern, desc in rules:
+                for m in re.finditer(pattern, text, re.MULTILINE):
+                    # Skip matches whose line starts inside a comment
+                    # (e.g. an old-implementation note like /// UIWebView ...).
+                    line_start = text.rfind("\n", 0, m.start()) + 1
+                    if text[line_start:m.start()].lstrip().startswith(("//", "/*", "*")):
+                        continue
+                    line_no = text[:m.start()].count("\n") + 1
+                    findings.append({
+                        "finding_type": finding_type,
+                        "severity": severity,
+                        "file": rel,
+                        "line": line_no,
+                        "snippet": m.group(0)[:200],
+                        "description": desc,
+                    })
+        return findings
+
+
+    def scan_android_manifest(manifest_path: Path) -> list:
+        """Check AndroidManifest.xml for permissions, cleartext HTTP, and debuggable flags."""
+        findings = []
+        try:
+            tree = ET.parse(manifest_path)
+        except Exception as e:
+            return [{"finding_type": "dangerous_api", "severity": "low",
+                     "file": str(manifest_path.name), "line": 0,
+                     "snippet": f"parse error: {e}",
+                     "description": "AndroidManifest.xml XML parse failed"}]
+        root = tree.getroot()
+        ns = {"android": "http://schemas.android.com/apk/res/android"}
+        rel = manifest_path.name
+
+        # uses-permission
+        for p in root.findall("uses-permission"):
+            name = p.get(f"{{{ns['android']}}}name", "")
+            if name in ANDROID_DANGEROUS_PERMISSIONS:
+                findings.append({
+                    "finding_type": "permission_over_request",
+                    "severity": "medium",
+                    "file": rel,
+                    "line": 0,
+                    "snippet": f'<uses-permission android:name="{name}"/>',
+                    "description": f"Dangerous permission requested: {name}",
+                })
+
+        # application attributes
+        app = root.find("application")
+        if app is not None:
+            cleartext = app.get(f"{{{ns['android']}}}usesCleartextTraffic")
+            if cleartext == "true":
+                findings.append({
+                    "finding_type": "tls_config_weak",
+                    "severity": "high",
+                    "file": rel,
+                    "line": 0,
+                    "snippet": 'android:usesCleartextTraffic="true"',
+                    "description": "cleartextTraffic=true allows cleartext HTTP traffic",
+                })
+            debuggable = app.get(f"{{{ns['android']}}}debuggable")
+            if debuggable == "true":
+                findings.append({
+                    "finding_type": "dangerous_api",
+                    "severity": "high",
+                    "file": rel,
+                    "line": 0,
+                    "snippet": 'android:debuggable="true"',
+                    "description": "debuggable=true in an app aimed at production (debug-attachable)",
+                })
+
+        findings.extend(_android_component_findings(root, rel))
+        return findings
+
+
+    ANDROID_NS = "{http://schemas.android.com/apk/res/android}"
+
+
+    def _android_component_findings(root, rel: str) -> list:
+        """Check for exported components, deep links, and backup settings (MASVS-PLATFORM / STORAGE).
+
+        Used both for the source AndroidManifest.xml and for the
+        merged manifest of a built APK.
+        """
+        A = ANDROID_NS
+        findings = []
+        app = root.find("application")
+        if app is None:
+            return findings
+        if app.get(f"{A}allowBackup", "true") == "true":
+            has_rules = app.get(f"{A}dataExtractionRules") or app.get(f"{A}fullBackupContent")
+            findings.append({
+                "finding_type": "backup_enabled",
+                "severity": "low" if has_rules else "medium",
+                "file": rel, "line": 0,
+                "snippet": 'android:allowBackup="true"' + (" (exclusion rules present)" if has_rules else ""),
+                "description": ("App data is included in device backups. "
+                                + ("Check that credentials and PII are excluded by the rules"
+                                   if has_rules else "No exclusion rules, so every file is included")),
+            })
+        for tag in ("activity", "activity-alias", "service", "receiver", "provider"):
+            for comp in app.findall(tag):
+                name = comp.get(f"{A}name", "?")
+                filters = comp.findall("intent-filter")
+                exported = comp.get(f"{A}exported")
+                if exported is None:
+                    exported = "true" if filters else "false"
+                if exported != "true":
+                    continue
+                actions = {a.get(f"{A}name") for f in filters for a in f.findall("action")}
+                cats = {c.get(f"{A}name") for f in filters for c in f.findall("category")}
+                is_launcher = ("android.intent.action.MAIN" in actions
+                               and "android.intent.category.LAUNCHER" in cats)
+                is_widget = "android.appwidget.action.APPWIDGET_UPDATE" in actions
+                # Deep links (VIEW + BROWSABLE) are entry points for external input.
+                for f in filters:
+                    f_actions = {a.get(f"{A}name") for a in f.findall("action")}
+                    f_cats = {c.get(f"{A}name") for c in f.findall("category")}
+                    if ("android.intent.action.VIEW" not in f_actions
+                            or "android.intent.category.BROWSABLE" not in f_cats):
+                        continue
+                    schemes = sorted({d.get(f"{A}scheme") for d in f.findall("data")
+                                      if d.get(f"{A}scheme")})
+                    custom = [s for s in schemes if s not in ("http", "https")]
+                    if custom:
+                        findings.append({
+                            "finding_type": "deep_link_custom_scheme",
+                            "severity": "medium",
+                            "file": rel, "line": 0,
+                            "snippet": f"{name} scheme={','.join(custom)}",
+                            "description": ("Custom-scheme deep link. Another app that registers the same scheme "
+                                            "can intercept it; if this is an authorisation callback receiver, "
+                                            "PKCE and state validation are required and every received "
+                                            "value must be validated."),
+                        })
+                    elif schemes:
+                        verified = f.get(f"{A}autoVerify") == "true"
+                        findings.append({
+                            "finding_type": "deep_link_entry",
+                            "severity": "low" if verified else "medium",
+                            "file": rel, "line": 0,
+                            "snippet": f"{name} scheme={','.join(schemes)} autoVerify={verified}",
+                            "description": ("Entry point for external URLs into the app; every received URL "
+                                            "value must be validated"
+                                            + ("" if verified else ". autoVerify is off, so other apps can "
+                                               "compete for the same URL")),
+                        })
+                if is_launcher or is_widget:
+                    continue
+                if comp.get(f"{A}permission"):
+                    continue
+                has_view = "android.intent.action.VIEW" in actions
+                if tag == "activity" and has_view:
+                    continue  # Reported above as a deep link.
+                findings.append({
+                    "finding_type": "exported_component",
+                    "severity": "high" if tag == "provider" else "medium",
+                    "file": rel, "line": 0,
+                    "snippet": f'<{tag} android:name="{name}" android:exported="true"> (no permission)',
+                    "description": f"The {tag} can be invoked by any app with no permission. Set exported=false if not needed, or guard it with a permission.",
+                })
+        return findings
+
+
+    OSV_URL = os.environ.get("OSV_URL", "https://api.osv.dev")
+    DEP_CHECK = os.environ.get("DEP_CHECK", "true").lower() != "false"
+    _SKIP_DIRS = ("build", ".gradle", "DerivedData", ".swiftpm")
+    _GRADLE_COORD = re.compile(
+        r'["\']([A-Za-z0-9_.\-]+):([A-Za-z0-9_.\-]+):([0-9][A-Za-z0-9_.\-+]*)["\']')
+    _OSV_SEVERITY = {"CRITICAL": "critical", "HIGH": "high",
+                     "MODERATE": "medium", "MEDIUM": "medium", "LOW": "low"}
+
+
+    def _skip(path: Path) -> bool:
+        return any(seg in path.parts for seg in _SKIP_DIRS)
+
+
+    def collect_gradle_deps(root: Path) -> list:
+        """Collect (group:name, version, file) tuples from libs.versions.toml and build.gradle(.kts).
+
+        Only declared direct dependencies; entries with no version
+        (BOM-managed) and transitive dependencies are out of scope.
+        """
+        deps = {}
+        for toml_path in root.rglob("libs.versions.toml"):
+            if _skip(toml_path) or not toml_path.is_file():
+                continue
+            try:
+                with open(toml_path, "rb") as f:
+                    data = tomllib.load(f)
+            except Exception as e:
+                print(f"[warn] toml parse {toml_path}: {e}", file=sys.stderr)
+                continue
+            versions = data.get("versions", {}) or {}
+            rel = toml_path.relative_to(root).as_posix()
+            for _alias, spec in (data.get("libraries", {}) or {}).items():
+                if isinstance(spec, str):
+                    parts = spec.split(":")
+                    if len(parts) == 3:
+                        deps[(f"{parts[0]}:{parts[1]}", parts[2])] = rel
+                    continue
+                if not isinstance(spec, dict):
+                    continue
+                module = spec.get("module") or (
+                    f"{spec['group']}:{spec['name']}" if spec.get("group") and spec.get("name") else None)
+                ver = spec.get("version")
+                if isinstance(ver, dict):
+                    if "ref" in ver:
+                        ver = versions.get(ver["ref"])
+                    else:
+                        ver = ver.get("strictly") or ver.get("require") or ver.get("prefer")
+                if isinstance(ver, dict):  # the versions entry is itself a rich-version dict
+                    ver = ver.get("strictly") or ver.get("require") or ver.get("prefer")
+                if module and isinstance(ver, str) and ver:
+                    deps[(module, ver)] = rel
+        for gradle in list(root.rglob("*.gradle")) + list(root.rglob("*.gradle.kts")):
+            if _skip(gradle) or not gradle.is_file():
+                continue
+            text = gradle.read_text(encoding="utf-8", errors="ignore")
+            rel = gradle.relative_to(root).as_posix()
+            for m in _GRADLE_COORD.finditer(text):
+                deps.setdefault((f"{m.group(1)}:{m.group(2)}", m.group(3)), rel)
+        return [(name, ver, rel) for (name, ver), rel in sorted(deps.items())]
+
+
+    def _http_json(method: str, url: str, body=None):
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(url, data=data, method=method,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+
+
+    def scan_dependencies(deps: list, ecosystem: str) -> list:
+        """Query OSV (https://osv.dev) for known vulnerabilities and turn hits into findings."""
+        if not deps or not DEP_CHECK:
+            return []
+        findings = []
+        try:
+            hits = []
+            for i in range(0, len(deps), 100):
+                chunk = deps[i:i + 100]
+                res = _http_json("POST", f"{OSV_URL}/v1/querybatch", {"queries": [
+                    {"package": {"ecosystem": ecosystem, "name": n}, "version": v}
+                    for n, v, _ in chunk]})
+                for (n, v, rel), r in zip(chunk, res.get("results", [])):
+                    for vuln in r.get("vulns") or []:
+                        hits.append((n, v, rel, vuln["id"]))
+            details = {}
+            for vid in sorted({h[3] for h in hits}):
+                try:
+                    details[vid] = _http_json("GET", f"{OSV_URL}/v1/vulns/{vid}")
+                except Exception as e:
+                    print(f"[warn] osv detail {vid}: {e}", file=sys.stderr)
+                    details[vid] = {}
+            for n, v, rel, vid in hits:
+                d = details.get(vid, {})
+                sev = _OSV_SEVERITY.get(
+                    str((d.get("database_specific") or {}).get("severity", "")).upper(), "medium")
+                cves = [a for a in d.get("aliases", []) if a.startswith("CVE-")]
+                fixed = sorted({ev["fixed"] for aff in d.get("affected", [])
+                                if (aff.get("package") or {}).get("name") == n
+                                for rg in aff.get("ranges", []) for ev in rg.get("events", [])
+                                if "fixed" in ev})
+                findings.append({
+                    "finding_type": "vulnerable_dependency",
+                    "severity": sev,
+                    "file": rel, "line": 0,
+                    "snippet": f"{n}:{v} {vid}" + (f" ({', '.join(cves)})" if cves else ""),
+                    "description": ((d.get("summary") or "Known vulnerability")[:200]
+                                    + (f" / fixed in: {', '.join(fixed)}" if fixed else "")),
+                })
+        except Exception as e:
+            print(f"[warn] dependency check failed: {type(e).__name__}: {e}", file=sys.stderr)
+            findings.append({
+                "finding_type": "dependency_check_failed", "severity": "info",
+                "file": "-", "line": 0, "snippet": str(e)[:200],
+                "description": "Could not query OSV; known vulnerabilities in dependencies were not checked",
+            })
+        return findings
+
+
+    def summarize_findings(findings: list) -> tuple:
+        """Return per-severity counts and per (finding_type x severity) counts."""
+        severity_counts = Counter()
+        type_severity_counts = Counter()
+        for f in findings:
+            severity_counts[f["severity"]] += 1
+            type_severity_counts[(f["finding_type"], f["severity"])] += 1
+        finding_summaries = [
+            {"finding_type": ft, "severity": sev, "count": cnt}
+            for (ft, sev), cnt in sorted(type_severity_counts.items())
+        ]
+        return dict(severity_counts), finding_summaries
+
+
+    def _ios_info_findings(info: dict, rel: str) -> list:
+        """Check ATS and custom URL schemes in an Info.plist-like dict.
+
+        Used both for Info.plist files and for the xcodegen
+        project.yml (targets.*.info.properties)."""
+        findings = []
+        if not isinstance(info, dict):
+            return findings
+
+        def add(ft, sev, snippet, desc):
+            findings.append({"finding_type": ft, "severity": sev, "file": rel,
+                             "line": 0, "snippet": snippet, "description": desc})
+
+        ats = info.get("NSAppTransportSecurity") or {}
+        if isinstance(ats, dict):
+            if ats.get("NSAllowsArbitraryLoads") is True:
+                add("tls_config_weak", "high", "NSAllowsArbitraryLoads = true",
+                    "ATS disabled (NSAllowsArbitraryLoads); cleartext HTTP is allowed")
+            for key in ("NSAllowsArbitraryLoadsInWebContent", "NSAllowsArbitraryLoadsForMedia"):
+                if ats.get(key) is True:
+                    add("tls_config_weak", "medium", f"{key} = true",
+                        f"ATS {key} allows cleartext HTTP for a subset of traffic")
+            for dom, cfg in (ats.get("NSExceptionDomains") or {}).items():
+                if isinstance(cfg, dict) and cfg.get("NSExceptionAllowsInsecureHTTPLoads") is True:
+                    add("tls_config_weak", "medium",
+                        f"NSExceptionDomains.{dom}.NSExceptionAllowsInsecureHTTPLoads = true",
+                        f"Cleartext HTTP allowed for {dom}")
+        for url_type in info.get("CFBundleURLTypes") or []:
+            for scheme in (url_type or {}).get("CFBundleURLSchemes") or []:
+                add("deep_link_custom_scheme", "medium", f"CFBundleURLSchemes: {scheme}",
+                    "Custom-scheme deep link. Another app that registers the same scheme "
+                    "can intercept it; if this is an authorisation callback receiver, "
+                    "PKCE and state validation are required and every received value "
+                    "must be validated.")
+        return findings
+
+
+    def _xcodegen_infos(root: Path) -> list:
+        """Collect (display path, info.properties) tuples from the xcodegen project.yml.
+
+        Lets the check run even when Info.plist is generated at build
+        time and is not in git.
+        """
+        if yaml is None:
+            return []
+        out = []
+        for y in root.rglob("project.yml"):
+            if _skip(y) or not y.is_file():
+                continue
+            try:
+                data = yaml.safe_load(y.read_text(encoding="utf-8", errors="ignore")) or {}
+            except Exception as e:
+                print(f"[warn] project.yml parse {y}: {e}", file=sys.stderr)
+                continue
+            rel = y.relative_to(root).as_posix()
+            for tname, t in (data.get("targets") or {}).items():
+                props = ((t or {}).get("info") or {}).get("properties") or {}
+                if props:
+                    out.append((f"{rel} (targets.{tname}.info.properties)", props))
+        return out
+
+
+    def scan_ios(root: Path) -> dict:
+        findings = scan_source_files(root, {".swift"}, IOS_RULES)
+        # Info.plist (both XML and binary are handled by plistlib).
+        for plist_path in root.rglob("Info.plist"):
+            if _skip(plist_path) or not plist_path.is_file():
+                continue
+            try:
+                with open(plist_path, "rb") as f:
+                    info = plistlib.load(f)
+            except Exception as e:
+                print(f"[warn] Info.plist parse {plist_path}: {e}", file=sys.stderr)
+                continue
+            findings.extend(_ios_info_findings(info, plist_path.relative_to(root).as_posix()))
+        # Info.plist contents declared inline in the xcodegen project.yml.
+        # If a generated Info.plist is already in git and the same
+        # finding was already picked up, do not emit it again.
+        seen = {(f["finding_type"], f["snippet"]) for f in findings if f["line"] == 0}
+        for rel, props in _xcodegen_infos(root):
+            for f in _ios_info_findings(props, rel):
+                key = (f["finding_type"], f["snippet"])
+                if key not in seen:
+                    seen.add(key)
+                    findings.append(f)
+        return {"findings": findings}
+
+
+    def scan_android(root: Path) -> dict:
+        findings = scan_source_files(root, {".kt", ".java"}, KOTLIN_RULES)
+        # Scan build.gradle(.kts) with its own rules.
+        findings.extend(scan_source_files(root, {".kts", ".gradle"}, GRADLE_RULES))
+        for manifest in root.rglob("AndroidManifest.xml"):
+            if any(seg in manifest.parts for seg in ("build", ".gradle")):
+                continue
+            findings.extend(scan_android_manifest(manifest))
+        # Known vulnerabilities in dependencies (OSV).
+        findings.extend(scan_dependencies(collect_gradle_deps(root), "Maven"))
+        return {"findings": findings}
+
+
+    def main():
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--root", required=True, help="Root directory of the code to scan")
+        ap.add_argument("--platform", required=True, choices=["ios", "android"])
+        ap.add_argument("--bundle-id", default=None, help="iOS: bundle_id")
+        ap.add_argument("--package-name", default=None, help="Android: package name")
+        ap.add_argument("--app-version", default=None)
+        ap.add_argument("--scan-id", default=None, help="auto-generated if omitted")
+        args = ap.parse_args()
+
+        root = Path(args.root).resolve()
+        if not root.is_dir():
+            print(f"error: root not a directory: {root}", file=sys.stderr)
+            sys.exit(2)
+
+        scan_id = args.scan_id or f"mobile-{args.platform}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
+
+        if args.platform == "ios":
+            result = scan_ios(root)
+        else:
+            result = scan_android(root)
+
+        all_findings = result["findings"]
+        severity_counts, finding_summaries = summarize_findings(all_findings)
+
+        # JSON matching the kernel's VulnEventMobileDetectedPayload.
+        payload = {
+            "scan_id": scan_id,
+            "platform": args.platform,
+            "bundle_id": args.bundle_id,
+            "package_name": args.package_name,
+            "app_version": args.app_version,
+            "app_version_code": None,
+            "artifact_path": None,
+            "severity_counts": severity_counts,
+            "finding_summaries": finding_summaries,
+        }
+        # Return the detail findings alongside the payload (for the
+        # caller to store as detailed logs).
+        output = {
+            "mobile_detected": payload,
+            "detail_findings": all_findings,
+            "total_findings": len(all_findings),
+        }
+        print(json.dumps(output, indent=2, ensure_ascii=False))
+
+
+    if __name__ == "__main__":
+        main()
