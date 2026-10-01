@@ -1,0 +1,326 @@
+---
+# iOS binary scanner.
+#
+# Target: an .app bundle built by Xcode (or an unpacked .ipa).
+#
+# Runs on a native spoke (nsmt) that has the relevant macOS tools
+# installed (otool, codesign, plutil, strings). It cannot run inside
+# a Kubernetes container because these tools are macOS-only.
+#
+# This ConfigMap is projected onto the spoke as
+# ~/nsm-work/mobile_binary_scan_ios.py and invoked over nsm_sh_exec
+# by the mobile-binary-scan CronJob.
+#
+# Output: JSON on stdout that matches the kernel's
+# VulnEventMobileDetectedPayload contract at /core/security/events.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mobile-binary-scan-ios-script
+  namespace: security-mobile
+  labels:
+    purpose: mobile-vulnerability-binary-scanner-ios
+data:
+  mobile_binary_scan_ios.py: |
+    #!/usr/bin/env python3
+    """iOS .app / .ipa binary scanner.
+
+    Target: an .app bundle built by Xcode (or an unpacked .ipa).
+
+    Detected finding_type values:
+      - hardcoded_secret_in_binary: cleartext AWS / Google /
+        Firebase / Sentry credentials picked up by `strings`.
+      - weak_signature: `codesign -dvvv` shows an ad-hoc signature
+        or a Development certificate only (high risk for a release
+        artefact).
+      - dangerous_linked_library: `otool -L` shows a linked
+        framework combination that is known to be risky.
+      - ats_config_weak: Info.plist's
+        NSAppTransportSecurity.NSAllowsArbitraryLoads = true, or a
+        weaker per-domain exception.
+      - binary_no_hardening: `otool -hv` shows no PIE flag, or
+        `otool -Iv` has no stack-protector symbols.
+      - debuggable_build: signing entitlements include
+        get-task-allow = true.
+      - deep_link_custom_scheme: Info.plist declares
+        CFBundleURLSchemes.
+
+    Output: JSON on stdout that matches the same
+    VulnEventMobileDetectedPayload contract used by mobile_scan.py.
+    Invocation:
+      python3 mobile_binary_scan_ios.py --app <path/to/App.app> \\
+        --bundle-id <id> --app-version <version>
+    """
+    import argparse
+    import json
+    import plistlib
+    import re
+    import subprocess
+    import sys
+    import time
+    import uuid
+    from collections import Counter
+    from pathlib import Path
+
+
+    def _run(cmd: list, cwd=None) -> tuple:
+        r = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
+        return r.returncode, r.stdout, r.stderr
+
+
+    CLOUD_CRED_PATTERNS = [
+        (r'AKIA[0-9A-Z]{16}', 'AWS Access Key ID'),
+        (r'AIza[0-9A-Za-z_\-]{35}', 'Google API Key'),
+        (r'https://[a-zA-Z0-9]+@[a-zA-Z0-9\-]+\.ingest\.sentry\.io/[0-9]+', 'Sentry DSN'),
+    ]
+
+
+    def scan_strings(app_binary: Path, app_bundle: Path) -> list:
+        """`strings` picks up cleartext AWS / Google / Sentry literals."""
+        findings = []
+        _, out, _ = _run(['strings', '-a', str(app_binary)])
+        for line in out.split('\n'):
+            for pat, desc in CLOUD_CRED_PATTERNS:
+                if re.search(pat, line):
+                    findings.append({
+                        'finding_type': 'hardcoded_secret_in_binary',
+                        'severity': 'critical',
+                        'file': app_binary.relative_to(app_bundle.parent).as_posix(),
+                        'line': 0,
+                        'snippet': line.strip()[:200],
+                        'description': f'{desc} embedded in the binary',
+                    })
+        return findings
+
+
+    def scan_codesign(app_bundle: Path) -> list:
+        """`codesign -dvvv` reads the signature; ad-hoc and Development are flagged."""
+        findings = []
+        rc, _, err = _run(['codesign', '-dvvv', str(app_bundle)])
+        if rc != 0:
+            findings.append({
+                'finding_type': 'weak_signature',
+                'severity': 'medium',
+                'file': app_bundle.name,
+                'line': 0,
+                'snippet': (err or '').strip()[:200],
+                'description': 'codesign call failed; signature info could not be read',
+            })
+            return findings
+        # `codesign -dvvv` writes its output to stderr.
+        text = err
+        if 'adhoc' in text.lower() or 'Signature=adhoc' in text:
+            findings.append({
+                'finding_type': 'weak_signature',
+                'severity': 'medium',
+                'file': app_bundle.name,
+                'line': 0,
+                'snippet': 'Signature=adhoc',
+                'description': 'Ad-hoc signature (equivalent to self-signed); not a distribution-capable certificate',
+            })
+        if 'Authority=Apple Development' in text or 'Authority=iPhone Developer' in text:
+            findings.append({
+                'finding_type': 'weak_signature',
+                'severity': 'low',
+                'file': app_bundle.name,
+                'line': 0,
+                'snippet': 'Authority=Apple Development / iPhone Developer',
+                'description': 'Debug build signature (Development certificate; not distributable via the App Store)',
+            })
+        return findings
+
+
+    def scan_otool_linked_libs(app_binary: Path, app_bundle: Path) -> list:
+        """`otool -L` lists linked frameworks; flag risky combinations."""
+        findings = []
+        rc, out, _ = _run(['otool', '-L', str(app_binary)])
+        if rc != 0:
+            return findings
+        # Example: WebKit + SafariServices together makes external JS
+        # execution through a WebView more likely.
+        has_webkit = 'WebKit.framework' in out
+        has_safari_services = 'SafariServices.framework' in out
+        if has_webkit and has_safari_services:
+            findings.append({
+                'finding_type': 'dangerous_linked_library',
+                'severity': 'low',
+                'file': app_bundle.name,
+                'line': 0,
+                'snippet': 'WebKit + SafariServices',
+                'description': 'Links both WebKit and SafariServices; be careful with external JS execution through a WebView',
+            })
+        return findings
+
+
+    def scan_info_plist(info_plist: Path, app_bundle: Path) -> list:
+        """Check Info.plist for ATS and permission-related weaknesses."""
+        findings = []
+        try:
+            with open(info_plist, 'rb') as f:
+                plist = plistlib.load(f)
+        except Exception as e:
+            return [{
+                'finding_type': 'ats_config_weak',
+                'severity': 'low',
+                'file': info_plist.name,
+                'line': 0,
+                'snippet': str(e)[:200],
+                'description': 'Info.plist parse failed',
+            }]
+        ats = plist.get('NSAppTransportSecurity', {})
+        if ats.get('NSAllowsArbitraryLoads') is True:
+            findings.append({
+                'finding_type': 'ats_config_weak',
+                'severity': 'high',
+                'file': info_plist.name,
+                'line': 0,
+                'snippet': 'NSAllowsArbitraryLoads = true',
+                'description': 'ATS disabled; cleartext HTTP is allowed',
+            })
+        for key in ('NSAllowsArbitraryLoadsInWebContent', 'NSAllowsArbitraryLoadsForMedia'):
+            if ats.get(key) is True:
+                findings.append({
+                    'finding_type': 'ats_config_weak',
+                    'severity': 'medium',
+                    'file': info_plist.name,
+                    'line': 0,
+                    'snippet': f'{key} = true',
+                    'description': f'ATS {key} allows cleartext HTTP for a subset of traffic',
+                })
+        for dom, cfg in (ats.get('NSExceptionDomains') or {}).items():
+            if isinstance(cfg, dict) and cfg.get('NSExceptionAllowsInsecureHTTPLoads') is True:
+                findings.append({
+                    'finding_type': 'ats_config_weak',
+                    'severity': 'medium',
+                    'file': info_plist.name,
+                    'line': 0,
+                    'snippet': f'NSExceptionDomains.{dom}.NSExceptionAllowsInsecureHTTPLoads = true',
+                    'description': f'Cleartext HTTP allowed for {dom}',
+                })
+        # Custom URL schemes: another app that registers the same
+        # scheme can intercept the callback.
+        for url_type in plist.get('CFBundleURLTypes') or []:
+            for scheme in (url_type or {}).get('CFBundleURLSchemes') or []:
+                findings.append({
+                    'finding_type': 'deep_link_custom_scheme',
+                    'severity': 'medium',
+                    'file': info_plist.name,
+                    'line': 0,
+                    'snippet': f'CFBundleURLSchemes: {scheme}',
+                    'description': ('Custom-scheme deep link. Another app that registers the same scheme '
+                                    'can intercept the callback; if this is an authorisation callback '
+                                    'receiver, PKCE and state validation are required and every '
+                                    'received value must be validated.'),
+                })
+        return findings
+
+
+    def scan_binary_hardening(app_binary: Path, app_bundle: Path) -> list:
+        """Binary hardening (PIE, stack canary) and debug entitlements (MASVS-RESILIENCE)."""
+        findings = []
+        rc, out, _ = _run(['otool', '-hv', str(app_binary)])
+        if rc == 0 and 'EXECUTE' in out and 'PIE' not in out:
+            findings.append({
+                'finding_type': 'binary_no_hardening',
+                'severity': 'medium',
+                'file': app_binary.name,
+                'line': 0,
+                'snippet': 'No MH_PIE flag',
+                'description': 'PIE (position-independent execution) is disabled; ASLR does not apply',
+            })
+        rc, out, _ = _run(['otool', '-Iv', str(app_binary)])
+        if rc == 0 and '___stack_chk_guard' not in out and '___stack_chk_fail' not in out:
+            findings.append({
+                'finding_type': 'binary_no_hardening',
+                'severity': 'low',
+                'file': app_binary.name,
+                'line': 0,
+                'snippet': 'No ___stack_chk_guard / ___stack_chk_fail symbols',
+                'description': 'No stack-canary symbols. Pure-Swift code sometimes omits these, so treat this as advisory only',
+            })
+        rc, out, err = _run(['codesign', '-d', '--entitlements', ':-', str(app_bundle)])
+        if re.search(r'<key>get-task-allow</key>\s*<true\s*/>', out + err):
+            findings.append({
+                'finding_type': 'debuggable_build',
+                'severity': 'low',
+                'file': app_bundle.name,
+                'line': 0,
+                'snippet': 'get-task-allow = true',
+                'description': 'Debugger-attachable build (development signature); a distribution build sets this to false',
+            })
+        return findings
+
+
+    def main():
+        ap = argparse.ArgumentParser()
+        ap.add_argument('--app', required=True, help='Path to the .app bundle')
+        ap.add_argument('--bundle-id', default=None)
+        ap.add_argument('--app-version', default=None)
+        ap.add_argument('--scan-id', default=None)
+        args = ap.parse_args()
+
+        app = Path(args.app).resolve()
+        if not app.is_dir() or not app.name.endswith('.app'):
+            print(f'error: not a .app bundle: {app}', file=sys.stderr)
+            sys.exit(2)
+
+        # The main binary name comes from Info.plist's CFBundleExecutable.
+        info_plist = app / 'Info.plist'
+        exe_name = app.stem  # default to the .app name
+        bundle_id = args.bundle_id
+        app_version = args.app_version
+        if info_plist.is_file():
+            try:
+                with open(info_plist, 'rb') as f:
+                    plist = plistlib.load(f)
+                    exe_name = plist.get('CFBundleExecutable') or exe_name
+                    bundle_id = args.bundle_id or plist.get('CFBundleIdentifier')
+                    app_version = args.app_version or plist.get('CFBundleShortVersionString')
+            except Exception:
+                pass
+
+        app_binary = app / exe_name
+        if not app_binary.is_file():
+            print(f'error: main binary not found: {app_binary}', file=sys.stderr)
+            sys.exit(2)
+
+        scan_id = args.scan_id or f'mobile-binary-ios-{int(time.time())}-{uuid.uuid4().hex[:8]}'
+
+        all_findings = []
+        all_findings.extend(scan_strings(app_binary, app))
+        all_findings.extend(scan_codesign(app))
+        all_findings.extend(scan_otool_linked_libs(app_binary, app))
+        all_findings.extend(scan_binary_hardening(app_binary, app))
+        if info_plist.is_file():
+            all_findings.extend(scan_info_plist(info_plist, app))
+
+        severity_counts = Counter()
+        type_severity_counts = Counter()
+        for f in all_findings:
+            severity_counts[f['severity']] += 1
+            type_severity_counts[(f['finding_type'], f['severity'])] += 1
+        finding_summaries = [
+            {'finding_type': ft, 'severity': sev, 'count': cnt}
+            for (ft, sev), cnt in sorted(type_severity_counts.items())
+        ]
+
+        output = {
+            'mobile_detected': {
+                'scan_id': scan_id,
+                'platform': 'ios',
+                'bundle_id': bundle_id,
+                'package_name': None,
+                'app_version': app_version,
+                'app_version_code': None,
+                'artifact_path': str(app),
+                'severity_counts': dict(severity_counts),
+                'finding_summaries': finding_summaries,
+            },
+            'detail_findings': all_findings,
+            'total_findings': len(all_findings),
+        }
+        print(json.dumps(output, indent=2, ensure_ascii=False))
+
+
+    if __name__ == '__main__':
+        main()
