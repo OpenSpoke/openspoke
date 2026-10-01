@@ -1,0 +1,927 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-backend-kernel-kubectl
+  namespace: rag-company1
+data:
+  kubectl_endpoints.py: |
+    """kubectl_endpoints.py (hub 側)
+    ====================================================================
+    OpenSpoke の各スポーククラスタに対して kubectl を集中実行する仕組み。
+
+    設計方針:
+        - 各クラスタの admin kubeconfig を OpenSearch の kubeconfigs index に
+          平文で集中保管する (詳細は docs/operations/kubectl-centralization.md 参照)。
+        - kubectl バイナリは image に焼き込まず、 呼び出し時に対象バージョンを
+          emptyDir にダウンロードしてキャッシュする (image 再ビルド不要)。
+        - kubectl 実行は kernel Pod 内で行い、 kubeconfig は subprocess の
+          stdin に流し込んで --kubeconfig=/dev/stdin で渡す。 ファイル化しない。
+        - kubeconfig の server URL は tunnel-server の内部 URL に上書き可能
+          (server_url_override フィールド)。 これにより tunnel 逆流経路を通り
+          スポーク内の kube-apiserver に届く形になる。
+        - 実行のたびに kubectl_audit index に監査ログを残す。
+
+    エンドポイント:
+        POST   /core/kubeconfig                  … 登録・更新 (upsert)
+        GET    /core/kubeconfig                  … 一覧
+        GET    /core/kubeconfig/{cluster_name}   … 1 件取得
+        DELETE /core/kubeconfig/{cluster_name}   … 削除
+        POST   /core/kubectl/execute             … kubectl 実行
+
+    main.py からの取り込み:
+        from kubectl_endpoints import router as _kubectl_endpoints_router
+        app.include_router(_kubectl_endpoints_router)
+    """
+    from __future__ import annotations
+
+    import asyncio
+    import json
+    import logging
+    import os
+    import re
+    import subprocess
+    import tempfile
+    import time
+    from datetime import datetime, timezone
+    from typing import Any, Dict, List, Optional
+
+    import requests
+    from fastapi import APIRouter, HTTPException, Request
+    from fastapi.concurrency import run_in_threadpool
+    from pydantic import BaseModel, Field
+
+    logger = logging.getLogger("kubectl_endpoints")
+    router = APIRouter()
+
+    _OPENSEARCH_URL = os.environ.get(
+        "OPENSEARCH_URL", "http://opensearch.opensearch.svc.cluster.local:9200"
+    ).rstrip("/")
+
+    # OpenSearch index 名
+    _KUBECONFIG_INDEX = "kubeconfigs"
+    _AUDIT_INDEX = "kubectl_audit"
+
+    # kubectl バイナリキャッシュディレクトリ (emptyDir でマウント)
+    _KUBECTL_CACHE_DIR = os.environ.get("KUBECTL_CACHE_DIR", "/opt/kubectl-cache")
+
+    # kubectl ダウンロード元 URL テンプレート
+    _KUBECTL_DL_URL_TEMPLATE = (
+        "https://dl.k8s.io/release/{version}/bin/linux/amd64/kubectl"
+    )
+
+    # kubectl 実行のタイムアウト (秒)
+    _KUBECTL_EXEC_TIMEOUT = int(os.environ.get("KUBECTL_EXEC_TIMEOUT", "60"))
+
+    # kubectl バイナリダウンロードのタイムアウト (秒)
+    _KUBECTL_DL_TIMEOUT = int(os.environ.get("KUBECTL_DL_TIMEOUT", "60"))
+
+    # cluster_name / version の validation 用正規表現
+    _RE_CLUSTER_NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_\-]{0,62}$")
+    _RE_K8S_VERSION = re.compile(r"^v[0-9]+\.[0-9]+(\.[0-9]+)?$")
+
+
+    # ============================================================
+    # OpenSearch helpers
+    # ============================================================
+
+    def _now_iso() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+
+    def _ensure_kubeconfig_index() -> None:
+        """kubeconfigs index を冪等に作成する。 既存なら mapping を追加更新する。"""
+        url = f"{_OPENSEARCH_URL}/{_KUBECONFIG_INDEX}"
+        properties = {
+            "cluster_name": {"type": "keyword"},
+            "k8s_version": {"type": "keyword"},
+            "kubeconfig_yaml": {"type": "text", "index": False},
+            "server_url_override": {"type": "keyword"},
+            "source": {"type": "keyword"},
+            "notes": {"type": "text"},
+            "created_at": {"type": "date"},
+            "updated_at": {"type": "date"},
+        }
+        try:
+            head = requests.head(url, timeout=5)
+            if head.status_code == 200:
+                # 既存 index: mapping に新規フィールドが必要な場合に備えて PUT で追加。
+                # OpenSearch は既存フィールドの再指定を許容し、 新規フィールドだけ追加する。
+                try:
+                    requests.put(
+                        f"{url}/_mapping",
+                        json={"properties": properties},
+                        timeout=10,
+                    )
+                except Exception as e:
+                    logger.warning(f"[kubectl] kubeconfig mapping update failed: {e}")
+                return
+        except Exception as e:
+            logger.warning(f"[kubectl] kubeconfig index HEAD failed: {e}")
+            return
+
+        body = {"mappings": {"properties": properties}}
+        try:
+            resp = requests.put(url, json=body, timeout=10)
+            if resp.status_code not in (200, 201):
+                logger.warning(
+                    f"[kubectl] kubeconfig index create returned {resp.status_code}: {resp.text[:200]}"
+                )
+        except Exception as e:
+            logger.warning(f"[kubectl] kubeconfig index create failed: {e}")
+
+
+    def _ensure_audit_index() -> None:
+        """kubectl_audit index を冪等に作成する。"""
+        url = f"{_OPENSEARCH_URL}/{_AUDIT_INDEX}"
+        try:
+            head = requests.head(url, timeout=5)
+            if head.status_code == 200:
+                return
+        except Exception as e:
+            logger.warning(f"[kubectl] audit index HEAD failed: {e}")
+            return
+
+        body = {
+            "mappings": {
+                "properties": {
+                    "cluster_name": {"type": "keyword"},
+                    "user": {"type": "keyword"},
+                    "user_source": {"type": "keyword"},
+                    "kubectl_version": {"type": "keyword"},
+                    "args": {"type": "keyword"},
+                    "exit_code": {"type": "integer"},
+                    "stdout_length": {"type": "integer"},
+                    "stderr_length": {"type": "integer"},
+                    "elapsed_ms": {"type": "integer"},
+                    "started_at": {"type": "date"},
+                }
+            }
+        }
+        try:
+            resp = requests.put(url, json=body, timeout=10)
+            if resp.status_code not in (200, 201):
+                logger.warning(
+                    f"[kubectl] audit index create returned {resp.status_code}: {resp.text[:200]}"
+                )
+        except Exception as e:
+            logger.warning(f"[kubectl] audit index create failed: {e}")
+
+
+    def _record_audit(record: Dict[str, Any]) -> None:
+        """監査ログを OpenSearch に書き込む (失敗しても kubectl 呼び出しは通す)。"""
+        try:
+            _ensure_audit_index()
+            url = f"{_OPENSEARCH_URL}/{_AUDIT_INDEX}/_doc"
+            requests.post(url, json=record, timeout=5)
+        except Exception as e:
+            logger.warning(f"[kubectl] audit record failed: {e}")
+
+
+    # ============================================================
+    # kubeconfig CRUD
+    # ============================================================
+
+    class KubeconfigUpsert(BaseModel):
+        cluster_name: str = Field(..., description="クラスタ識別子")
+        k8s_version: str = Field(..., description="Kubernetes バージョン (例 v1.32)")
+        kubeconfig_yaml: str = Field(..., description="kubeconfig 本体 (yaml 文字列)")
+        server_url_override: Optional[str] = Field(
+            None,
+            description="server URL の上書き (tunnel 経由 URL 等)",
+        )
+        notes: Optional[str] = Field(None, description="運用メモ")
+        source: str = Field(
+            "manual",
+            description="登録の由来 (manual = UI 手動登録、 auto = 自動取得)",
+        )
+
+
+    def _validate_cluster_name(cluster_name: str) -> None:
+        if not _RE_CLUSTER_NAME.match(cluster_name):
+            raise HTTPException(
+                status_code=400,
+                detail=f"invalid cluster_name: {cluster_name}",
+            )
+
+
+    def _validate_k8s_version(version: str) -> None:
+        if not version:
+            # 空文字は任意扱いで許容 (フロントエンドで readonly 表示のみに使う場合など)
+            return
+        if not _RE_K8S_VERSION.match(version):
+            raise HTTPException(
+                status_code=400,
+                detail=f"invalid k8s_version (expected e.g. v1.32 or v1.32.5): {version}",
+            )
+
+
+    @router.post("/core/kubeconfig")
+    async def kubeconfig_upsert(body: KubeconfigUpsert) -> Dict[str, Any]:
+        _validate_cluster_name(body.cluster_name)
+        _validate_k8s_version(body.k8s_version)
+
+        def _do() -> Dict[str, Any]:
+            _ensure_kubeconfig_index()
+            now = _now_iso()
+            url_get = f"{_OPENSEARCH_URL}/{_KUBECONFIG_INDEX}/_doc/{body.cluster_name}"
+            existing = requests.get(url_get, timeout=10)
+            created_at = now
+            existing_source = ""
+            if existing.status_code == 200:
+                try:
+                    src = existing.json().get("_source") or {}
+                    created_at = src.get("created_at") or now
+                    existing_source = (src.get("source") or "").strip()
+                except Exception:
+                    pass
+
+            # auto 呼び出しは既存 manual を上書きしない (手動編集の保護)
+            requested_source = (body.source or "manual").strip().lower()
+            if requested_source not in ("manual", "auto"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"invalid source (expected 'manual' or 'auto'): {body.source}",
+                )
+            if requested_source == "auto" and existing_source == "manual":
+                return {
+                    "cluster_name": body.cluster_name,
+                    "k8s_version": body.k8s_version,
+                    "created_at": created_at,
+                    "updated_at": src.get("updated_at") if existing.status_code == 200 else now,
+                    "result": "skipped",
+                    "reason": "auto は既存 manual エントリを上書きしません",
+                }
+
+            doc = {
+                "cluster_name": body.cluster_name,
+                "k8s_version": body.k8s_version,
+                "kubeconfig_yaml": body.kubeconfig_yaml,
+                "server_url_override": body.server_url_override or "",
+                "source": requested_source,
+                "notes": body.notes or "",
+                "created_at": created_at,
+                "updated_at": now,
+            }
+            url_put = f"{_OPENSEARCH_URL}/{_KUBECONFIG_INDEX}/_doc/{body.cluster_name}"
+            resp = requests.put(url_put, json=doc, timeout=10)
+            if resp.status_code not in (200, 201):
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"opensearch upsert failed: {resp.status_code} {resp.text[:200]}",
+                )
+            return {
+                "cluster_name": body.cluster_name,
+                "k8s_version": body.k8s_version,
+                "source": requested_source,
+                "created_at": created_at,
+                "updated_at": now,
+                "result": resp.json().get("result", "unknown"),
+            }
+
+        return await run_in_threadpool(_do)
+
+
+    @router.get("/core/kubeconfig")
+    async def kubeconfig_list() -> Dict[str, Any]:
+        def _do() -> Dict[str, Any]:
+            _ensure_kubeconfig_index()
+            url = f"{_OPENSEARCH_URL}/{_KUBECONFIG_INDEX}/_search"
+            body = {
+                "size": 500,
+                "_source": [
+                    "cluster_name",
+                    "k8s_version",
+                    "server_url_override",
+                    "source",
+                    "notes",
+                    "created_at",
+                    "updated_at",
+                ],
+                "sort": [{"cluster_name": "asc"}],
+            }
+            resp = requests.post(url, json=body, timeout=10)
+            if resp.status_code != 200:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"opensearch search failed: {resp.status_code} {resp.text[:200]}",
+                )
+            hits = resp.json().get("hits", {}).get("hits", [])
+            entries = [h.get("_source", {}) for h in hits]
+            return {"count": len(entries), "entries": entries}
+
+        return await run_in_threadpool(_do)
+
+
+    @router.get("/core/kubeconfig/{cluster_name}")
+    async def kubeconfig_get(cluster_name: str, include_yaml: bool = False) -> Dict[str, Any]:
+        _validate_cluster_name(cluster_name)
+
+        def _do() -> Dict[str, Any]:
+            url = f"{_OPENSEARCH_URL}/{_KUBECONFIG_INDEX}/_doc/{cluster_name}"
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 404:
+                raise HTTPException(status_code=404, detail=f"kubeconfig not found: {cluster_name}")
+            if resp.status_code != 200:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"opensearch get failed: {resp.status_code} {resp.text[:200]}",
+                )
+            src = resp.json().get("_source") or {}
+            if not include_yaml:
+                src.pop("kubeconfig_yaml", None)
+            return src
+
+        return await run_in_threadpool(_do)
+
+
+    @router.delete("/core/kubeconfig/{cluster_name}")
+    async def kubeconfig_delete(cluster_name: str) -> Dict[str, Any]:
+        _validate_cluster_name(cluster_name)
+
+        def _do() -> Dict[str, Any]:
+            url = f"{_OPENSEARCH_URL}/{_KUBECONFIG_INDEX}/_doc/{cluster_name}"
+            resp = requests.delete(url, timeout=10)
+            if resp.status_code == 404:
+                raise HTTPException(status_code=404, detail=f"kubeconfig not found: {cluster_name}")
+            if resp.status_code not in (200, 201):
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"opensearch delete failed: {resp.status_code} {resp.text[:200]}",
+                )
+            return {"cluster_name": cluster_name, "deleted": True}
+
+        return await run_in_threadpool(_do)
+
+
+    # ============================================================
+    # kubectl バイナリ管理 (キャッシュ + 実行)
+    # ============================================================
+
+    def _normalize_version(version: str) -> str:
+        """v1.32 のような minor 指定を stable の patch バージョンに解決する。
+
+        v1.32     → v1.32 の最新 patch (stable-1.32.txt から取得)
+        v1.32.5   → そのまま
+        """
+        _validate_k8s_version(version)
+        parts = version.lstrip("v").split(".")
+        if len(parts) == 3:
+            return version
+        # minor 指定の場合、 dl.k8s.io の stable-<minor>.txt から取得
+        minor = f"{parts[0]}.{parts[1]}"
+        stable_url = f"https://dl.k8s.io/release/stable-{minor}.txt"
+        try:
+            resp = requests.get(stable_url, timeout=_KUBECTL_DL_TIMEOUT)
+            resp.raise_for_status()
+            resolved = resp.text.strip()
+            if not _RE_K8S_VERSION.match(resolved):
+                raise ValueError(f"unexpected stable content: {resolved!r}")
+            return resolved
+        except Exception as e:
+            raise HTTPException(
+                status_code=502,
+                detail=f"failed to resolve k8s version {version}: {e}",
+            )
+
+
+    def _kubectl_binary_path(version: str) -> str:
+        return os.path.join(_KUBECTL_CACHE_DIR, f"kubectl-{version}")
+
+
+    def _ensure_kubectl_binary(version: str) -> str:
+        """指定バージョンの kubectl バイナリを emptyDir キャッシュに用意する。
+
+        既にキャッシュに存在すればそのまま返す。 無ければ dl.k8s.io からダウンロードして
+        chmod +x してキャッシュに書き込む。 返り値はキャッシュ上のパス。
+        """
+        os.makedirs(_KUBECTL_CACHE_DIR, exist_ok=True)
+        resolved = _normalize_version(version)
+        path = _kubectl_binary_path(resolved)
+        if os.path.exists(path) and os.access(path, os.X_OK):
+            return path
+
+        url = _KUBECTL_DL_URL_TEMPLATE.format(version=resolved)
+        logger.info(f"[kubectl] downloading {resolved} from {url}")
+        tmp_fd, tmp_path = tempfile.mkstemp(prefix="kubectl-", dir=_KUBECTL_CACHE_DIR)
+        try:
+            with os.fdopen(tmp_fd, "wb") as tmp_file:
+                with requests.get(url, timeout=_KUBECTL_DL_TIMEOUT, stream=True) as resp:
+                    resp.raise_for_status()
+                    for chunk in resp.iter_content(chunk_size=65536):
+                        if chunk:
+                            tmp_file.write(chunk)
+            os.chmod(tmp_path, 0o755)
+            # atomic rename でキャッシュに配置
+            os.replace(tmp_path, path)
+            return path
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
+            raise
+
+
+    def _rewrite_server_url(kubeconfig_yaml: str, server_url_override: str) -> str:
+        """kubeconfig 内の全 cluster.server を server_url_override に書き換える。"""
+        if not server_url_override:
+            return kubeconfig_yaml
+        # yaml の server: 行を単純置換。 kubeconfig は yaml 1.1 準拠なので
+        # 空白の付き方を正規表現で吸収する。
+        pattern = re.compile(r"^(\s*server:\s*).*$", re.MULTILINE)
+        return pattern.sub(rf"\1{server_url_override}", kubeconfig_yaml)
+
+
+    def _load_kubeconfig_for_cluster(cluster_name: str) -> Dict[str, Any]:
+        url = f"{_OPENSEARCH_URL}/{_KUBECONFIG_INDEX}/_doc/{cluster_name}"
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 404:
+            raise HTTPException(
+                status_code=404,
+                detail=f"kubeconfig not registered: {cluster_name}",
+            )
+        if resp.status_code != 200:
+            raise HTTPException(
+                status_code=500,
+                detail=f"opensearch get failed: {resp.status_code} {resp.text[:200]}",
+            )
+        src = resp.json().get("_source") or {}
+        if not src.get("kubeconfig_yaml") or not src.get("k8s_version"):
+            raise HTTPException(
+                status_code=500,
+                detail=f"kubeconfig entry incomplete for {cluster_name}",
+            )
+        return src
+
+
+    class KubectlExecute(BaseModel):
+        cluster_name: str = Field(..., description="対象クラスタ")
+        args: List[str] = Field(
+            ...,
+            description="kubectl に渡す引数リスト (例 ['get', 'pods', '-A'])",
+        )
+        stdin: Optional[str] = Field(
+            None,
+            description="kubectl の標準入力に流し込むテキスト (apply -f - 用)",
+        )
+        timeout: Optional[int] = Field(
+            None,
+            description="実行タイムアウト秒 (default 60、 上限 300)",
+        )
+
+
+    def _user_from_request(request: Request) -> Dict[str, str]:
+        """oauth2-proxy / mcp から注入される identity ヘッダを読む。"""
+        headers = request.headers
+        user = (
+            headers.get("x-forwarded-preferred-username")
+            or headers.get("x-auth-request-preferred-username")
+            or headers.get("x-forwarded-email")
+            or headers.get("x-auth-request-email")
+            or headers.get("x-forwarded-user")
+            or headers.get("x-auth-request-user")
+            or ""
+        )
+        source = "header" if user else "unknown"
+        return {"user": user, "source": source}
+
+
+    @router.post("/core/kubectl/execute")
+    async def kubectl_execute(body: KubectlExecute, request: Request) -> Dict[str, Any]:
+        _validate_cluster_name(body.cluster_name)
+        if not body.args or not isinstance(body.args, list):
+            raise HTTPException(status_code=400, detail="args must be a non-empty list")
+
+        timeout = min(max(body.timeout or _KUBECTL_EXEC_TIMEOUT, 1), 300)
+        user_info = _user_from_request(request)
+
+        def _do() -> Dict[str, Any]:
+            entry = _load_kubeconfig_for_cluster(body.cluster_name)
+            version = entry["k8s_version"]
+            kubeconfig_yaml = entry["kubeconfig_yaml"]
+            override = entry.get("server_url_override") or ""
+            if override:
+                kubeconfig_yaml = _rewrite_server_url(kubeconfig_yaml, override)
+
+            binary_path = _ensure_kubectl_binary(version)
+
+            cmd = [binary_path, "--kubeconfig=/dev/stdin", *body.args]
+            started = time.monotonic()
+            started_at = _now_iso()
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    input=(kubeconfig_yaml + ("\n" + body.stdin if body.stdin else "")),
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+                exit_code = proc.returncode
+                stdout = proc.stdout
+                stderr = proc.stderr
+            except subprocess.TimeoutExpired as e:
+                exit_code = 124
+                stdout = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+                stderr = (e.stderr.decode() if isinstance(e.stderr, bytes) else (e.stderr or "")) + f"\n[TIMEOUT after {timeout}s]"
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+
+            audit = {
+                "cluster_name": body.cluster_name,
+                "user": user_info["user"],
+                "user_source": user_info["source"],
+                "kubectl_version": version,
+                "args": body.args,
+                "exit_code": exit_code,
+                "stdout_length": len(stdout or ""),
+                "stderr_length": len(stderr or ""),
+                "elapsed_ms": elapsed_ms,
+                "started_at": started_at,
+            }
+            _record_audit(audit)
+
+            return {
+                "cluster_name": body.cluster_name,
+                "kubectl_version": version,
+                "exit_code": exit_code,
+                "stdout": stdout,
+                "stderr": stderr,
+                "elapsed_ms": elapsed_ms,
+            }
+
+        return await run_in_threadpool(_do)
+
+
+    @router.get("/core/kubectl/cache")
+    async def kubectl_cache_list() -> Dict[str, Any]:
+        """emptyDir 上にキャッシュされている kubectl バイナリの一覧を返す。"""
+        def _do() -> Dict[str, Any]:
+            entries: List[Dict[str, Any]] = []
+            if not os.path.isdir(_KUBECTL_CACHE_DIR):
+                return {"cache_dir": _KUBECTL_CACHE_DIR, "entries": entries}
+            for name in sorted(os.listdir(_KUBECTL_CACHE_DIR)):
+                path = os.path.join(_KUBECTL_CACHE_DIR, name)
+                if not os.path.isfile(path):
+                    continue
+                if not name.startswith("kubectl-"):
+                    continue
+                try:
+                    st = os.stat(path)
+                    entries.append({
+                        "version": name[len("kubectl-"):],
+                        "size_bytes": st.st_size,
+                        "mtime": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat(),
+                    })
+                except OSError:
+                    pass
+            return {"cache_dir": _KUBECTL_CACHE_DIR, "entries": entries}
+
+        return await run_in_threadpool(_do)
+
+
+    # ============================================================
+    # 自動取得 (auto-fetch)
+    # ------------------------------------------------------------
+    # スポークコントロールプレーンにノードシェル (node-shell DaemonSet) が
+    # 動作している rke2 系クラスタでは、 admin kubeconfig を自動取得できる。
+    # 経路:
+    #   kernel → hub の mcp-company1 (SimpleMCPClient で SSE) →
+    #     cluster_node_list / cluster_node_exec →
+    #       スポーク MCP → node-shell DaemonSet Pod → nsenter → host OS
+    #
+    # 動作:
+    #   1) list_clusters 相当を hub MCP から取得
+    #   2) 対象クラスタの node 一覧を取得、 control-plane node を選定
+    #   3) その node で `cat /etc/rancher/rke2/rke2.yaml` を実行し
+    #      admin kubeconfig を取得
+    #   4) /var/lib/rancher/rke2/bin/kubectl version --client -o yaml で
+    #      client version、 続いて --kubeconfig=rke2.yaml version -o yaml で
+    #      server version を取得。 server の major.minor をタグにする
+    #   5) kubeconfig の server: を tunnel 逆流経路 URL に書き換えたい場合は
+    #      server_url_override に入れる。 このタスクは初回取得段階では未実装、
+    #      いったん kubeconfig そのままで保存する
+    # ============================================================
+
+    _MCP_URL = os.environ.get(
+        "MCP_SERVER_URL", "http://mcp-company1.mcp.svc.cluster.local:8000/sse"
+    )
+    _MCP_KEY = os.environ.get("MCP_API_KEY", "")
+    _MCP_TIMEOUT = 60.0
+
+    # rke2 の kubeconfig と kubectl のパス (rke2 系スポーク全てで共通)
+    _RKE2_KUBECONFIG_PATH = "/etc/rancher/rke2/rke2.yaml"
+    _RKE2_KUBECTL_PATH = "/var/lib/rancher/rke2/bin/kubectl"
+
+
+    def _hub_mcp_call(tool_name: str, arguments: Dict[str, Any]) -> str:
+        """hub の mcp-company1 に SimpleMCPClient で 1 tool を叩く。
+
+        spoke_history_proxy と同じパターン。 kernel の main モジュールから
+        SimpleMCPClient を lazy import する (循環 import 防止)。
+        """
+        import main  # type: ignore
+
+        SimpleMCPClient = getattr(main, "SimpleMCPClient", None)
+        if SimpleMCPClient is None:
+            raise RuntimeError("SimpleMCPClient is not available in main module")
+        if not _MCP_KEY:
+            raise RuntimeError("MCP_API_KEY is not configured")
+
+        with SimpleMCPClient(_MCP_URL, _MCP_KEY, timeout=_MCP_TIMEOUT) as client:
+            result = client.call_tool(tool_name, arguments)
+            return result if isinstance(result, str) else json.dumps(result, default=str)
+
+
+    def _list_registered_clusters() -> List[Dict[str, Any]]:
+        """hub MCP の list_clusters を叩いてクラスタ一覧を得る。
+
+        hub の list_clusters は JSON ではなく Markdown 形式で返す:
+            ## 登録済みクラスタ (6 件)
+
+            ### fleetCluster
+            - 環境: onprem-rke2
+            - ...
+
+            ### linode0001
+            - ...
+
+        `### <cluster_name>` の行から cluster_name を抜き出し、 各エントリの
+        直下のキーバリューをパースして dict にする。 status: disabled は除外。
+        """
+        raw = _hub_mcp_call("list_clusters", {})
+        if not raw or not isinstance(raw, str):
+            return []
+        entries: List[Dict[str, Any]] = []
+        current: Optional[Dict[str, Any]] = None
+        for line in raw.splitlines():
+            # クラスタ名の見出し
+            m = re.match(r"^###\s+(\S+)\s*$", line)
+            if m:
+                if current:
+                    entries.append(current)
+                current = {"cluster_name": m.group(1)}
+                continue
+            if current is None:
+                continue
+            # 属性行 (- キー: 値)
+            m = re.match(r"^-\s+([^:]+):\s*(.*)$", line)
+            if m:
+                key = m.group(1).strip()
+                value = m.group(2).strip()
+                current[key] = value
+        if current:
+            entries.append(current)
+        # ステータス disabled を除外
+        return [e for e in entries if (e.get("ステータス") or e.get("status") or "").strip() != "disabled"]
+
+
+    def _list_spoke_nodes(cluster: str) -> List[str]:
+        """cluster_node_list を叩き、 node 名のリストを返す。
+
+        hub の cluster_node_list は Markdown 形式で返す:
+            ## node-shell pods (6 件)
+
+            - node=rke2-001  podIP=10.42.1.6  phase=Running  ready=True
+            - node=rke2-005  podIP=10.42.2.67  phase=Running  ready=True
+            ...
+        """
+        raw = _hub_mcp_call("cluster_node_list", {"cluster": cluster})
+        if not raw or not isinstance(raw, str):
+            return []
+        nodes: List[str] = []
+        for line in raw.splitlines():
+            m = re.match(r"^-\s+node=(\S+)", line)
+            if m:
+                nodes.append(m.group(1))
+        return nodes
+
+
+    def _parse_node_exec_output(raw: str) -> Dict[str, Any]:
+        """cluster_node_exec の Markdown 応答をパースする。
+
+        応答例:
+            ## node_exec node=rke2-000  exit_code=0  duration=3ms  spoke=12ms
+
+            [stdout]
+            YES
+
+            [stderr]
+            (empty)
+        """
+        result = {"stdout": "", "stderr": "", "exit_code": -1}
+        if not raw or not isinstance(raw, str):
+            return result
+        # exit_code
+        m = re.search(r"exit_code=(-?\d+)", raw)
+        if m:
+            try:
+                result["exit_code"] = int(m.group(1))
+            except ValueError:
+                pass
+        # stdout ブロック
+        m = re.search(r"\n\[stdout\]\n(.*?)(?=\n\[stderr\]|\Z)", raw, re.DOTALL)
+        if m:
+            content = m.group(1).strip()
+            result["stdout"] = "" if content == "(empty)" else content
+        # stderr ブロック
+        m = re.search(r"\n\[stderr\]\n(.*?)\Z", raw, re.DOTALL)
+        if m:
+            content = m.group(1).strip()
+            result["stderr"] = "" if content == "(empty)" else content
+        return result
+
+
+    def _spoke_node_exec(cluster: str, node: str, command: str, timeout: int = 30) -> Dict[str, Any]:
+        """cluster_node_exec を叩き、 {stdout, stderr, exit_code} を返す。"""
+        raw = _hub_mcp_call(
+            "cluster_node_exec",
+            {"cluster": cluster, "node": node, "command": command, "timeout": timeout},
+        )
+        return _parse_node_exec_output(raw)
+
+
+    def _pick_control_plane_node(cluster: str) -> Optional[str]:
+        """このヘルパは非推奨。 _autofetch_one が全ノードを試す形に切り替えた。"""
+        nodes = _list_spoke_nodes(cluster)
+        return nodes[0] if nodes else None
+
+
+    def _extract_server_version(kubectl_version_output: str) -> Optional[str]:
+        """`kubectl version -o yaml` の出力から serverVersion.gitVersion (v1.32.5) を取り、
+        minor までに短縮 (v1.32) して返す。 失敗時 None。
+        """
+        # yaml パースを避けて簡易的に正規表現で拾う。 client と server の両方
+        # が gitVersion を持つので、 serverVersion ブロック直下の gitVersion を
+        # 優先。
+        m = re.search(
+            r"serverVersion:\s*\n(?:\s+.+\n)*?\s+gitVersion:\s*(v[0-9]+\.[0-9]+(?:\.[0-9]+)?)",
+            kubectl_version_output,
+            re.MULTILINE,
+        )
+        if m:
+            full = m.group(1)
+        else:
+            # 単一 (client) の場合の fallback
+            m = re.search(r"gitVersion:\s*(v[0-9]+\.[0-9]+(?:\.[0-9]+)?)", kubectl_version_output)
+            if not m:
+                return None
+            full = m.group(1)
+        parts = full.lstrip("v").split(".")
+        if len(parts) < 2:
+            return None
+        return f"v{parts[0]}.{parts[1]}"
+
+
+    def _autofetch_one(cluster: str) -> Dict[str, Any]:
+        """1 クラスタに対して自動取得を試みる。 結果 dict を返す。
+
+        戻り値:
+          status: "ok" | "skipped" | "failed"
+          reason: 補足メッセージ
+          k8s_version: 判定できたバージョン (ok のみ)
+          node: 実際に kubeconfig を取れたノード名 (ok のみ)
+
+        rke2 は基本的に CP ノードにしか /etc/rancher/rke2/rke2.yaml を置かないが、
+        どのノードが CP かはクラスタごとに異なる。 名前で判定するのは環境依存
+        になりすぎるので、 全ノードを試して最初に読めたノードを採用する
+        (worker で失敗するのは無害、 単に次のノードを試すだけ)。
+        """
+        _validate_cluster_name(cluster)
+
+        # 既存 manual 保護
+        try:
+            existing_url = f"{_OPENSEARCH_URL}/{_KUBECONFIG_INDEX}/_doc/{cluster}"
+            existing = requests.get(existing_url, timeout=10)
+            if existing.status_code == 200:
+                src = existing.json().get("_source") or {}
+                if (src.get("source") or "").strip() == "manual":
+                    return {
+                        "status": "skipped",
+                        "reason": "既存の登録は manual 由来のため上書きしません",
+                    }
+        except Exception as e:
+            logger.warning(f"[kubectl] autofetch existence check failed cluster={cluster}: {e}")
+
+        # 1) ノード一覧
+        try:
+            nodes = _list_spoke_nodes(cluster)
+        except Exception as e:
+            return {"status": "failed", "reason": f"cluster_node_list 失敗: {type(e).__name__}: {e}"}
+        if not nodes:
+            return {"status": "failed", "reason": "ノードが見つかりません (node-shell DaemonSet が動作していない可能性)"}
+
+        # 2) 全ノードを順次試して kubeconfig を取得
+        kubeconfig_yaml = None
+        used_node = None
+        last_stderr = ""
+        for node in nodes:
+            try:
+                res_cfg = _spoke_node_exec(cluster, node, f"cat {_RKE2_KUBECONFIG_PATH}", timeout=15)
+            except Exception as e:
+                last_stderr = f"{type(e).__name__}: {e}"
+                continue
+            stdout = res_cfg.get("stdout", "") or ""
+            if res_cfg.get("exit_code") == 0 and stdout.strip():
+                kubeconfig_yaml = stdout
+                used_node = node
+                break
+            last_stderr = (res_cfg.get("stderr") or "")[:200]
+
+        if not kubeconfig_yaml:
+            return {
+                "status": "failed",
+                "reason": f"どのノードでも {_RKE2_KUBECONFIG_PATH} を読めませんでした (試したノード数={len(nodes)}, 最後の stderr={last_stderr})",
+            }
+
+        # 3) server version を取る (kubeconfig が取れたノードで実行)
+        version = None
+        try:
+            ver_cmd = (
+                f"{_RKE2_KUBECTL_PATH} --kubeconfig={_RKE2_KUBECONFIG_PATH} version -o yaml 2>/dev/null "
+                f"|| {_RKE2_KUBECTL_PATH} --kubeconfig={_RKE2_KUBECONFIG_PATH} version --output=yaml 2>/dev/null"
+            )
+            res_ver = _spoke_node_exec(cluster, used_node, ver_cmd, timeout=15)
+            if res_ver.get("exit_code") == 0 and res_ver.get("stdout"):
+                version = _extract_server_version(res_ver["stdout"])
+        except Exception as e:
+            logger.warning(f"[kubectl] autofetch version detect failed cluster={cluster}: {e}")
+
+        if not version:
+            # server version が取れなくても kubeconfig は保存できる。
+            # デフォルトで v1.32 を仮置きし、 UI から手動で書き換えられるようにする。
+            version = "v1.32"
+
+        # 4) upsert
+        now = _now_iso()
+        try:
+            existing2 = requests.get(existing_url, timeout=10)
+            created_at = now
+            if existing2.status_code == 200:
+                src2 = existing2.json().get("_source") or {}
+                created_at = src2.get("created_at") or now
+            doc = {
+                "cluster_name": cluster,
+                "k8s_version": version,
+                "kubeconfig_yaml": kubeconfig_yaml,
+                "server_url_override": "",
+                "source": "auto",
+                "notes": f"auto-fetched from {used_node} at {now}",
+                "created_at": created_at,
+                "updated_at": now,
+            }
+            put_resp = requests.put(existing_url, json=doc, timeout=10)
+            if put_resp.status_code not in (200, 201):
+                return {
+                    "status": "failed",
+                    "reason": f"opensearch upsert 失敗: {put_resp.status_code} {put_resp.text[:200]}",
+                }
+        except Exception as e:
+            return {"status": "failed", "reason": f"opensearch upsert 例外: {type(e).__name__}: {e}"}
+
+        return {"status": "ok", "k8s_version": version, "node": used_node}
+
+
+    @router.post("/core/kubectl/autofetch/{cluster_name}")
+    async def kubectl_autofetch_one(cluster_name: str) -> Dict[str, Any]:
+        """指定クラスタの kubeconfig 自動取得を試みる。"""
+        _validate_cluster_name(cluster_name)
+        return await run_in_threadpool(lambda: {"cluster_name": cluster_name, **_autofetch_one(cluster_name)})
+
+
+    @router.post("/core/kubectl/autofetch")
+    async def kubectl_autofetch_all() -> Dict[str, Any]:
+        """登録済みの全クラスタに対して自動取得を試みる (manual は上書きしない)。"""
+        def _do() -> Dict[str, Any]:
+            try:
+                clusters = _list_registered_clusters()
+            except Exception as e:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"list_clusters 失敗: {type(e).__name__}: {e}",
+                )
+            results = []
+            for entry in clusters:
+                name = entry["cluster_name"]
+                try:
+                    r = _autofetch_one(name)
+                except Exception as e:
+                    r = {"status": "failed", "reason": f"{type(e).__name__}: {e}"}
+                results.append({"cluster_name": name, **r})
+            return {"count": len(results), "results": results}
+
+        return await run_in_threadpool(_do)
+
+
+    @router.get("/core/clusters")
+    async def clusters_list() -> Dict[str, Any]:
+        """OpenSpoke 管理下のクラスタ一覧を返す。 hub MCP の list_clusters 経由。"""
+        def _do() -> Dict[str, Any]:
+            try:
+                clusters = _list_registered_clusters()
+            except Exception as e:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"list_clusters 失敗: {type(e).__name__}: {e}",
+                )
+            return {"count": len(clusters), "clusters": clusters}
+
+        return await run_in_threadpool(_do)
