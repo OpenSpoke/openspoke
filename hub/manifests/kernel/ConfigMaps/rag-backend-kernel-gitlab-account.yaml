@@ -1,0 +1,879 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-backend-kernel-gitlab-account
+  namespace: rag-company1
+data:
+  gitlab_account.py: |
+    """
+    gitlab_account.py
+    ====================================================================
+    GitLab Account Management Module
+
+    秘書システムのユーザーごとに GitLab Personal Access Token を登録・
+    管理する。既存の /core/gitlab/* エンドポイントが token を解決する際に
+    本モジュールの resolve_gitlab_token() を呼び出す。
+
+    GitHub 版 (github_account.py) との差異:
+      - GitLab は複数 host 対応 (gitlab.example.com, gitlab.com, 顧客本番 等)
+      - 各 account は gitlab_host プロパティを持つ
+      - API endpoint: https://{host}/api/v4/*
+      - Token verify: GET /api/v4/user (with PRIVATE-TOKEN header, Bearer も可)
+
+    OpenSearch index: secretary_gitlab_accounts
+      - doc_id: {user_id}:{account_id}
+      - fields: user_id, account_id, account_label, gitlab_host, token,
+                gitlab_login, gitlab_user_id, scopes, default,
+                created_at, updated_at, last_used_at
+
+    Endpoints:
+      POST /core/gitlab-account/add
+      GET  /core/gitlab-account/list
+      POST /core/gitlab-account/update
+      POST /core/gitlab-account/delete
+      GET  /core/gitlab-account/health
+    """
+    from __future__ import annotations
+
+    import json
+    import logging
+    import os
+    import re
+    from datetime import datetime, timezone
+    from typing import Any, Dict, List, Optional
+
+    from fastapi import APIRouter, HTTPException
+
+    try:
+        import requests
+        _REQUESTS_AVAILABLE = True
+    except ImportError:
+        _REQUESTS_AVAILABLE = False
+
+    logger = logging.getLogger(__name__)
+
+    router = APIRouter(prefix="/core/gitlab-account", tags=["gitlab-account"])
+
+
+    # ==================================================================
+    # 定数
+    # ==================================================================
+    OPENSEARCH_URL = os.environ.get(
+        "OPENSEARCH_URL",
+        "http://opensearch.opensearch.svc.cluster.local:9200",
+    )
+    OS_INDEX_GITLAB_ACCOUNTS = "secretary_gitlab_accounts"
+    # GitLab は複数 host 対応。 API base は host から build する
+    # (例: "https://gitlab.example.com/api/v4")
+
+    # account_id: 英数字 + '_' + '-' + '.' の 1..64 文字
+    _ACCOUNT_ID_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,64}$")
+
+    # gitlab_host: hostname 形式のバリデーション
+    # (英数字 + '.' + '-'、 先頭末尾は英数字、 1..253 文字)
+    _GITLAB_HOST_RE = re.compile(
+        r"^[A-Za-z0-9](?:[A-Za-z0-9\-.]{0,251}[A-Za-z0-9])?$"
+    )
+
+
+    # ==================================================================
+    # OpenSearch ヘルパ
+    # ==================================================================
+    def _os_doc_id(user_id: str, account_id: str) -> str:
+        """OpenSearch document ID を組み立てる。"""
+        return f"{user_id}:{account_id}"
+
+
+    def _ensure_index() -> None:
+        """secretary_gitlab_accounts index が無ければ作成する。"""
+        if not _REQUESTS_AVAILABLE:
+            return
+        url = f"{OPENSEARCH_URL}/{OS_INDEX_GITLAB_ACCOUNTS}"
+        try:
+            resp = requests.head(url, timeout=5)
+            if resp.status_code == 200:
+                return
+        except Exception as e:
+            logger.warning(f"[GITLAB_ACCOUNT] index check failed: {e}")
+            return
+
+        # 存在しない → 作成
+        body = {
+            "settings": {
+                "number_of_shards": 1,
+                "number_of_replicas": 0,
+            },
+            "mappings": {
+                "properties": {
+                    "user_id":       {"type": "keyword"},
+                    "account_id":    {"type": "keyword"},
+                    "account_label": {"type": "keyword"},
+                    "gitlab_host":   {"type": "keyword"},
+                    "token":         {"type": "keyword", "index": False},
+                    "gitlab_login":  {"type": "keyword"},
+                    "gitlab_user_id": {"type": "integer"},
+                    "scopes":        {"type": "keyword"},
+                    "default":       {"type": "boolean"},
+                    "created_at":    {"type": "date"},
+                    "updated_at":    {"type": "date"},
+                    "last_used_at":  {"type": "date"},
+                }
+            },
+        }
+        try:
+            resp = requests.put(
+                url,
+                json=body,
+                headers={"Content-Type": "application/json"},
+                timeout=10,
+            )
+            if resp.status_code in (200, 201):
+                logger.info(
+                    f"[GITLAB_ACCOUNT] created index "
+                    f"{OS_INDEX_GITLAB_ACCOUNTS}"
+                )
+            else:
+                logger.warning(
+                    f"[GITLAB_ACCOUNT] failed to create index: "
+                    f"{resp.status_code}: {resp.text[:200]}"
+                )
+        except Exception as e:
+            logger.warning(f"[GITLAB_ACCOUNT] index create error: {e}")
+
+
+    def _os_get(user_id: str, account_id: str) -> Optional[Dict[str, Any]]:
+        """1 件取得。 見つからなければ None。"""
+        if not _REQUESTS_AVAILABLE:
+            return None
+        doc_id = _os_doc_id(user_id, account_id)
+        url = f"{OPENSEARCH_URL}/{OS_INDEX_GITLAB_ACCOUNTS}/_doc/{doc_id}"
+        try:
+            resp = requests.get(url, timeout=5)
+            if resp.status_code == 200:
+                data = resp.json() or {}
+                src = data.get("_source", {})
+                return src if isinstance(src, dict) else None
+            if resp.status_code == 404:
+                return None
+            logger.warning(
+                f"[GITLAB_ACCOUNT] _os_get {doc_id}: HTTP {resp.status_code}"
+            )
+            return None
+        except Exception as e:
+            logger.warning(f"[GITLAB_ACCOUNT] _os_get {doc_id} error: {e}")
+            return None
+
+
+    def _os_put(user_id: str, account_id: str, doc: Dict[str, Any]) -> bool:
+        """1 件 upsert。 成功したら True。"""
+        if not _REQUESTS_AVAILABLE:
+            return False
+        doc_id = _os_doc_id(user_id, account_id)
+        url = f"{OPENSEARCH_URL}/{OS_INDEX_GITLAB_ACCOUNTS}/_doc/{doc_id}"
+        try:
+            resp = requests.put(
+                url,
+                json=doc,
+                headers={"Content-Type": "application/json"},
+                timeout=10,
+            )
+            if resp.status_code in (200, 201):
+                return True
+            logger.warning(
+                f"[GITLAB_ACCOUNT] _os_put {doc_id}: HTTP {resp.status_code}: "
+                f"{resp.text[:200]}"
+            )
+            return False
+        except Exception as e:
+            logger.warning(f"[GITLAB_ACCOUNT] _os_put {doc_id} error: {e}")
+            return False
+
+
+    def _os_delete(user_id: str, account_id: str) -> bool:
+        """1 件削除。 成功したら True。 存在しない場合も True。"""
+        if not _REQUESTS_AVAILABLE:
+            return False
+        doc_id = _os_doc_id(user_id, account_id)
+        url = f"{OPENSEARCH_URL}/{OS_INDEX_GITLAB_ACCOUNTS}/_doc/{doc_id}"
+        try:
+            resp = requests.delete(url, timeout=5)
+            if resp.status_code in (200, 404):
+                return True
+            logger.warning(
+                f"[GITLAB_ACCOUNT] _os_delete {doc_id}: "
+                f"HTTP {resp.status_code}"
+            )
+            return False
+        except Exception as e:
+            logger.warning(
+                f"[GITLAB_ACCOUNT] _os_delete {doc_id} error: {e}"
+            )
+            return False
+
+
+    def _os_search_by_user(user_id: str) -> List[Dict[str, Any]]:
+        """user_id に紐づくアカウント全件返す (updated_at 降順)。"""
+        if not _REQUESTS_AVAILABLE:
+            return []
+        url = f"{OPENSEARCH_URL}/{OS_INDEX_GITLAB_ACCOUNTS}/_search"
+        body = {
+            "query": {"term": {"user_id": user_id}},
+            "sort": [
+                {"updated_at": {"order": "desc",
+                                "unmapped_type": "date"}}
+            ],
+            "size": 100,
+        }
+        try:
+            resp = requests.post(
+                url,
+                json=body,
+                headers={"Content-Type": "application/json"},
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                return []
+            data = resp.json() or {}
+            hits = data.get("hits", {}).get("hits", []) or []
+            return [h.get("_source", {}) for h in hits
+                    if isinstance(h.get("_source"), dict)]
+        except Exception as e:
+            logger.warning(
+                f"[GITLAB_ACCOUNT] _os_search_by_user {user_id} error: {e}"
+            )
+            return []
+
+
+    def _os_find_default(
+        user_id: str, gitlab_host: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """default=True のアカウントを 1 件返す。
+
+        gitlab_host 指定あり: (user_id, gitlab_host, default=True) で検索
+        gitlab_host 指定なし: (user_id, default=True) で検索
+                             (最新の updated_at 優先)
+        """
+        if not _REQUESTS_AVAILABLE:
+            return None
+        must: List[Dict[str, Any]] = [
+            {"term": {"user_id": user_id}},
+            {"term": {"default": True}},
+        ]
+        if gitlab_host:
+            must.append({"term": {"gitlab_host": gitlab_host}})
+        url = f"{OPENSEARCH_URL}/{OS_INDEX_GITLAB_ACCOUNTS}/_search"
+        body = {
+            "query": {"bool": {"must": must}},
+            "sort": [
+                {"updated_at": {"order": "desc",
+                                "unmapped_type": "date"}}
+            ],
+            "size": 1,
+        }
+        try:
+            resp = requests.post(
+                url,
+                json=body,
+                headers={"Content-Type": "application/json"},
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json() or {}
+            hits = data.get("hits", {}).get("hits", []) or []
+            if not hits:
+                return None
+            src = hits[0].get("_source", {})
+            return src if isinstance(src, dict) else None
+        except Exception as e:
+            logger.warning(
+                f"[GITLAB_ACCOUNT] _os_find_default {user_id} error: {e}"
+            )
+            return None
+
+
+    def _os_clear_default_flag(
+        user_id: str, keep_account_id: str,
+        gitlab_host: Optional[str] = None,
+    ) -> None:
+        """user_id (と gitlab_host) 範囲で default フラグを False にする。
+        keep_account_id は残す。"""
+        if not _REQUESTS_AVAILABLE:
+            return
+        must: List[Dict[str, Any]] = [
+            {"term": {"user_id": user_id}},
+            {"term": {"default": True}},
+        ]
+        if gitlab_host:
+            must.append({"term": {"gitlab_host": gitlab_host}})
+        must_not = [{"term": {"account_id": keep_account_id}}]
+        url = (
+            f"{OPENSEARCH_URL}/{OS_INDEX_GITLAB_ACCOUNTS}"
+            f"/_update_by_query?refresh=true"
+        )
+        body = {
+            "query": {
+                "bool": {"must": must, "must_not": must_not}
+            },
+            "script": {
+                "source": "ctx._source.default = false;",
+                "lang": "painless",
+            },
+        }
+        try:
+            resp = requests.post(
+                url,
+                json=body,
+                headers={"Content-Type": "application/json"},
+                timeout=10,
+            )
+            if resp.status_code >= 400:
+                logger.warning(
+                    f"[GITLAB_ACCOUNT] _os_clear_default_flag: "
+                    f"HTTP {resp.status_code}: {resp.text[:200]}"
+                )
+        except Exception as e:
+            logger.warning(
+                f"[GITLAB_ACCOUNT] _os_clear_default_flag error: {e}"
+            )
+
+
+    def _os_touch_last_used(user_id: str, account_id: str) -> None:
+        """last_used_at を現在時刻に更新する。 失敗は無視。"""
+        if not _REQUESTS_AVAILABLE:
+            return
+        doc_id = _os_doc_id(user_id, account_id)
+        url = f"{OPENSEARCH_URL}/{OS_INDEX_GITLAB_ACCOUNTS}/_update/{doc_id}"
+        body = {"doc": {"last_used_at": _now_iso()}}
+        try:
+            requests.post(
+                url,
+                json=body,
+                headers={"Content-Type": "application/json"},
+                timeout=5,
+            )
+        except Exception:
+            pass
+
+
+    # ==================================================================
+    # GitLab API による token 検証
+    # ==================================================================
+    def _verify_gitlab_token(
+        gitlab_host: str, token: str
+    ) -> Dict[str, Any]:
+        """GitLab API /api/v4/user を叩いて token を検証する。
+        成功時: {"ok": True, "login": "...", "user_id": int, "scopes": [...]}
+        失敗時: {"ok": False, "error": "..."}
+
+        GitLab の PAT は 'PRIVATE-TOKEN' header (慣習) または
+        'Authorization: Bearer' (OAuth token 互換) のどちらでも動く。
+        ここでは PRIVATE-TOKEN を使う。
+        """
+        if not _REQUESTS_AVAILABLE:
+            return {"ok": False, "error": "requests library not available"}
+        base = f"https://{gitlab_host}/api/v4"
+        try:
+            resp = requests.get(
+                f"{base}/user",
+                headers={
+                    "PRIVATE-TOKEN": token,
+                    "Accept": "application/json",
+                },
+                timeout=10,
+            )
+            if resp.status_code == 401:
+                return {
+                    "ok": False,
+                    "error": "token is invalid (401 Unauthorized)",
+                }
+            if resp.status_code == 403:
+                return {
+                    "ok": False,
+                    "error": "token is forbidden (403 Forbidden)",
+                }
+            if resp.status_code >= 400:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"GitLab API returned {resp.status_code}: "
+                        f"{resp.text[:200]}"
+                    ),
+                }
+            data = resp.json() or {}
+            login = data.get("username", "")
+            user_id_gl = data.get("id", 0)
+
+            # scopes を別 API から取得 (Personal Access Tokens API)
+            scopes: List[str] = []
+            try:
+                pat_resp = requests.get(
+                    f"{base}/personal_access_tokens/self",
+                    headers={
+                        "PRIVATE-TOKEN": token,
+                        "Accept": "application/json",
+                    },
+                    timeout=5,
+                )
+                if pat_resp.status_code == 200:
+                    pat = pat_resp.json() or {}
+                    scopes = list(pat.get("scopes", []) or [])
+            except Exception:
+                pass
+
+            return {
+                "ok": True,
+                "login": login,
+                "user_id": user_id_gl,
+                "scopes": scopes,
+            }
+        except Exception as e:
+            return {"ok": False, "error": f"verification error: {e}"}
+
+
+    # ==================================================================
+    # token 解決 (kernel 内部 API)
+    # ==================================================================
+    def resolve_gitlab_token(
+        user_id: Optional[str] = None,
+        gitlab_host: Optional[str] = None,
+        owner: Optional[str] = None,
+    ) -> Dict[str, str]:
+        """user_id (と gitlab_host、 owner) に紐づく GitLab token を返す。
+
+        解決順:
+          1. user_id 指定あり + secretary_gitlab_accounts に default=True
+             アカウントあり
+             1a. gitlab_host も指定あり → (user_id, host, default=True)
+             1b. gitlab_host 指定なし → (user_id, default=True) 最新
+             → そのユーザー token
+          2. gitlab_host + owner 指定あり + git_credentials 保管庫に
+             org:gitlab:{host}:{owner} があれば → その組織 token
+          3. os.environ["GITLAB_TOKEN"] + ["GITLAB_HOST"] フォールバック
+             (漸進的移行のため許可、 警告付き)
+          4. どれも無ければ RuntimeError
+
+        Args:
+            user_id: 秘書システムの利用者 ID (None / 空文字なら 1. をスキップ)
+            gitlab_host: GitLab hostname
+                        (例: "gitlab.example.com"、 None 可)
+            owner:   GitLab 組織 (group) 名 (canonical form、
+                     None なら 2. をスキップ)
+
+        Returns:
+            {"token": <PAT>, "host": <hostname>,
+             "base_url": "https://{host}/api/v4"}
+
+        Raises:
+            RuntimeError: token が見つからない場合
+        """
+        # 1. ユーザー別 token を試す
+        if user_id:
+            acct = _os_find_default(user_id, gitlab_host)
+            if acct and acct.get("token") and acct.get("gitlab_host"):
+                _os_touch_last_used(
+                    user_id, acct.get("account_id", "")
+                )
+                host = acct["gitlab_host"]
+                return {
+                    "token": acct["token"],
+                    "host": host,
+                    "base_url": f"https://{host}/api/v4",
+                }
+
+        # 2. 組織スコープ token を試す (git_credentials 保管庫)
+        if gitlab_host and owner:
+            try:
+                from git_credentials import resolve_gitlab_token_for_org
+                org_token = resolve_gitlab_token_for_org(gitlab_host, owner)
+                if org_token:
+                    return {
+                        "token": org_token,
+                        "host": gitlab_host,
+                        "base_url": f"https://{gitlab_host}/api/v4",
+                    }
+            except Exception as _e:
+                logger.warning(
+                    f"[GITLAB_ACCOUNT] git_credentials lookup failed: {_e}"
+                )
+
+        # 3. システム共通 token フォールバック (漸進的移行のため
+        #    strict/bootstrap どちらでも許可、 警告付き)
+        env_token = os.environ.get("GITLAB_TOKEN")
+        env_host = os.environ.get("GITLAB_HOST")
+        if env_token and env_host:
+            logger.warning(
+                "[GITLAB_ACCOUNT] using env GITLAB_TOKEN/GITLAB_HOST "
+                "(migrate to git_credentials store); "
+                f"user_id={user_id!r} gitlab_host={gitlab_host!r} "
+                f"owner={owner!r}"
+            )
+            return {
+                "token": env_token,
+                "host": env_host,
+                "base_url": f"https://{env_host}/api/v4",
+            }
+
+        # 4. どれも無い
+        raise RuntimeError(
+            "GitLab token not available: "
+            "no user token, no org token in credentials store, "
+            "and no GITLAB_TOKEN/GITLAB_HOST environment"
+        )
+
+
+    # ==================================================================
+    # 内部ユーティリティ
+    # ==================================================================
+    def _mask_token(token: str) -> str:
+        """token を先頭 4 文字 + アスタリスク + 末尾 4 文字にマスクする。"""
+        if not token or len(token) < 12:
+            return "****"
+        return f"{token[:4]}{'*' * (len(token) - 8)}{token[-4:]}"
+
+
+    def _now_iso() -> str:
+        """現在時刻の ISO 8601 表現 (UTC)。"""
+        return datetime.now(timezone.utc).isoformat()
+
+
+    def _validate_account_id(account_id: str) -> None:
+        """account_id を validate する。 不正なら HTTPException 400。"""
+        if not account_id:
+            raise HTTPException(
+                status_code=400, detail="account_id is required"
+            )
+        if not _ACCOUNT_ID_RE.match(account_id):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "account_id must match "
+                    "[A-Za-z0-9_.-]{1,64}"
+                ),
+            )
+
+
+    def _validate_gitlab_host(gitlab_host: str) -> None:
+        """gitlab_host を validate する。 不正なら HTTPException 400。"""
+        if not gitlab_host:
+            raise HTTPException(
+                status_code=400, detail="gitlab_host is required"
+            )
+        if not _GITLAB_HOST_RE.match(gitlab_host):
+            raise HTTPException(
+                status_code=400,
+                detail="gitlab_host is not a valid hostname",
+            )
+
+
+    # ==================================================================
+    # Endpoints
+    # ==================================================================
+    @router.post("/add")
+    async def add_gitlab_account(request: dict) -> Dict[str, Any]:
+        """GitLab アカウントを新規登録する。
+
+        token を GitLab API /api/v4/user で検証してから保存する。
+        同一 (user_id, account_id) が既に存在する場合は 409。
+        既存アカウントが無ければ default=True で保存。
+        既存アカウントがある状態で default=True 指定なら他をすべて False
+        に更新 (同一 gitlab_host 範囲内)。
+
+        Body:
+          user_id (必須): 秘書利用者 ID
+          account_id (必須): アカウント一意 ID
+          gitlab_host (必須): GitLab hostname (例: gitlab.example.com)
+          token (必須): Personal Access Token
+          account_label (任意): 表示名 (省略時は account_id)
+          default (任意): デフォルトフラグ (bool)
+        """
+        user_id = (request.get("user_id") or "").strip()
+        account_id = (request.get("account_id") or "").strip()
+        gitlab_host = (request.get("gitlab_host") or "").strip().lower()
+        account_label = (
+            request.get("account_label") or ""
+        ).strip() or account_id
+        token = (request.get("token") or "").strip()
+        is_default = bool(request.get("default", False))
+
+        if not user_id:
+            raise HTTPException(
+                status_code=400, detail="user_id is required"
+            )
+        _validate_account_id(account_id)
+        _validate_gitlab_host(gitlab_host)
+        if not token:
+            raise HTTPException(
+                status_code=400, detail="token is required"
+            )
+
+        _ensure_index()
+
+        # 重複チェック
+        if _os_get(user_id, account_id) is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"account already exists: {user_id}:{account_id}"
+                ),
+            )
+
+        # token 検証
+        verify = _verify_gitlab_token(gitlab_host, token)
+        if not verify.get("ok"):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"token verification failed: "
+                    f"{verify.get('error')}"
+                ),
+            )
+
+        # 既存アカウントが無ければ強制的に default=True
+        existing = _os_search_by_user(user_id)
+        if not existing:
+            is_default = True
+
+        now = _now_iso()
+        doc = {
+            "user_id":        user_id,
+            "account_id":     account_id,
+            "account_label":  account_label,
+            "gitlab_host":    gitlab_host,
+            "token":          token,
+            "gitlab_login":   verify.get("login", ""),
+            "gitlab_user_id": int(verify.get("user_id", 0) or 0),
+            "scopes":         verify.get("scopes", []),
+            "default":        is_default,
+            "created_at":     now,
+            "updated_at":     now,
+            "last_used_at":   None,
+        }
+
+        if not _os_put(user_id, account_id, doc):
+            raise HTTPException(
+                status_code=500,
+                detail="failed to save account to OpenSearch",
+            )
+
+        # default=True なら同一 gitlab_host 範囲の他を False に
+        if is_default:
+            _os_clear_default_flag(user_id, account_id, gitlab_host)
+
+        return {
+            "ok": True,
+            "user_id": user_id,
+            "account_id": account_id,
+            "account_label": account_label,
+            "gitlab_host": gitlab_host,
+            "gitlab_login": verify.get("login", ""),
+            "gitlab_user_id": int(verify.get("user_id", 0) or 0),
+            "scopes": verify.get("scopes", []),
+            "default": is_default,
+            "created_at": now,
+        }
+
+
+    @router.get("/list")
+    async def list_gitlab_account(user_id: str) -> Dict[str, Any]:
+        """user_id に紐づくアカウント一覧を返す。 token はマスクされる。"""
+        if not user_id:
+            raise HTTPException(
+                status_code=400, detail="user_id is required"
+            )
+
+        _ensure_index()
+        rows = _os_search_by_user(user_id)
+        masked: List[Dict[str, Any]] = []
+        for r in rows:
+            m = dict(r)
+            m["token"] = _mask_token(r.get("token", ""))
+            masked.append(m)
+        return {"ok": True, "user_id": user_id, "accounts": masked}
+
+
+    @router.post("/update")
+    async def update_gitlab_account(request: dict) -> Dict[str, Any]:
+        """アカウントを部分更新する。
+
+        Body:
+          user_id (必須)
+          account_id (必須)
+          account_label (任意)
+          gitlab_host (任意): 変更時は token を再検証する
+          token (任意): 変更時は再検証する
+          default (任意): True 指定なら他を False に更新
+        """
+        user_id = (request.get("user_id") or "").strip()
+        account_id = (request.get("account_id") or "").strip()
+
+        if not user_id:
+            raise HTTPException(
+                status_code=400, detail="user_id is required"
+            )
+        _validate_account_id(account_id)
+
+        _ensure_index()
+        cur = _os_get(user_id, account_id)
+        if cur is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"account not found: {user_id}:{account_id}",
+            )
+
+        new_label = request.get("account_label")
+        new_host = request.get("gitlab_host")
+        new_token = request.get("token")
+        new_default = request.get("default")
+
+        updated = dict(cur)
+
+        if new_label is not None:
+            nl = str(new_label).strip()
+            if nl:
+                updated["account_label"] = nl
+
+        need_verify = False
+        if new_host is not None:
+            nh = str(new_host).strip().lower()
+            _validate_gitlab_host(nh)
+            if nh != updated.get("gitlab_host"):
+                updated["gitlab_host"] = nh
+                need_verify = True
+
+        if new_token is not None:
+            nt = str(new_token).strip()
+            if not nt:
+                raise HTTPException(
+                    status_code=400,
+                    detail="token cannot be empty",
+                )
+            if nt != updated.get("token"):
+                updated["token"] = nt
+                need_verify = True
+
+        if need_verify:
+            verify = _verify_gitlab_token(
+                updated["gitlab_host"], updated["token"]
+            )
+            if not verify.get("ok"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"token verification failed: "
+                        f"{verify.get('error')}"
+                    ),
+                )
+            updated["gitlab_login"] = verify.get("login", "")
+            updated["gitlab_user_id"] = int(
+                verify.get("user_id", 0) or 0
+            )
+            updated["scopes"] = verify.get("scopes", [])
+
+        made_default = False
+        if new_default is not None:
+            nd = bool(new_default)
+            if nd != updated.get("default"):
+                updated["default"] = nd
+                made_default = nd
+
+        updated["updated_at"] = _now_iso()
+
+        if not _os_put(user_id, account_id, updated):
+            raise HTTPException(
+                status_code=500,
+                detail="failed to update account in OpenSearch",
+            )
+
+        if made_default:
+            _os_clear_default_flag(
+                user_id, account_id, updated.get("gitlab_host")
+            )
+
+        result = dict(updated)
+        result["token"] = _mask_token(updated.get("token", ""))
+        return {"ok": True, **result}
+
+
+    @router.post("/delete")
+    async def delete_gitlab_account(request: dict) -> Dict[str, Any]:
+        """アカウントを削除する。 default アカウントを削除した場合は
+        同一 (user_id, gitlab_host) 範囲の残った 1 件を default にする。"""
+        user_id = (request.get("user_id") or "").strip()
+        account_id = (request.get("account_id") or "").strip()
+
+        if not user_id:
+            raise HTTPException(
+                status_code=400, detail="user_id is required"
+            )
+        _validate_account_id(account_id)
+
+        _ensure_index()
+        cur = _os_get(user_id, account_id)
+        if cur is None:
+            return {
+                "ok": True,
+                "already_deleted": True,
+                "user_id": user_id,
+                "account_id": account_id,
+            }
+
+        was_default = bool(cur.get("default", False))
+        gitlab_host = cur.get("gitlab_host")
+
+        if not _os_delete(user_id, account_id):
+            raise HTTPException(
+                status_code=500,
+                detail="failed to delete account from OpenSearch",
+            )
+
+        # default だった場合、 同一 gitlab_host 範囲の残った 1 件を
+        # default にする
+        promoted_account_id: Optional[str] = None
+        if was_default and gitlab_host:
+            remaining = _os_search_by_user(user_id)
+            same_host = [
+                r for r in remaining
+                if r.get("gitlab_host") == gitlab_host
+            ]
+            if same_host:
+                promoted = same_host[0]  # updated_at 降順で最新
+                promoted_id = promoted.get("account_id", "")
+                if promoted_id:
+                    promoted_doc = dict(promoted)
+                    promoted_doc["default"] = True
+                    promoted_doc["updated_at"] = _now_iso()
+                    if _os_put(user_id, promoted_id, promoted_doc):
+                        promoted_account_id = promoted_id
+
+        return {
+            "ok": True,
+            "user_id": user_id,
+            "account_id": account_id,
+            "was_default": was_default,
+            "gitlab_host": gitlab_host,
+            "promoted_default_account_id": promoted_account_id,
+        }
+
+
+    @router.get("/health")
+    async def health() -> Dict[str, Any]:
+        """gitlab_account モジュールの health check。"""
+        available = {
+            "requests": _REQUESTS_AVAILABLE,
+            "opensearch_url": OPENSEARCH_URL,
+            "index": OS_INDEX_GITLAB_ACCOUNTS,
+        }
+        opensearch_ok = False
+        if _REQUESTS_AVAILABLE:
+            try:
+                resp = requests.head(OPENSEARCH_URL, timeout=3)
+                opensearch_ok = resp.status_code < 500
+            except Exception:
+                opensearch_ok = False
+        return {
+            "ok": True,
+            "module": "gitlab_account",
+            "opensearch_reachable": opensearch_ok,
+            "config": available,
+        }
