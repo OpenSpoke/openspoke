@@ -1,0 +1,403 @@
+---
+# Binary-scanner runner.
+#
+# For each enabled app in mobile-scan-targets this runner asks a
+# native spoke (nsmt) to run the platform scanner
+# (mobile-binary-scan-ios-script / -android-script) against the
+# matching already-built artefact on the spoke, then POSTs the
+# result to the kernel at /core/security/events.
+#
+# Path to the spoke: the tunnel-server's internal listener, using a
+# JSON-RPC 2.0 tools/call for nsm_sh_exec. The kernel and central
+# MCP server are not on this path, and no Kubernetes Secret is used.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mobile-binary-scan-runner
+  namespace: security-mobile
+  labels:
+    purpose: mobile-vulnerability-scan
+data:
+  binary_scan_runner.py: |
+    #!/usr/bin/env python3
+    """Mobile-app binary-scanner runner.
+
+    Runs as a K8s CronJob inside the security-mobile Fleet module.
+    Statically inspects already-built .app / .apk artefacts on a
+    native spoke (nsmt) and POSTs the results to the kernel at
+    /core/security/events.
+
+    Path:
+      K8s Pod
+        → tunnel-server.mcp.svc.cluster.local:<spoke port>/mcp
+          (JSON-RPC 2.0 tools/call nsm_sh_exec)
+        → nsmt (in --hub mode)
+        → zsh
+      nsmt does not require a Bearer on requests that come through
+      the tunnel; the kernel and central MCP server are not on the
+      path.
+
+    Per app (one nsm_sh_exec call):
+      1. Write the ConfigMap's scanner (base64-encoded) into
+         SCANNER_DIR on the spoke. The ConfigMap is the source of
+         truth; the copy on the spoke is overwritten every run.
+      2. Match built artefacts by bundle_id (iOS) or applicationId
+         (Android) and pick the one with the newest mtime.
+         - iOS: exact match on the .app's Info.plist
+           CFBundleIdentifier (skip stubs under Index.noindex).
+         - Android: `aapt2 dump packagename` equals package_name, or
+           starts with package_name + "." (to accommodate
+           applicationIdSuffix, e.g. com.example.app.debug).
+      3. Run the scanner and return the JSON printed to stdout.
+      Apps with no matching artefact are skipped (not counted as
+      failures).
+
+    Environment variables:
+      KERNEL_URL            : kernel Service URL
+      NSMT_MCP_URL          : nsmt's MCP endpoint (via tunnel-server)
+      TARGETS_CONFIG_PATH   : targets.yaml
+      IOS_SCANNER_PATH      : mobile_binary_scan_ios.py (ConfigMap)
+      ANDROID_SCANNER_PATH  : mobile_binary_scan_android.py (ConfigMap)
+      SCANNER_DIR           : where the scanner is written on the
+                              spoke (default: $HOME/nsm-work/auto)
+      IOS_SEARCH_ROOTS      : ':'-separated search roots on the spoke for .app
+      ANDROID_SEARCH_ROOTS  : ':'-separated search roots on the spoke for .apk
+      DRY_RUN               : "true" skips the POST.
+
+    Exit codes:
+      0 = configuration loaded (per-app failures and skips are only
+          logged).
+      2 = fatal failure (no config, or the spoke is unreachable).
+    Because each run emits events, the CronJob sets backoffLimit: 0.
+    """
+    import base64
+    import json
+    import os
+    import shlex
+    import sys
+    import time
+    import urllib.error
+    import urllib.request
+    import uuid
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    import yaml  # PyYAML
+
+    KERNEL_URL = os.environ.get(
+        "KERNEL_URL", "http://rag-backend-kernel.rag-company1.svc.cluster.local:8000")
+    NSMT_MCP_URL = os.environ.get(
+        "NSMT_MCP_URL", "http://tunnel-server.mcp.svc.cluster.local:10008/mcp")
+    TARGETS_CONFIG_PATH = os.environ.get("TARGETS_CONFIG_PATH", "/config/targets.yaml")
+    IOS_SCANNER_PATH = os.environ.get(
+        "IOS_SCANNER_PATH", "/scanners/ios/mobile_binary_scan_ios.py")
+    ANDROID_SCANNER_PATH = os.environ.get(
+        "ANDROID_SCANNER_PATH", "/scanners/android/mobile_binary_scan_android.py")
+    SCANNER_DIR = os.environ.get("SCANNER_DIR", "$HOME/nsm-work/auto")
+    IOS_SEARCH_ROOTS = os.environ.get(
+        "IOS_SEARCH_ROOTS",
+        "$HOME/Library/Application Support/NativeSpokeMacTool/work/ios-dd"
+        ":$HOME/Library/Developer/Xcode/DerivedData")
+    ANDROID_SEARCH_ROOTS = os.environ.get(
+        "ANDROID_SEARCH_ROOTS",
+        "$HOME/Documents:$HOME/Library/Application Support/NativeSpokeMacTool/work")
+    DRY_RUN = os.environ.get("DRY_RUN", "").lower() == "true"
+
+    BEGIN = "@@SCAN_JSON_BEGIN@@"
+    END = "@@SCAN_JSON_END@@"
+
+
+    def nsm_sh_exec(script: str, timeout_sec: int = 45) -> dict:
+        """Call nsmt's nsm_sh_exec and return {exit_code, stdout, stderr, ...}.
+        Raise RuntimeError on transport failure."""
+        body = {
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "nsm_sh_exec",
+                       "arguments": {"script": script, "timeout_sec": timeout_sec}},
+        }
+        req = urllib.request.Request(
+            NSMT_MCP_URL, data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json",
+                     "Accept": "application/json, text/event-stream"},
+            method="POST")
+        with urllib.request.urlopen(req, timeout=timeout_sec + 20) as r:
+            res = json.loads(r.read())
+        if "error" in res:
+            raise RuntimeError(f"nsmt error: {res['error']}")
+        content = res.get("result", {}).get("content", [])
+        text = "".join(c.get("text", "") for c in content if c.get("type") == "text")
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            raise RuntimeError(f"nsm_sh_exec response is not JSON: {text[:300]}")
+
+
+    def _roots_expr(roots: str) -> str:
+        """Convert ':'-separated search roots into a zsh list literal (letting $HOME expand)."""
+        parts = [p for p in roots.split(":") if p]
+        return " ".join('"' + p.replace('"', '\\"') + '"' for p in parts)
+
+
+    def build_script(app: dict, scanner_b64: str, scanner_name: str, scan_id: str) -> str:
+        platform = app["platform"]
+        ident = app.get("bundle_id") if platform == "ios" else app.get("package_name")
+        q_ident = shlex.quote(ident)
+        q_scan_id = shlex.quote(scan_id)
+        head = f'''set -u
+    SD="{SCANNER_DIR}"
+    mkdir -p "$SD"
+    echo {shlex.quote(scanner_b64)} | base64 -D > "$SD/{scanner_name}.tmp" && mv "$SD/{scanner_name}.tmp" "$SD/{scanner_name}"
+    IDENT={q_ident}
+    BEST=""; BEST_T=0
+    '''
+        if platform == "ios":
+            find_part = f'''for R in {_roots_expr(IOS_SEARCH_ROOTS)}; do
+      [ -d "$R" ] || continue
+      while IFS= read -r A; do
+        case "$A" in *Index.noindex*|*/PlugIns/*) continue;; esac
+        [ -f "$A/Info.plist" ] || continue
+        B=$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$A/Info.plist" 2>/dev/null)
+        [ "$B" = "$IDENT" ] || continue
+        T=$(stat -f %m "$A")
+        if [ "$T" -gt "$BEST_T" ]; then BEST="$A"; BEST_T=$T; fi
+      done < <(find "$R" -maxdepth 6 -type d -name '*.app' -path '*Build/Products*' 2>/dev/null)
+    done
+    [ -n "$BEST" ] || {{ echo "NO_ARTIFACT"; exit 0; }}
+    echo "ARTIFACT $BEST_T $BEST"
+    echo "{BEGIN}"
+    python3 "$SD/{scanner_name}" --app "$BEST" --bundle-id "$IDENT" --scan-id {q_scan_id}
+    RC=$?
+    echo "{END}"
+    exit $RC
+    '''
+        else:
+            find_part = f'''BT=$(ls -d "$HOME"/Library/Android/sdk/build-tools/* 2>/dev/null | sort -r | head -1)
+    [ -x "$BT/aapt2" ] || {{ echo "NO_AAPT2"; exit 3; }}
+    for R in {_roots_expr(ANDROID_SEARCH_ROOTS)}; do
+      [ -d "$R" ] || continue
+      while IFS= read -r A; do
+        P=$("$BT/aapt2" dump packagename "$A" 2>/dev/null)
+        case "$P" in "$IDENT"|"$IDENT".*) ;; *) continue;; esac
+        T=$(stat -f %m "$A")
+        if [ "$T" -gt "$BEST_T" ]; then BEST="$A"; BEST_T=$T; fi
+      done < <(find "$R" -maxdepth 9 -type f -name '*.apk' -path '*build/outputs/apk*' 2>/dev/null)
+    done
+    [ -n "$BEST" ] || {{ echo "NO_ARTIFACT"; exit 0; }}
+    echo "ARTIFACT $BEST_T $BEST"
+    echo "{BEGIN}"
+    python3 "$SD/{scanner_name}" --apk "$BEST" --package-name "$IDENT" --scan-id {q_scan_id}
+    RC=$?
+    echo "{END}"
+    exit $RC
+    '''
+        return head + find_part
+
+
+    def post_event(mobile_detected: dict, module_id) -> str | None:
+        if module_id:
+            mobile_detected = dict(mobile_detected)
+            mobile_detected["module_id"] = module_id
+        body = {"event_type": "detected", "target_type": "mobile_app",
+                "cluster": "rag", "mobile_detected": mobile_detected}
+        req = urllib.request.Request(
+            f"{KERNEL_URL}/core/security/events", data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.loads(r.read())["event_id"]
+        except urllib.error.HTTPError as e:
+            print(f"[error] kernel POST {e.code}: {e.read().decode()[:200]}", file=sys.stderr)
+        except Exception as e:
+            print(f"[error] kernel POST: {e}", file=sys.stderr)
+        return None
+
+
+    # Detail findings are stored separately from the events. Events
+    # go to the kernel's vuln_events index; mobile-scan detail
+    # findings go to vuln_findings_mobile. As with the container
+    # scanner, this runner writes to OpenSearch directly without
+    # going through the kernel.
+    OPENSEARCH_URL = os.environ.get(
+        "OPENSEARCH_URL", "http://opensearch.opensearch.svc.cluster.local:9200")
+    FINDINGS_INDEX = "vuln_findings_mobile"
+    _FINDINGS_MAPPING = {"mappings": {"properties": {
+        "event_id": {"type": "keyword"}, "scan_id": {"type": "keyword"},
+        "scan_kind": {"type": "keyword"}, "module_id": {"type": "keyword"},
+        "app_name": {"type": "keyword"}, "platform": {"type": "keyword"},
+        "bundle_id": {"type": "keyword"}, "package_name": {"type": "keyword"},
+        "app_version": {"type": "keyword"}, "artifact_path": {"type": "keyword"},
+        "finding_type": {"type": "keyword"}, "severity": {"type": "keyword"},
+        "severity_rank": {"type": "integer"},
+        "file": {"type": "keyword"}, "line": {"type": "integer"},
+        "snippet": {"type": "text"}, "description": {"type": "text"},
+        "timestamp": {"type": "date"},
+    }}}
+    _SEV_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+    _findings_index_ready = False
+
+
+    def _os_call(method: str, path: str, body=None, ndjson=None) -> dict:
+        if ndjson is not None:
+            data, ctype = ndjson.encode(), "application/x-ndjson"
+        else:
+            data = json.dumps(body).encode() if body is not None else None
+            ctype = "application/json"
+        req = urllib.request.Request(f"{OPENSEARCH_URL}{path}", data=data, method=method,
+                                     headers={"Content-Type": ctype})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            raw = r.read()
+        return json.loads(raw) if raw else {}
+
+
+    def _ensure_findings_index() -> None:
+        global _findings_index_ready
+        if _findings_index_ready:
+            return
+        try:
+            _os_call("HEAD", f"/{FINDINGS_INDEX}")
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise
+            try:
+                _os_call("PUT", f"/{FINDINGS_INDEX}", _FINDINGS_MAPPING)
+            except urllib.error.HTTPError as e2:
+                if e2.code != 400:  # 400 = index created concurrently (resource_already_exists)
+                    raise
+        _findings_index_ready = True
+
+
+    def index_findings(findings: list, event_id: str, module_id, md: dict,
+                       app_name: str, scan_kind: str) -> int:
+        """Store the detail findings as one document per finding, with
+        _id = event_id-<index> so a re-run does not duplicate them. If
+        this fails the event is already registered, so log a warning
+        and continue."""
+        if not findings:
+            return 0
+        try:
+            _ensure_findings_index()
+            ts = datetime.now(timezone.utc).isoformat()
+            common = {
+                "event_id": event_id, "scan_id": md.get("scan_id"), "scan_kind": scan_kind,
+                "module_id": module_id, "app_name": app_name, "platform": md.get("platform"),
+                "bundle_id": md.get("bundle_id"), "package_name": md.get("package_name"),
+                "app_version": md.get("app_version"), "artifact_path": md.get("artifact_path"),
+                "timestamp": ts,
+            }
+            lines = []
+            for i, f in enumerate(findings):
+                sev = f.get("severity") or "info"
+                doc = dict(common)
+                doc.update({
+                    "finding_type": f.get("finding_type"), "severity": sev,
+                    "severity_rank": _SEV_RANK.get(sev, 5),
+                    "file": f.get("file"), "line": int(f.get("line") or 0),
+                    "snippet": str(f.get("snippet") or "")[:1000],
+                    "description": str(f.get("description") or "")[:1000],
+                })
+                lines.append(json.dumps({"index": {"_index": FINDINGS_INDEX,
+                                                   "_id": f"{event_id}-{i:04d}"}}))
+                lines.append(json.dumps(doc, ensure_ascii=False))
+            res = _os_call("POST", "/_bulk?refresh=true", ndjson="\n".join(lines) + "\n")
+            if res.get("errors"):
+                bad = [it for it in res.get("items", []) if it.get("index", {}).get("error")]
+                print(f"[warn] some detail findings failed to store ({event_id}): "
+                      f"{len(bad)} item(s), sample {str(bad[:1])[:300]}", file=sys.stderr)
+                return len(findings) - len(bad)
+            return len(findings)
+        except Exception as e:
+            print(f"[warn] failed to store detail findings ({event_id}): {type(e).__name__}: {e}", file=sys.stderr)
+            return 0
+
+
+    def main():
+        for p in (TARGETS_CONFIG_PATH, IOS_SCANNER_PATH, ANDROID_SCANNER_PATH):
+            if not Path(p).exists():
+                print(f"[fatal] missing: {p}", file=sys.stderr)
+                sys.exit(2)
+        with open(TARGETS_CONFIG_PATH) as f:
+            config = yaml.safe_load(f)
+        scanners = {
+            "ios": ("mobile_binary_scan_ios.py",
+                    base64.b64encode(Path(IOS_SCANNER_PATH).read_bytes()).decode()),
+            "android": ("mobile_binary_scan_android.py",
+                        base64.b64encode(Path(ANDROID_SCANNER_PATH).read_bytes()).decode()),
+        }
+
+        # Reachability check; fatal if we can't reach the spoke.
+        try:
+            r = nsm_sh_exec("hostname", 15)
+            print(f"[info] nsmt reachable: {r.get('stdout', '').strip()} via {NSMT_MCP_URL}", flush=True)
+        except Exception as e:
+            print(f"[fatal] cannot reach nsmt ({NSMT_MCP_URL}): {e}", file=sys.stderr)
+            sys.exit(2)
+
+        modules = [m for m in config.get("modules", []) if m.get("enabled")]
+        print(f"[info] {len(modules)} module(s) enabled, dry_run={DRY_RUN}", flush=True)
+        ok = skip = fail = 0
+        for module in modules:
+            module_id = module.get("module_id")
+            print(f"[info] module={module_id}", flush=True)
+            for app in module.get("apps", []):
+                name = app.get("name", "?")
+                platform = app.get("platform")
+                if app.get("binary") is False:
+                    print(f"[skip]   {name}: binary: false", flush=True)
+                    skip += 1
+                    continue
+                ident = app.get("bundle_id") if platform == "ios" else app.get("package_name")
+                if platform not in scanners or not ident:
+                    print(f"[error]  {name}: missing platform or identifier", file=sys.stderr)
+                    fail += 1
+                    continue
+                scan_id = f"{name.replace(' ', '')}-{platform}-binary-{int(time.time())}-{uuid.uuid4().hex[:6]}"
+                sc_name, sc_b64 = scanners[platform]
+                try:
+                    res = nsm_sh_exec(build_script(app, sc_b64, sc_name, scan_id), 45)
+                except Exception as e:
+                    print(f"[error]  {name}: nsm_sh_exec {type(e).__name__}: {e}", file=sys.stderr)
+                    fail += 1
+                    continue
+                out = res.get("stdout", "")
+                if res.get("timed_out"):
+                    print(f"[error]  {name}: timed out on the spoke", file=sys.stderr)
+                    fail += 1
+                    continue
+                if "NO_ARTIFACT" in out:
+                    print(f"[skip]   {name}: no built artefact for {ident} on the spoke", flush=True)
+                    skip += 1
+                    continue
+                if BEGIN not in out or END not in out or res.get("exit_code") != 0:
+                    print(f"[error]  {name}: exit={res.get('exit_code')} "
+                          f"stdout={out[-300:]} stderr={res.get('stderr', '')[-300:]}", file=sys.stderr)
+                    fail += 1
+                    continue
+                artifact = next((l for l in out.splitlines() if l.startswith("ARTIFACT ")), "")
+                try:
+                    result = json.loads(out.split(BEGIN, 1)[1].split(END, 1)[0])
+                except json.JSONDecodeError as e:
+                    print(f"[error]  {name}: JSON decode {e}", file=sys.stderr)
+                    fail += 1
+                    continue
+                md = result["mobile_detected"]
+                sev = md.get("severity_counts", {})
+                print(f"[info]   {name}: {artifact}", flush=True)
+                if DRY_RUN:
+                    print(f"[dry-run] {name}: total={result.get('total_findings')} severity={sev}", flush=True)
+                    ok += 1
+                    continue
+                event_id = post_event(md, module_id)
+                if event_id is None:
+                    fail += 1
+                    continue
+                n_saved = index_findings(result.get("detail_findings") or [], event_id,
+                                         module_id, md, name, "binary")
+                print(f"[info]   stored {n_saved} finding(s) in {FINDINGS_INDEX}", flush=True)
+                print(f"[ok]     {name}: total={result.get('total_findings')} severity={sev} event_id={event_id}", flush=True)
+                ok += 1
+        print(f"[summary] ok={ok} skip={skip} fail={fail}", flush=True)
+        sys.exit(0)
+
+
+    if __name__ == "__main__":
+        main()
