@@ -1,0 +1,775 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-backend-kernel-git-mirror
+  namespace: rag-company1
+data:
+  git_mirror.py: |
+    """
+    git_mirror.py
+    ====================================================================
+    Git protocol pack transfer service (git clone --mirror + git push --mirror).
+
+    OpenSpoke 環境内から、 ある git リポジトリ (GitHub / GitLab、
+    パブリック or 保管庫にトークン登録済み) の全ての ref を丸ごと
+    別リポジトリにコピーする。 プロトコル動作は git 本体 (subprocess)
+    に委譲し、 kernel は job キュー・進捗記録・キャンセルを担う。
+
+    設計:
+      - 非同期実行 (threading.Thread、 securitysheet_answer_jobs と同じ流儀)
+      - job 状態は OpenSearch `git_mirror_jobs` index に保存
+      - dest 側 PAT は git_credentials 保管庫から解決
+        (org スコープを想定、 provider=github の scope_id は owner、
+         gitlab の scope_id は "{host}:{owner}")
+      - source が dest と同じ host+owner のときだけ dest PAT を流用
+        (それ以外はパブリックとして扱う)
+      - refs/pull/* は既定で strip (GitHub 特有の read-only ref、
+        push 先で拒否される)
+
+    エンドポイント (prefix=/core/git_mirror):
+      - GET  /health
+      - POST /jobs                  ジョブ作成 (即返る、 job_id を返す)
+      - GET  /jobs                  一覧
+      - GET  /jobs/{job_id}         詳細
+      - POST /jobs/{job_id}/cancel  キャンセル要求
+
+    実行環境の必要条件:
+      - image に `git` が含まれること (v0.1.3 以降)
+      - /tmp が書き込み可能で数百 MB の作業領域があること
+
+    参照: knowledge base の topic `git_mirror_tool_20260915`
+    """
+    from __future__ import annotations
+
+    import logging
+    import os
+    import shutil
+    import subprocess
+    import tempfile
+    import threading
+    import uuid
+    from datetime import datetime, timezone
+    from typing import Any, Dict, List, Optional
+    from urllib.parse import quote as _urlquote, urlsplit
+
+    from fastapi import APIRouter, HTTPException, Request
+    from pydantic import BaseModel
+
+    logger = logging.getLogger(__name__)
+
+    # ── requests (遅延 import、 git_credentials と同じ流儀) ──
+    try:
+        import requests
+        _REQUESTS_AVAILABLE = True
+    except ImportError as _e:
+        logger.warning(f"[GIT_MIRROR] requests not available: {_e}")
+        _REQUESTS_AVAILABLE = False
+        requests = None
+
+
+    # ── 設定 ──
+    OPENSEARCH_URL = os.environ.get(
+        "OPENSEARCH_URL",
+        "http://opensearch.opensearch.svc.cluster.local:9200",
+    )
+    IDX_JOBS = os.environ.get("GIT_MIRROR_IDX_JOBS", "git_mirror_jobs")
+
+    # 作業ディレクトリ (Pod 内の /tmp)
+    WORK_ROOT = os.environ.get("GIT_MIRROR_WORK_ROOT", "/tmp/git-mirror")
+
+    # git subprocess のタイムアウト (秒)
+    GIT_TIMEOUT_SECONDS = int(os.environ.get("GIT_MIRROR_TIMEOUT_SECONDS", "1800"))
+
+    # ジョブ保持数の上限 (list の max)
+    _LIST_LIMIT_DEFAULT = 20
+    _LIST_LIMIT_MAX = 100
+
+    _VALID_PROVIDERS = ("github", "gitlab")
+    _ADMIN_ROLE = "role:openspoke_admin"
+
+    # ── in-memory (cancel フラグとログ蓄積) ──
+    _ACTIVE_JOBS: Dict[str, Dict[str, Any]] = {}
+    _ACTIVE_JOBS_LOCK = threading.Lock()
+
+
+    # ====================================================================
+    # 補助
+    # ====================================================================
+
+    def _now_iso() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+
+    def _job_id_new() -> str:
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        return f"gm-{ts}-{uuid.uuid4().hex[:8]}"
+
+
+    def _extract_login_identity(request: Request) -> Dict[str, str]:
+        """oauth2-proxy が入れるヘッダから login 情報を抜き出す。"""
+        try:
+            headers = {k.lower(): v for k, v in request.headers.items()}
+        except Exception:
+            return {"user": "", "email": "", "groups": ""}
+        return {
+            "user":   headers.get("x-forwarded-preferred-username")
+                       or headers.get("x-forwarded-user")
+                       or headers.get("x-auth-request-user")
+                       or "",
+            "email":  headers.get("x-forwarded-email")
+                       or headers.get("x-auth-request-email")
+                       or "",
+            "groups": headers.get("x-forwarded-groups") or "",
+        }
+
+
+    def _mask_url(url: str) -> str:
+        """log 出力用に URL の auth 部分をマスクする。"""
+        try:
+            p = urlsplit(url)
+            if not (p.username or p.password):
+                return url
+            return f"{p.scheme}://***:***@{p.hostname}{p.path}"
+        except Exception:
+            return url
+
+
+    def _auth_url(url: str, token: Optional[str], provider: str) -> str:
+        """PAT を URL に埋め込む。 github: x-access-token, gitlab: oauth2。"""
+        if not token:
+            return url
+        user = "x-access-token" if provider == "github" else "oauth2"
+        p = urlsplit(url)
+        # 末尾 (query 等) は _mirror では使わない想定
+        return f"{p.scheme}://{user}:{_urlquote(token, safe='')}@{p.netloc}{p.path}"
+
+
+    def _source_uses_dest_pat(source_url: str, dest_host: str,
+                              dest_owner: str) -> bool:
+        """source が dest と同じ host+owner なら dest PAT を再利用してよい。"""
+        try:
+            p = urlsplit(source_url)
+            if (p.hostname or "").lower() != (dest_host or "").lower():
+                return False
+            parts = p.path.strip("/").split("/")
+            if not parts or not parts[0]:
+                return False
+            return parts[0].lower() == (dest_owner or "").lower()
+        except Exception:
+            return False
+
+
+    def _run(cmd: List[str], cwd: Optional[str] = None,
+             env: Optional[Dict[str, str]] = None,
+             timeout: int = GIT_TIMEOUT_SECONDS
+             ) -> subprocess.CompletedProcess:
+        e = os.environ.copy()
+        e["GIT_TERMINAL_PROMPT"] = "0"
+        if env:
+            e.update(env)
+        return subprocess.run(
+            cmd, cwd=cwd, env=e,
+            capture_output=True, text=True,
+            timeout=timeout, check=False,
+        )
+
+
+    # ====================================================================
+    # OpenSearch helper (git_credentials と同じ流儀、 auth 無し)
+    # ====================================================================
+
+    def _ensure_index() -> None:
+        """index が無ければ作成する (idempotent)。"""
+        if not _REQUESTS_AVAILABLE:
+            return
+        try:
+            resp = requests.head(f"{OPENSEARCH_URL}/{IDX_JOBS}", timeout=3)
+            if resp.status_code == 200:
+                return
+        except Exception as e:
+            logger.warning(f"[GIT_MIRROR] index HEAD failed: {e}")
+            return
+
+        mapping = {
+            "settings": {
+                "number_of_shards": 1,
+                "number_of_replicas": 0,
+            },
+            "mappings": {
+                "properties": {
+                    "job_id":            {"type": "keyword"},
+                    "state":             {"type": "keyword"},
+                    "source_url":        {"type": "keyword"},
+                    "dest_provider":     {"type": "keyword"},
+                    "dest_host":         {"type": "keyword"},
+                    "dest_owner":        {"type": "keyword"},
+                    "dest_repo":         {"type": "keyword"},
+                    "dest_url":          {"type": "keyword"},
+                    "private":           {"type": "boolean"},
+                    "description":       {"type": "text"},
+                    "exclude_pull_refs": {"type": "boolean"},
+                    "create_if_missing": {"type": "boolean"},
+                    "created_at":        {"type": "date"},
+                    "started_at":        {"type": "date"},
+                    "finished_at":       {"type": "date"},
+                    "requested_by":      {"type": "keyword"},
+                    "cancel_requested":  {"type": "boolean"},
+                    "progress":          {"type": "keyword"},
+                    "source_head":       {"type": "keyword"},
+                    "dest_head":         {"type": "keyword"},
+                    "size_mb":           {"type": "float"},
+                    "counters": {
+                        "properties": {
+                            "branches":      {"type": "integer"},
+                            "tags":          {"type": "integer"},
+                            "refs_total":    {"type": "integer"},
+                            "refs_stripped": {"type": "integer"},
+                        }
+                    },
+                    "error": {"type": "text"},
+                    "log":   {"type": "text"},
+                }
+            }
+        }
+        try:
+            resp = requests.put(
+                f"{OPENSEARCH_URL}/{IDX_JOBS}",
+                json=mapping, timeout=5,
+            )
+            if resp.status_code >= 400:
+                logger.warning(
+                    f"[GIT_MIRROR] index create failed: "
+                    f"{resp.status_code} {resp.text[:200]}"
+                )
+            else:
+                logger.info(f"[GIT_MIRROR] index created: {IDX_JOBS}")
+        except Exception as e:
+            logger.warning(f"[GIT_MIRROR] index create error: {e}")
+
+
+    def _os_put(doc_id: str, doc: Dict[str, Any]) -> None:
+        if not _REQUESTS_AVAILABLE:
+            return
+        try:
+            resp = requests.put(
+                f"{OPENSEARCH_URL}/{IDX_JOBS}/_doc/{_urlquote(doc_id, safe='')}"
+                f"?refresh=false",
+                json=doc, timeout=5,
+            )
+            if resp.status_code >= 400:
+                logger.warning(
+                    f"[GIT_MIRROR] _os_put failed: "
+                    f"{resp.status_code} {resp.text[:200]}"
+                )
+        except Exception as e:
+            logger.warning(f"[GIT_MIRROR] _os_put error: {e}")
+
+
+    def _os_patch(doc_id: str, patch: Dict[str, Any]) -> None:
+        if not _REQUESTS_AVAILABLE:
+            return
+        body = {"doc": patch, "doc_as_upsert": True}
+        try:
+            resp = requests.post(
+                f"{OPENSEARCH_URL}/{IDX_JOBS}/_update/"
+                f"{_urlquote(doc_id, safe='')}?refresh=false",
+                json=body, timeout=5,
+            )
+            if resp.status_code >= 400:
+                logger.warning(
+                    f"[GIT_MIRROR] _os_patch failed: "
+                    f"{resp.status_code} {resp.text[:200]}"
+                )
+        except Exception as e:
+            logger.warning(f"[GIT_MIRROR] _os_patch error: {e}")
+
+
+    def _os_get(doc_id: str) -> Optional[Dict[str, Any]]:
+        if not _REQUESTS_AVAILABLE:
+            return None
+        try:
+            resp = requests.get(
+                f"{OPENSEARCH_URL}/{IDX_JOBS}/_doc/"
+                f"{_urlquote(doc_id, safe='')}",
+                timeout=3,
+            )
+            if resp.status_code == 404:
+                return None
+            if resp.status_code >= 400:
+                return None
+            return resp.json().get("_source")
+        except Exception:
+            return None
+
+
+    def _os_list(limit: int) -> List[Dict[str, Any]]:
+        if not _REQUESTS_AVAILABLE:
+            return []
+        body = {
+            "query": {"match_all": {}},
+            "sort": [{"created_at": {"order": "desc"}}],
+            "size": limit,
+        }
+        try:
+            resp = requests.post(
+                f"{OPENSEARCH_URL}/{IDX_JOBS}/_search",
+                json=body, timeout=5,
+            )
+            if resp.status_code >= 400:
+                return []
+            hits = resp.json().get("hits", {}).get("hits", [])
+            return [h.get("_source", {}) for h in hits]
+        except Exception:
+            return []
+
+
+    # ====================================================================
+    # dest PAT 解決 (git_credentials から)
+    # ====================================================================
+
+    def _resolve_dest_token(provider: str, owner: str, host: str
+                            ) -> Optional[str]:
+        """保管庫の org スコープからトークンを引く。 provider=github の
+        scope_id は owner、 gitlab は "{host}:{owner}"。"""
+        scope_id = owner if provider == "github" else f"{host}:{owner}"
+        try:
+            from git_credentials import (
+                _os_get as _cred_os_get,
+                _doc_id as _cred_doc_id,
+            )
+        except Exception as e:
+            logger.warning(
+                f"[GIT_MIRROR] cannot import git_credentials helpers: {e}"
+            )
+            return None
+        try:
+            doc = _cred_os_get(_cred_doc_id("org", provider, scope_id))
+            if not doc:
+                return None
+            token = doc.get("token") or ""
+            return token or None
+        except Exception as e:
+            logger.warning(f"[GIT_MIRROR] token resolve failed: {e}")
+            return None
+
+
+    # ====================================================================
+    # dest リポジトリ確保 (GitHub のみ)
+    # ====================================================================
+
+    def _ensure_dest_repo_github(host: str, owner: str, repo: str,
+                                 private: bool, description: str,
+                                 token: str) -> None:
+        """dest リポが無ければ orgs 経由で作成する。 host=github.com 前提。"""
+        if not _REQUESTS_AVAILABLE:
+            raise RuntimeError("requests unavailable")
+        api = "https://api.github.com" if host == "github.com" \
+            else f"https://{host}/api/v3"
+        h = {
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github.v3+json",
+        }
+        # 存在確認
+        resp = requests.get(f"{api}/repos/{owner}/{repo}",
+                            headers=h, timeout=10)
+        if resp.status_code == 200:
+            return
+        if resp.status_code != 404:
+            raise RuntimeError(
+                f"repo probe failed: {resp.status_code} "
+                f"{resp.text[:200]}"
+            )
+        body: Dict[str, Any] = {
+            "name": repo,
+            "private": bool(private),
+            "auto_init": False,
+        }
+        if description:
+            body["description"] = description
+        # まず org リポとして作成、 だめなら user リポで再試行
+        resp = requests.post(f"{api}/orgs/{owner}/repos",
+                             headers=h, json=body, timeout=15)
+        if resp.status_code >= 400:
+            if resp.status_code == 404:
+                resp = requests.post(f"{api}/user/repos",
+                                     headers=h, json=body, timeout=15)
+            if resp.status_code >= 400:
+                raise RuntimeError(
+                    f"repo create failed: {resp.status_code} "
+                    f"{resp.text[:300]}"
+                )
+
+
+    # ====================================================================
+    # ワーカー本体 (background thread)
+    # ====================================================================
+
+    def _log_line(job_id: str, msg: str) -> None:
+        stamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        line = f"[{stamp}] {msg}"
+        logger.info(f"[GIT_MIRROR] {job_id}: {msg}")
+        with _ACTIVE_JOBS_LOCK:
+            entry = _ACTIVE_JOBS.get(job_id)
+            if entry is not None:
+                entry["log_lines"].append(line)
+
+
+    def _cancel_requested(job_id: str) -> bool:
+        with _ACTIVE_JOBS_LOCK:
+            entry = _ACTIVE_JOBS.get(job_id)
+            return bool(entry and entry.get("cancel"))
+
+
+    def _mirror_worker(job_id: str, payload: Dict[str, Any]) -> None:
+        source_url        = payload["source_url"]
+        dest_provider     = payload["dest_provider"]
+        dest_host         = payload["dest_host"]
+        dest_owner        = payload["dest_owner"]
+        dest_repo         = payload["dest_repo"]
+        exclude_pull_refs = bool(payload.get("exclude_pull_refs", True))
+        create_if_missing = bool(payload.get("create_if_missing", True))
+        private           = bool(payload.get("private", True))
+        description       = payload.get("description", "") or ""
+
+        work_dir: Optional[str] = None
+        try:
+            _os_patch(job_id, {
+                "state": "running",
+                "started_at": _now_iso(),
+                "progress": "resolving dest token",
+            })
+            _log_line(job_id, "resolving dest token from credentials store")
+
+            dest_token = _resolve_dest_token(
+                dest_provider, dest_owner, dest_host,
+            )
+            if not dest_token:
+                raise RuntimeError(
+                    f"dest token not found in credentials store: "
+                    f"org:{dest_provider}:{dest_owner}"
+                )
+
+            # source は同一 host+owner のみ dest PAT を流用、 それ以外は無認証
+            src_token: Optional[str] = None
+            if _source_uses_dest_pat(source_url, dest_host, dest_owner):
+                src_token = dest_token
+                _log_line(job_id, "source shares dest PAT (same host+owner)")
+            else:
+                _log_line(job_id, "source treated as public (no auth)")
+
+            # 作業ディレクトリ
+            os.makedirs(WORK_ROOT, exist_ok=True)
+            work_dir = tempfile.mkdtemp(prefix=f"{job_id}-", dir=WORK_ROOT)
+            clone_dir = os.path.join(work_dir, "repo.git")
+
+            # clone --mirror
+            if _cancel_requested(job_id):
+                raise RuntimeError("cancelled before clone")
+            _os_patch(job_id, {"progress": "cloning (--mirror)"})
+            src_auth = _auth_url(source_url, src_token, dest_provider)
+            _log_line(job_id, f"git clone --mirror {_mask_url(src_auth)}")
+            r = _run(["git", "clone", "--mirror", src_auth, clone_dir])
+            if r.returncode != 0:
+                raise RuntimeError(f"git clone failed: {r.stderr[-500:]}")
+
+            # ref カウント
+            r = _run(["git", "-C", clone_dir, "for-each-ref"], timeout=60)
+            refs_total = len(
+                [ln for ln in r.stdout.splitlines() if ln.strip()]
+            )
+            _log_line(job_id, f"cloned: {refs_total} refs")
+
+            # refs/pull/* を落とす
+            refs_stripped = 0
+            if exclude_pull_refs:
+                r = _run(
+                    ["git", "-C", clone_dir, "for-each-ref", "refs/pull/",
+                     "--format=delete %(refname)"],
+                    timeout=60,
+                )
+                delete_lines = [ln for ln in r.stdout.splitlines()
+                                if ln.strip()]
+                refs_stripped = len(delete_lines)
+                if refs_stripped > 0:
+                    _log_line(
+                        job_id,
+                        f"stripping {refs_stripped} refs/pull/* refs"
+                    )
+                    p = subprocess.Popen(
+                        ["git", "-C", clone_dir, "update-ref", "--stdin"],
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                    out, err = p.communicate(
+                        "\n".join(delete_lines) + "\n",
+                        timeout=60,
+                    )
+                    if p.returncode != 0:
+                        raise RuntimeError(
+                            f"strip refs/pull/* failed: {err[-500:]}"
+                        )
+
+            # source HEAD
+            r = _run(
+                ["git", "-C", clone_dir, "log", "-1", "--format=%H", "HEAD"],
+                timeout=30,
+            )
+            source_head = r.stdout.strip() if r.returncode == 0 else ""
+
+            # サイズ計測
+            r = _run(["du", "-sm", clone_dir], timeout=30)
+            try:
+                size_mb = float(r.stdout.split()[0])
+            except Exception:
+                size_mb = -1.0
+
+            _os_patch(job_id, {
+                "source_head": source_head,
+                "size_mb": size_mb,
+                "counters": {
+                    "refs_total": refs_total,
+                    "refs_stripped": refs_stripped,
+                },
+            })
+            _log_line(
+                job_id,
+                f"local size {size_mb} MB, source_head={source_head}"
+            )
+
+            # dest リポジトリの確保
+            if create_if_missing:
+                if _cancel_requested(job_id):
+                    raise RuntimeError("cancelled before repo ensure")
+                _os_patch(job_id, {"progress": "ensuring dest repo"})
+                if dest_provider == "github":
+                    _ensure_dest_repo_github(
+                        dest_host, dest_owner, dest_repo,
+                        private=private,
+                        description=description,
+                        token=dest_token,
+                    )
+                    _log_line(job_id, "dest repo ready")
+                else:
+                    _log_line(
+                        job_id,
+                        "gitlab: create_if_missing not supported yet, "
+                        "assuming exists"
+                    )
+
+            # push --mirror
+            if _cancel_requested(job_id):
+                raise RuntimeError("cancelled before push")
+            _os_patch(job_id, {"progress": "pushing (--mirror)"})
+            dest_url = (
+                f"https://{dest_host}/{dest_owner}/{dest_repo}.git"
+            )
+            dest_auth = _auth_url(dest_url, dest_token, dest_provider)
+            _log_line(job_id, f"git push --mirror {_mask_url(dest_auth)}")
+            r = _run(["git", "-C", clone_dir, "push", "--mirror", dest_auth])
+            if r.returncode != 0:
+                raise RuntimeError(f"git push failed: {r.stderr[-500:]}")
+
+            # 検証
+            _os_patch(job_id, {"progress": "verifying"})
+            r = _run(["git", "ls-remote", dest_auth, "HEAD"], timeout=60)
+            dest_head = ""
+            if r.returncode == 0 and r.stdout.strip():
+                dest_head = r.stdout.split()[0]
+            r2 = _run(["git", "ls-remote", "--heads", dest_auth],
+                      timeout=60)
+            branches_n = len(
+                [ln for ln in r2.stdout.splitlines() if ln.strip()]
+            )
+            r3 = _run(["git", "ls-remote", "--tags", dest_auth], timeout=60)
+            # 注釈タグの ^{} 変換分を除外
+            tags_n = len([
+                ln for ln in r3.stdout.splitlines()
+                if ln.strip() and not ln.strip().endswith("^{}")
+            ])
+
+            _os_patch(job_id, {
+                "state": "succeeded",
+                "finished_at": _now_iso(),
+                "progress": "done",
+                "dest_head": dest_head,
+                "counters": {
+                    "refs_total": refs_total,
+                    "refs_stripped": refs_stripped,
+                    "branches": branches_n,
+                    "tags": tags_n,
+                },
+            })
+            _log_line(
+                job_id,
+                f"done: source_head={source_head} dest_head={dest_head} "
+                f"branches={branches_n} tags={tags_n}"
+            )
+
+        except Exception as e:
+            err = f"{type(e).__name__}: {str(e)[:800]}"
+            _log_line(job_id, f"FAILED: {err}")
+            try:
+                _os_patch(job_id, {
+                    "state": "failed",
+                    "finished_at": _now_iso(),
+                    "error": err,
+                })
+            except Exception:
+                pass
+
+        finally:
+            # ログを doc に反映して in-memory から抜く
+            with _ACTIVE_JOBS_LOCK:
+                entry = _ACTIVE_JOBS.pop(job_id, None)
+            try:
+                if entry is not None:
+                    log_text = "\n".join(entry.get("log_lines", []))
+                    _os_patch(job_id, {"log": log_text})
+            except Exception:
+                pass
+            if work_dir and os.path.exists(work_dir):
+                try:
+                    shutil.rmtree(work_dir)
+                except Exception as e:
+                    logger.warning(f"[GIT_MIRROR] cleanup failed: {e}")
+
+
+    # ====================================================================
+    # API
+    # ====================================================================
+
+    router = APIRouter(prefix="/core/git_mirror", tags=["git-mirror"])
+
+
+    class MirrorJobCreate(BaseModel):
+        source_url: str
+        dest_owner: str
+        dest_repo: str
+        dest_provider: str = "github"
+        dest_host: str = "github.com"
+        private: bool = True
+        description: str = ""
+        create_if_missing: bool = True
+        exclude_pull_refs: bool = True
+        user_id: Optional[str] = None
+
+
+    @router.get("/health")
+    async def health() -> Dict[str, Any]:
+        return {
+            "ok": True,
+            "opensearch_url": OPENSEARCH_URL,
+            "index": IDX_JOBS,
+            "requests": _REQUESTS_AVAILABLE,
+            "active_jobs": len(_ACTIVE_JOBS),
+            "work_root": WORK_ROOT,
+        }
+
+
+    @router.post("/jobs")
+    async def create_job(payload: MirrorJobCreate,
+                         request: Request) -> Dict[str, Any]:
+        if payload.dest_provider not in _VALID_PROVIDERS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"dest_provider must be one of {_VALID_PROVIDERS}",
+            )
+        if not payload.dest_owner or not payload.dest_repo \
+                or not payload.source_url:
+            raise HTTPException(
+                status_code=400,
+                detail="source_url, dest_owner, dest_repo are required",
+            )
+        _ensure_index()
+
+        ident = _extract_login_identity(request)
+        requested_by = ident.get("user") or "unknown"
+
+        job_id = _job_id_new()
+        dest_url = (
+            f"https://{payload.dest_host}/{payload.dest_owner}/"
+            f"{payload.dest_repo}.git"
+        )
+        doc = {
+            "job_id": job_id,
+            "state": "queued",
+            "source_url": payload.source_url,
+            "dest_provider": payload.dest_provider,
+            "dest_host": payload.dest_host,
+            "dest_owner": payload.dest_owner,
+            "dest_repo": payload.dest_repo,
+            "dest_url": dest_url,
+            "private": payload.private,
+            "description": payload.description or "",
+            "exclude_pull_refs": payload.exclude_pull_refs,
+            "create_if_missing": payload.create_if_missing,
+            "created_at": _now_iso(),
+            "requested_by": requested_by,
+            "cancel_requested": False,
+            "progress": "queued",
+        }
+        _os_put(job_id, doc)
+
+        with _ACTIVE_JOBS_LOCK:
+            _ACTIVE_JOBS[job_id] = {"cancel": False, "log_lines": []}
+
+        t = threading.Thread(
+            target=_mirror_worker,
+            args=(job_id, payload.dict()),
+            daemon=True,
+            name=f"git_mirror_worker[{job_id}]",
+        )
+        t.start()
+
+        return {"ok": True, "job_id": job_id, "dest_url": dest_url}
+
+
+    @router.get("/jobs")
+    async def list_jobs(limit: int = _LIST_LIMIT_DEFAULT) -> Dict[str, Any]:
+        limit = max(1, min(int(limit or _LIST_LIMIT_DEFAULT), _LIST_LIMIT_MAX))
+        return {"jobs": _os_list(limit)}
+
+
+    @router.get("/jobs/{job_id}")
+    async def get_job(job_id: str) -> Dict[str, Any]:
+        doc = _os_get(job_id)
+        if not doc:
+            raise HTTPException(
+                status_code=404, detail=f"job {job_id} not found"
+            )
+        return doc
+
+
+    @router.post("/jobs/{job_id}/cancel")
+    async def cancel_job(job_id: str) -> Dict[str, Any]:
+        doc = _os_get(job_id)
+        if not doc:
+            raise HTTPException(
+                status_code=404, detail=f"job {job_id} not found"
+            )
+        if doc.get("state") in ("succeeded", "failed", "cancelled"):
+            return {
+                "ok": True,
+                "state": doc.get("state"),
+                "note": "already finished",
+            }
+        with _ACTIVE_JOBS_LOCK:
+            entry = _ACTIVE_JOBS.get(job_id)
+            if entry is not None:
+                entry["cancel"] = True
+        _os_patch(job_id, {"cancel_requested": True})
+        return {"ok": True, "state": "cancel_requested"}
+
+
+    # ====================================================================
+    # 起動時に index を冪等作成
+    # ====================================================================
+    try:
+        _ensure_index()
+    except Exception as _e:
+        logger.warning(
+            f"[GIT_MIRROR] initial ensure_index failed: "
+            f"{type(_e).__name__}: {_e}"
+        )
