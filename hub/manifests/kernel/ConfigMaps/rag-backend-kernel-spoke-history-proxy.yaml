@@ -1,0 +1,144 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-backend-kernel-spoke-history-proxy
+  namespace: rag-company1
+data:
+  spoke_history_proxy.py: |
+    """spoke_history_proxy.py (hub 側)
+    ====================================================================
+    中央ハブ (rag-hub) 上の kernel から、 各 spoke の history_* MCP tool を
+    呼び出す proxy エンドポイント。
+
+    背景:
+        - 各 spoke の rag-backend-kernel に spoke_recorder が動いており、
+          spoke ローカルの OpenSearch に K8s / Fleet 状態履歴を蓄積。
+        - spoke ローカル OpenSearch は hub からは直接叩けない (network 分離)。
+        - hub の frontend (Streamlit) から spoke の履歴を見るには、
+          hub kernel が hub の mcp-company1 経由で cluster_local_mcp_call を
+          叩き、 その結果を Streamlit に返す proxy が必要。
+
+    エンドポイント:
+        GET /core/spoke_history/{cluster}/{tool_name}?...
+            cluster: 対象 spoke クラスタ名 (rke2 / rag / rancher / ...)
+            tool_name: history_recorder_status / history_pod_events /
+                       history_deployment_events / history_configmap_events /
+                       history_node_events / history_bundle_events /
+                       history_k8s_events / history_timeline
+            追加の query params は spoke tool の arguments としてそのまま渡される。
+        レスポンス: spoke tool の JSON レスポンス (dict) をそのまま返す。
+
+    main.py からの取り込み:
+        from spoke_history_proxy import router as _spoke_history_proxy_router
+        app.include_router(_spoke_history_proxy_router)
+    """
+    from __future__ import annotations
+
+    import json
+    import logging
+    import os
+    from typing import Any, Dict
+
+    from fastapi import APIRouter, HTTPException, Request
+    from fastapi.concurrency import run_in_threadpool
+
+    logger = logging.getLogger("spoke_history_proxy")
+    router = APIRouter()
+
+    _MCP_URL = os.environ.get("MCP_SERVER_URL", "http://mcp-company1.mcp.svc.cluster.local:8000/sse")
+    _MCP_KEY = os.environ.get("MCP_API_KEY", "")
+    _MCP_TIMEOUT = 30.0
+
+    # 認可される history tool のホワイトリスト
+    _VALID_TOOLS = frozenset({
+        "history_recorder_status",
+        "history_pod_events",
+        "history_deployment_events",
+        "history_configmap_events",
+        "history_node_events",
+        "history_bundle_events",
+        "history_k8s_events",
+        "history_timeline",
+    })
+
+    # 数値型として解釈する query params
+    _INT_PARAMS = frozenset({"since_seconds", "limit", "limit_per_index"})
+
+
+    def _parse_args(request: Request) -> Dict[str, Any]:
+        """Query params を spoke tool の arguments dict に変換する。"""
+        args: Dict[str, Any] = {}
+        for k, v in request.query_params.items():
+            if k in _INT_PARAMS:
+                try:
+                    args[k] = int(v)
+                except ValueError:
+                    # 数値変換失敗時は文字列のまま渡す (spoke 側 validation に任せる)
+                    args[k] = v
+            else:
+                args[k] = v
+        return args
+
+
+    def _call_via_mcp_sync(cluster: str, tool_name: str, arguments: Dict[str, Any]) -> str:
+        """同期関数として SimpleMCPClient で cluster_local_mcp_call を叩く。
+
+        main.py で定義された SimpleMCPClient を lazy import で参照する
+        (循環 import を避けるため)。 async endpoint からは run_in_threadpool で呼ぶ。
+        """
+        # main モジュール (rag-backend-kernel 本体) から SimpleMCPClient をロード
+        import main  # type: ignore
+        SimpleMCPClient = getattr(main, "SimpleMCPClient", None)
+        if SimpleMCPClient is None:
+            raise RuntimeError("SimpleMCPClient is not available in main module")
+
+        if not _MCP_KEY:
+            raise RuntimeError("MCP_API_KEY is not configured")
+
+        with SimpleMCPClient(_MCP_URL, _MCP_KEY, timeout=_MCP_TIMEOUT) as client:
+            result = client.call_tool(
+                "cluster_local_mcp_call",
+                {
+                    "cluster": cluster,
+                    "service": "mcp-company1",
+                    "namespace": "rag-spoke",
+                    "tool_name": tool_name,
+                    "arguments": arguments,
+                },
+            )
+            return result if isinstance(result, str) else json.dumps(result, default=str)
+
+
+    @router.get("/core/spoke_history/{cluster}/{tool_name}")
+    async def spoke_history_proxy(
+        cluster: str,
+        tool_name: str,
+        request: Request,
+    ) -> Dict[str, Any]:
+        """spoke の history_* tool を hub 経由で叩く proxy。"""
+        if tool_name not in _VALID_TOOLS:
+            raise HTTPException(status_code=400, detail=f"unknown history tool: {tool_name}")
+        if not cluster or not cluster.replace("-", "").replace("_", "").isalnum():
+            # cluster 名は英数字 + ハイフン / アンダースコアのみ許容 (injection 対策)
+            raise HTTPException(status_code=400, detail=f"invalid cluster name: {cluster}")
+
+        args = _parse_args(request)
+
+        try:
+            result_str = await run_in_threadpool(_call_via_mcp_sync, cluster, tool_name, args)
+        except Exception as e:
+            logger.error(f"[SPOKE_HISTORY_PROXY] MCP call failed cluster={cluster} tool={tool_name}: {e}")
+            raise HTTPException(status_code=502, detail=f"upstream MCP call failed: {type(e).__name__}: {str(e)[:200]}")
+
+        # cluster_local_mcp_call の結果は spoke 側 tool の raw output。
+        # history_* tool は JSON 文字列を返すのでそのまま parse。
+        if not result_str:
+            return {"_empty": True}
+        try:
+            parsed = json.loads(result_str)
+        except (json.JSONDecodeError, TypeError):
+            # spoke 側でエラー文字列を返した場合等、 JSON でないものは raw で包む
+            return {"_raw": result_str}
+        if not isinstance(parsed, dict):
+            return {"_value": parsed}
+        return parsed
