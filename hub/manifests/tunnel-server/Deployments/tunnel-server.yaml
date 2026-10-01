@@ -44,6 +44,12 @@ spec:
               value: ":8080"
             - name: TUNNEL_METRICS_LISTEN
               value: ":9090"
+            # v3.0: hub kernel URL for the HTTP-proxy mode used by
+            # application spokes. When a spoke sends a HttpRequest
+            # frame, tunnel-server forwards it here (after the
+            # per-kind path allowlist check).
+            - name: KERNEL_URL
+              value: "http://rag-backend-kernel.rag-company1.svc.cluster.local:8000"
             # TUNNEL_SPOKES is the per-spoke registry.
             # Format: "<spoke_id>:<hub_listen_port>:<pre-shared token>[,...]".
             # Phase 1 (this release) uses static pre-shared tokens.
