@@ -1,0 +1,254 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-backend-kernel-native-spoke-mac
+  namespace: rag-company1
+data:
+  native_spoke_mac.py: |
+    """native_spoke_mac.py (hub 側)
+    ====================================================================
+    Native Spoke (macOS 上の nsmt) からの heartbeat 受信 endpoint。
+
+    背景:
+        - Native Spoke は Mac 特有の状態 (Xcode バージョン、 iOS シミュレータ
+          一覧、 起動中シミュレータ、 ディスク空き) を持ち、 通常の spoke recorder
+          では収集できない。
+        - Mac 上の常駐プロセス openspoke-heartbeat-sender が 60 秒ごとに
+          この endpoint に POST してくる。
+        - hub 側は Bearer 検証、 Memgraph の Spoke node property 更新、
+          OpenSearch への時系列記録を行う。
+
+    エンドポイント:
+        POST /core/native_spoke_mac/heartbeat
+            Header: Authorization: Bearer <shared_secret>
+            Body (JSON): {
+                "spoke_id": "nsmt-example",
+                "collected_at": "2026-09-15T12:00:00Z",
+                "xcode_version": "26.6",
+                "os_version": "26.6.2",
+                "sim_runtimes": ["iOS 26.5", "iOS 26.4"],
+                "booted_sims": [
+                    {"udid": "...", "name": "iPhone 17", "runtime": "iOS-26-5"}
+                ],
+                "disk_free_gb": 123.4
+            }
+        レスポンス: {"ok": true, "recorded_at": "..."}
+
+    認証:
+        env `MAC_HEARTBEAT_TOKEN_<sanitized_spoke_id>` に shared secret を持つ。
+        body の spoke_id に基づいて対応する token を検索し、 Bearer と定数時間
+        比較で単純一致検証。
+
+    保管先:
+        - Memgraph の (:Spoke {id: <spoke_id>}) node の property として最新値
+        - OpenSearch index=native_spoke_heartbeats に時系列記録
+
+    main.py への取り込み:
+        from native_spoke_mac import router as _native_spoke_mac_router
+        app.include_router(_native_spoke_mac_router)
+    """
+    from __future__ import annotations
+
+    import hmac
+    import logging
+    import os
+    import re
+    from datetime import datetime, timezone
+    from typing import Any, Dict, List, Optional
+
+    import requests
+    from fastapi import APIRouter, Header, HTTPException
+    from fastapi.concurrency import run_in_threadpool
+    from pydantic import BaseModel, Field
+
+    logger = logging.getLogger("native_spoke_mac")
+    router = APIRouter()
+
+    _OPENSEARCH_URL = os.environ.get(
+        "OPENSEARCH_URL",
+        "http://opensearch.opensearch.svc.cluster.local:9200",
+    ).rstrip("/")
+    _HEARTBEAT_INDEX = "native_spoke_heartbeats"
+    _NEO4J_URI = os.environ.get(
+        "NEO4J_URI",
+        "bolt://memgraph.memgraph.svc.cluster.local:7687",
+    )
+
+    _index_ensured = [False]
+
+
+    def _sanitize_spoke_id(spoke_id: str) -> str:
+        """env の key は英数字と _ のみ許容。 nsmt-example -> nsmt_example に変換。"""
+        return re.sub(r"[^A-Za-z0-9_]", "_", spoke_id)
+
+
+    def _lookup_token(spoke_id: str) -> Optional[str]:
+        """env から shared secret を取得。 無ければ None。"""
+        sanitized = _sanitize_spoke_id(spoke_id)
+        return os.environ.get(f"MAC_HEARTBEAT_TOKEN_{sanitized}")
+
+
+    def _ensure_index() -> None:
+        """OpenSearch index を idempotent 作成する。 起動後 1 回だけ実 PUT。"""
+        if _index_ensured[0]:
+            return
+        mapping = {
+            "mappings": {
+                "properties": {
+                    "spoke_id": {"type": "keyword"},
+                    "collected_at": {"type": "date"},
+                    "received_at": {"type": "date"},
+                    "xcode_version": {"type": "keyword"},
+                    "os_version": {"type": "keyword"},
+                    "sim_runtimes": {"type": "keyword"},
+                    "booted_sims": {
+                        "type": "nested",
+                        "properties": {
+                            "udid": {"type": "keyword"},
+                            "name": {"type": "keyword"},
+                            "runtime": {"type": "keyword"},
+                        },
+                    },
+                    "disk_free_gb": {"type": "float"},
+                }
+            }
+        }
+        try:
+            h = requests.head(f"{_OPENSEARCH_URL}/{_HEARTBEAT_INDEX}", timeout=5)
+            if h.status_code == 200:
+                _index_ensured[0] = True
+                return
+            c = requests.put(
+                f"{_OPENSEARCH_URL}/{_HEARTBEAT_INDEX}",
+                json=mapping,
+                headers={"Content-Type": "application/json"},
+                timeout=10,
+            )
+            if c.status_code in (200, 201):
+                logger.info(f"[NATIVE_SPOKE_MAC] created OpenSearch index: {_HEARTBEAT_INDEX}")
+            elif c.status_code == 400 and "resource_already_exists" in c.text:
+                pass
+            else:
+                logger.warning(
+                    f"[NATIVE_SPOKE_MAC] failed to create index: "
+                    f"{c.status_code} {c.text[:200]}"
+                )
+        except Exception as e:
+            logger.warning(f"[NATIVE_SPOKE_MAC] ensure_index error: {e}")
+        _index_ensured[0] = True
+
+
+    def _write_opensearch(doc: Dict[str, Any]) -> None:
+        _ensure_index()
+        try:
+            r = requests.post(
+                f"{_OPENSEARCH_URL}/{_HEARTBEAT_INDEX}/_doc",
+                json=doc,
+                headers={"Content-Type": "application/json"},
+                timeout=5,
+            )
+            if r.status_code not in (200, 201):
+                logger.warning(
+                    f"[NATIVE_SPOKE_MAC] OpenSearch write non-2xx: "
+                    f"{r.status_code} {r.text[:200]}"
+                )
+        except Exception as e:
+            logger.warning(f"[NATIVE_SPOKE_MAC] OpenSearch write error: {e}")
+
+
+    def _write_memgraph(payload: Dict[str, Any]) -> None:
+        """Spoke node の property として最新値を上書き。 node がなければ MERGE で作る。"""
+        try:
+            from neo4j import GraphDatabase
+        except ImportError:
+            logger.warning(
+                "[NATIVE_SPOKE_MAC] neo4j driver not available, skip Memgraph write"
+            )
+            return
+        driver = None
+        try:
+            driver = GraphDatabase.driver(_NEO4J_URI)
+            cypher = (
+                "MERGE (s:Spoke {id: $spoke_id}) "
+                "SET s.native_last_collected_at = $collected_at, "
+                "    s.native_xcode_version = $xcode_version, "
+                "    s.native_os_version = $os_version, "
+                "    s.native_sim_runtimes = $sim_runtimes, "
+                "    s.native_booted_sim_count = $booted_sim_count, "
+                "    s.native_disk_free_gb = $disk_free_gb "
+                "RETURN s.id AS id"
+            )
+            with driver.session() as session:
+                session.run(
+                    cypher,
+                    spoke_id=payload["spoke_id"],
+                    collected_at=payload.get("collected_at"),
+                    xcode_version=payload.get("xcode_version", ""),
+                    os_version=payload.get("os_version", ""),
+                    sim_runtimes=payload.get("sim_runtimes", []),
+                    booted_sim_count=len(payload.get("booted_sims", [])),
+                    disk_free_gb=float(payload.get("disk_free_gb", 0) or 0),
+                )
+        except Exception as e:
+            logger.warning(f"[NATIVE_SPOKE_MAC] Memgraph write error: {e}")
+        finally:
+            if driver is not None:
+                try:
+                    driver.close()
+                except Exception:
+                    pass
+
+
+    class _BootedSim(BaseModel):
+        udid: str = ""
+        name: str = ""
+        runtime: str = ""
+
+
+    class _HeartbeatBody(BaseModel):
+        spoke_id: str = Field(..., min_length=1, max_length=64)
+        collected_at: str = Field(..., min_length=1, max_length=64)
+        xcode_version: str = Field("", max_length=64)
+        os_version: str = Field("", max_length=64)
+        sim_runtimes: List[str] = Field(default_factory=list)
+        booted_sims: List[_BootedSim] = Field(default_factory=list)
+        disk_free_gb: float = 0.0
+
+
+    @router.post("/core/native_spoke_mac/heartbeat")
+    async def native_spoke_mac_heartbeat(
+        body: _HeartbeatBody,
+        authorization: Optional[str] = Header(default=None),
+    ) -> Dict[str, Any]:
+        """Native Spoke (Mac) からの heartbeat 受信。 Bearer + Memgraph + OpenSearch。"""
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="missing bearer token")
+        presented = authorization[len("Bearer "):]
+
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", body.spoke_id):
+            raise HTTPException(status_code=400, detail=f"invalid spoke_id: {body.spoke_id}")
+
+        expected = _lookup_token(body.spoke_id)
+        if not expected:
+            raise HTTPException(
+                status_code=401, detail=f"no shared secret for spoke_id: {body.spoke_id}"
+            )
+        if not hmac.compare_digest(presented, expected):
+            raise HTTPException(status_code=401, detail="bearer mismatch")
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        doc = {
+            "spoke_id": body.spoke_id,
+            "collected_at": body.collected_at,
+            "received_at": now_iso,
+            "xcode_version": body.xcode_version,
+            "os_version": body.os_version,
+            "sim_runtimes": body.sim_runtimes,
+            "booted_sims": [b.model_dump() for b in body.booted_sims],
+            "disk_free_gb": body.disk_free_gb,
+        }
+
+        await run_in_threadpool(_write_opensearch, doc)
+        await run_in_threadpool(_write_memgraph, body.model_dump())
+
+        return {"ok": True, "recorded_at": now_iso}
