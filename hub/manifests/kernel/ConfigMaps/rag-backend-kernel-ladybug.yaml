@@ -1,0 +1,108 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-backend-kernel-ladybug
+  namespace: rag-company1
+data:
+  ladybug_endpoints.py: |
+    """ladybug_endpoints.py — evaluation endpoints for the Ladybug backend (v3.0).
+
+    ============================================================================
+    Purpose
+    ----------------------------------------------------------------------------
+    Expose Ladybug (a kùzu-based embedded Cypher engine with a vector
+    extension) as a parallel evaluation surface alongside Milvus /
+    Memgraph / OpenSearch. These endpoints do not replace or reroute any
+    of `/core/handoff/*`, `/core/graph/*`, `/core/vectorstore/*`, or
+    `/core/knowledge/*` — they simply let an operator poke at Ladybug
+    while it runs alongside the primary stores.
+
+    Typical evaluation flow:
+      - Ingest the same Brief / Topic set into both Memgraph (via the
+        `system_brief` and `upsert_knowledge` MCP tools) and Ladybug
+        (via a small custom script hitting `/core/ladybug/cypher`), then
+        compare read behaviour and shape.
+      - Poke at Ladybug's Cypher dialect coverage with arbitrary queries
+        via `/core/ladybug/cypher`.
+      - Hybrid vector search over Ladybug is on the roadmap under
+        `/core/ladybug/vectorstore/*` (not yet implemented).
+
+    Both `_client()` and the endpoint implementations go through the
+    `LadybugClient` defined in `backends.py`, which in turn talks to the
+    Ladybug REST API at http://ladybug.ladybug.svc.cluster.local:8000
+    (overridable via the `LADYBUG_URL` environment variable).
+    """
+
+    from fastapi import APIRouter
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    router = APIRouter()
+
+    def _client():
+        # `backends.py` is mounted at /app/backends.py inside the kernel Pod.
+        from backends import LadybugClient, LADYBUG_URL
+        return LadybugClient(LADYBUG_URL)
+
+    def _err(e, prefix=""):
+        return f"{type(e).__name__}: {prefix}{str(e)[:200]}"
+
+    # -------------------------------------------------------------------------
+    # Ladybug REST API passthrough: health / schema / cypher
+    # -------------------------------------------------------------------------
+
+    @router.post("/core/ladybug/health")
+    async def core_ladybug_health(request: dict):
+        """Call Ladybug's GET / and return its server status.
+
+        Returns: {ok, status, version, mode, error}
+        """
+        try:
+            result = _client().health()
+            logger.info(f"[LADYBUG] health OK: version={result.get('version')} mode={result.get('mode')}")
+            return {"ok": True, **result, "error": None}
+        except Exception as e:
+            logger.error(f"[LADYBUG] health error: {e}", exc_info=True)
+            return {"ok": False, "error": _err(e)}
+
+    @router.post("/core/ladybug/schema")
+    async def core_ladybug_schema(request: dict):
+        """Call Ladybug's GET /schema and return the current DB schema.
+
+        Returns: {ok, nodeTables, relTables, relGroups, rdf, error}
+        """
+        try:
+            result = _client().schema()
+            node_count = len(result.get("nodeTables", []))
+            rel_count = len(result.get("relTables", []))
+            logger.info(f"[LADYBUG] schema OK: nodeTables={node_count} relTables={rel_count}")
+            return {"ok": True, **result, "error": None}
+        except Exception as e:
+            logger.error(f"[LADYBUG] schema error: {e}", exc_info=True)
+            return {"ok": False, "error": _err(e)}
+
+    @router.post("/core/ladybug/cypher")
+    async def core_ladybug_cypher(request: dict):
+        """Execute an arbitrary Cypher statement against Ladybug.
+
+        Body:
+            {"query": "MATCH (n) RETURN n LIMIT 10", "params": {...}}
+
+        Returns:
+            {ok, result: {rows, dataTypes, isSchemaChanged}, error}
+        """
+        query = request.get("query") or ""
+        params = request.get("params") or {}
+        if not query:
+            return {"ok": False, "error": "query is required"}
+        if not isinstance(params, dict):
+            return {"ok": False, "error": "params must be a dict"}
+        try:
+            result = _client().cypher(query, params)
+            rows = result.get("rows", [])
+            logger.info(f"[LADYBUG] cypher OK: {len(rows)} rows (prefix={query[:60].strip()})")
+            return {"ok": True, "result": result, "error": None}
+        except Exception as e:
+            logger.error(f"[LADYBUG] cypher error: {e} (prefix={query[:80].strip()})", exc_info=True)
+            return {"ok": False, "error": _err(e)}
