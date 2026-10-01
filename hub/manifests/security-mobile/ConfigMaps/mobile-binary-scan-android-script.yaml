@@ -1,0 +1,367 @@
+---
+# Android binary scanner.
+#
+# Target: a gradle-built .apk.
+#
+# Tools: apkanalyzer / aapt2 / apksigner (from the Android SDK) and
+# strings (bundled with macOS).
+#
+# Runs on a native spoke (nsmt) that has the Android SDK installed.
+# This ConfigMap is projected onto the spoke as
+# ~/nsm-work/mobile_binary_scan_android.py and invoked via
+# nsm_sh_exec by the mobile-binary-scan CronJob. Fleet-managed
+# GitOps keeps this file as the source of truth.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mobile-binary-scan-android-script
+  namespace: security-mobile
+  labels:
+    purpose: mobile-vulnerability-binary-scanner-android
+data:
+  mobile_binary_scan_android.py: |
+    #!/usr/bin/env python3
+    """Android .apk binary scanner.
+
+    Target: a gradle-built .apk.
+
+    Tools:
+      - apkanalyzer (~/Library/Android/sdk/cmdline-tools/latest/bin/apkanalyzer)
+      - aapt2 (~/Library/Android/sdk/build-tools/*/aapt2)
+      - apksigner (~/Library/Android/sdk/build-tools/*/apksigner)
+
+    Detected finding_type values:
+      - hardcoded_secret_in_binary: cleartext credentials picked up
+        from unpacked DEX files by `strings`.
+      - weak_signature: `apksigner verify --verbose` shows v1-only
+        signing or a debug signature.
+      - permission_over_request: apkanalyzer's merged manifest lists
+        a dangerous permission.
+      - build_config_weak: debuggable=true or android:testOnly.
+      - target_sdk_low: targetSdkVersion is old (< 30).
+      - backup_enabled / exported_component / deep_link_custom_scheme
+        / deep_link_entry: applied to the merged manifest (which also
+        includes components brought in by libraries).
+
+    Output: JSON on stdout that matches the
+    VulnEventMobileDetectedPayload contract.
+    Invocation:
+      python3 mobile_binary_scan_android.py --apk <path>.apk \\
+        --package-name <name> --app-version <version>
+    """
+    import argparse
+    import glob
+    import json
+    import os
+    import re
+    import subprocess
+    import sys
+    import tempfile
+    import time
+    import uuid
+    import zipfile
+    import xml.etree.ElementTree as ET
+    from collections import Counter
+    from pathlib import Path
+
+
+    HOME = os.path.expanduser('~')
+    APKANALYZER = f'{HOME}/Library/Android/sdk/cmdline-tools/latest/bin/apkanalyzer'
+    _BT = sorted(glob.glob(f'{HOME}/Library/Android/sdk/build-tools/*'), reverse=True)
+    AAPT2 = f'{_BT[0]}/aapt2' if _BT else 'aapt2'
+    APKSIGNER = f'{_BT[0]}/apksigner' if _BT else 'apksigner'
+
+    CLOUD_CRED_PATTERNS = [
+        (r'AKIA[0-9A-Z]{16}', 'AWS Access Key ID'),
+        (r'AIza[0-9A-Za-z_\-]{35}', 'Google API Key'),
+        (r'https://[a-zA-Z0-9]+@[a-zA-Z0-9\-]+\.ingest\.sentry\.io/[0-9]+', 'Sentry DSN'),
+    ]
+
+    ANDROID_DANGEROUS_PERMISSIONS = {
+        'android.permission.READ_CONTACTS',
+        'android.permission.WRITE_CONTACTS',
+        'android.permission.READ_SMS',
+        'android.permission.SEND_SMS',
+        'android.permission.READ_CALL_LOG',
+        'android.permission.RECORD_AUDIO',
+        'android.permission.READ_EXTERNAL_STORAGE',
+        'android.permission.WRITE_EXTERNAL_STORAGE',
+        'android.permission.ACCESS_FINE_LOCATION',
+        'android.permission.CAMERA',
+    }
+
+
+    def _run(cmd, cwd=None):
+        r = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
+        return r.returncode, r.stdout, r.stderr
+
+
+    def scan_manifest(apk: Path) -> tuple:
+        findings = []
+        rc, out, err = _run([APKANALYZER, 'manifest', 'print', str(apk)])
+        if rc != 0:
+            findings.append({
+                'finding_type': 'build_config_weak', 'severity': 'low',
+                'file': apk.name, 'line': 0,
+                'snippet': (err or '')[:200],
+                'description': 'apkanalyzer manifest read failed',
+            })
+            return findings, None, None, None
+        package_name = None
+        m = re.search(r'package="([^"]+)"', out)
+        if m:
+            package_name = m.group(1)
+        app_version = None
+        m = re.search(r'android:versionName="([^"]+)"', out)
+        if m:
+            app_version = m.group(1)
+        target_sdk = None
+        m = re.search(r'android:targetSdkVersion="(\d+)"', out)
+        if m:
+            target_sdk = int(m.group(1))
+        for m in re.finditer(r'<uses-permission[^/]*android:name="([^"]+)"', out):
+            name = m.group(1)
+            if name in ANDROID_DANGEROUS_PERMISSIONS:
+                findings.append({
+                    'finding_type': 'permission_over_request', 'severity': 'medium',
+                    'file': 'AndroidManifest.xml', 'line': 0,
+                    'snippet': f'<uses-permission android:name="{name}"/>',
+                    'description': f'Dangerous permission requested: {name}',
+                })
+        if re.search(r'android:debuggable="true"', out):
+            findings.append({
+                'finding_type': 'build_config_weak', 'severity': 'high',
+                'file': 'AndroidManifest.xml', 'line': 0,
+                'snippet': 'android:debuggable="true"',
+                'description': 'APK is debuggable=true (not appropriate for production distribution)',
+            })
+        if re.search(r'android:testOnly="true"', out):
+            findings.append({
+                'finding_type': 'build_config_weak', 'severity': 'medium',
+                'file': 'AndroidManifest.xml', 'line': 0,
+                'snippet': 'android:testOnly="true"',
+                'description': 'testOnly=true (requires adb install -t)',
+            })
+        if target_sdk is not None and target_sdk < 30:
+            findings.append({
+                'finding_type': 'target_sdk_low', 'severity': 'medium',
+                'file': 'AndroidManifest.xml', 'line': 0,
+                'snippet': f'targetSdkVersion={target_sdk}',
+                'description': f'targetSdkVersion={target_sdk} is old (>=30 recommended)',
+            })
+        try:
+            findings.extend(_android_component_findings(ET.fromstring(out), 'AndroidManifest.xml (merged)'))
+        except ET.ParseError as e:
+            print(f'warn: merged manifest parse: {e}', file=sys.stderr)
+        return findings, package_name, target_sdk, app_version
+
+
+    ANDROID_NS = "{http://schemas.android.com/apk/res/android}"
+
+
+    def _android_component_findings(root, rel: str) -> list:
+        """Check for exported components, deep links, and backup settings (MASVS-PLATFORM / STORAGE).
+
+        Same logic as mobile_scan.py (source scan), applied here to
+        the APK's merged manifest which also includes components
+        brought in by libraries.
+        """
+        A = ANDROID_NS
+        findings = []
+        app = root.find("application")
+        if app is None:
+            return findings
+        if app.get(f"{A}allowBackup", "true") == "true":
+            has_rules = app.get(f"{A}dataExtractionRules") or app.get(f"{A}fullBackupContent")
+            findings.append({
+                "finding_type": "backup_enabled",
+                "severity": "low" if has_rules else "medium",
+                "file": rel, "line": 0,
+                "snippet": 'android:allowBackup="true"' + (" (exclusion rules present)" if has_rules else ""),
+                "description": ("App data is included in device backups. "
+                                + ("Check that credentials and PII are excluded by the rules"
+                                   if has_rules else "No exclusion rules, so every file is included")),
+            })
+        for tag in ("activity", "activity-alias", "service", "receiver", "provider"):
+            for comp in app.findall(tag):
+                name = comp.get(f"{A}name", "?")
+                filters = comp.findall("intent-filter")
+                exported = comp.get(f"{A}exported")
+                if exported is None:
+                    exported = "true" if filters else "false"
+                if exported != "true":
+                    continue
+                actions = {a.get(f"{A}name") for f in filters for a in f.findall("action")}
+                cats = {c.get(f"{A}name") for f in filters for c in f.findall("category")}
+                is_launcher = ("android.intent.action.MAIN" in actions
+                               and "android.intent.category.LAUNCHER" in cats)
+                is_widget = "android.appwidget.action.APPWIDGET_UPDATE" in actions
+                # Deep links (VIEW + BROWSABLE) are entry points for external input.
+                for f in filters:
+                    f_actions = {a.get(f"{A}name") for a in f.findall("action")}
+                    f_cats = {c.get(f"{A}name") for c in f.findall("category")}
+                    if ("android.intent.action.VIEW" not in f_actions
+                            or "android.intent.category.BROWSABLE" not in f_cats):
+                        continue
+                    schemes = sorted({d.get(f"{A}scheme") for d in f.findall("data")
+                                      if d.get(f"{A}scheme")})
+                    custom = [s for s in schemes if s not in ("http", "https")]
+                    if custom:
+                        findings.append({
+                            "finding_type": "deep_link_custom_scheme",
+                            "severity": "medium",
+                            "file": rel, "line": 0,
+                            "snippet": f"{name} scheme={','.join(custom)}",
+                            "description": ("Custom-scheme deep link. Another app that registers the same scheme "
+                                            "can intercept it; if this is an authorisation callback receiver, "
+                                            "PKCE and state validation are required and every received "
+                                            "value must be validated."),
+                        })
+                    elif schemes:
+                        verified = f.get(f"{A}autoVerify") == "true"
+                        findings.append({
+                            "finding_type": "deep_link_entry",
+                            "severity": "low" if verified else "medium",
+                            "file": rel, "line": 0,
+                            "snippet": f"{name} scheme={','.join(schemes)} autoVerify={verified}",
+                            "description": ("Entry point for external URLs into the app; every received URL "
+                                            "value must be validated"
+                                            + ("" if verified else ". autoVerify is off, so other apps can "
+                                               "compete for the same URL")),
+                        })
+                if is_launcher or is_widget:
+                    continue
+                if comp.get(f"{A}permission"):
+                    continue
+                has_view = "android.intent.action.VIEW" in actions
+                if tag == "activity" and has_view:
+                    continue  # Reported above as a deep link.
+                findings.append({
+                    "finding_type": "exported_component",
+                    "severity": "high" if tag == "provider" else "medium",
+                    "file": rel, "line": 0,
+                    "snippet": f'<{tag} android:name="{name}" android:exported="true"> (no permission)',
+                    "description": f"The {tag} can be invoked by any app with no permission. Set exported=false if not needed, or guard it with a permission.",
+                })
+        return findings
+
+
+    def scan_signature(apk: Path) -> list:
+        findings = []
+        rc, out, err = _run([APKSIGNER, 'verify', '--verbose', str(apk)])
+        text = out + '\n' + err
+        if rc != 0:
+            findings.append({
+                'finding_type': 'weak_signature', 'severity': 'high',
+                'file': apk.name, 'line': 0,
+                'snippet': text[:200],
+                'description': f'apksigner verify failed (rc={rc})',
+            })
+            return findings
+        v2 = 'Verified using v2 scheme (APK Signature Scheme v2): true' in text
+        v3 = 'Verified using v3 scheme (APK Signature Scheme v3): true' in text
+        if not (v2 or v3):
+            findings.append({
+                'finding_type': 'weak_signature', 'severity': 'medium',
+                'file': apk.name, 'line': 0,
+                'snippet': 'apk signature v2/v3 both missing',
+                'description': 'No v2/v3 signature scheme (v1 only, vulnerable to stripping attacks)',
+            })
+        if 'Android Debug' in text or 'CN=Android Debug' in text:
+            findings.append({
+                'finding_type': 'weak_signature', 'severity': 'low',
+                'file': apk.name, 'line': 0,
+                'snippet': 'CN=Android Debug',
+                'description': 'Debug build signature (not distributable via Google Play)',
+            })
+        return findings
+
+
+    def scan_strings_in_apk(apk: Path) -> list:
+        findings = []
+        tmpdir = tempfile.mkdtemp(prefix='apkscan-')
+        try:
+            with zipfile.ZipFile(apk) as z:
+                dex_names = [n for n in z.namelist() if n.startswith('classes') and n.endswith('.dex')]
+                for dex_name in dex_names:
+                    dex_path = Path(tmpdir) / dex_name
+                    dex_path.parent.mkdir(parents=True, exist_ok=True)
+                    with z.open(dex_name) as src, open(dex_path, 'wb') as dst:
+                        dst.write(src.read())
+                    _, out, _ = _run(['strings', '-a', str(dex_path)])
+                    for line in out.split('\n'):
+                        for pat, desc in CLOUD_CRED_PATTERNS:
+                            if re.search(pat, line):
+                                findings.append({
+                                    'finding_type': 'hardcoded_secret_in_binary',
+                                    'severity': 'critical',
+                                    'file': dex_name, 'line': 0,
+                                    'snippet': line.strip()[:200],
+                                    'description': f'{desc} embedded in a DEX',
+                                })
+        except Exception as e:
+            findings.append({
+                'finding_type': 'hardcoded_secret_in_binary', 'severity': 'low',
+                'file': apk.name, 'line': 0,
+                'snippet': str(e)[:200],
+                'description': f'DEX unpack failed: {e}',
+            })
+        finally:
+            subprocess.run(['rm', '-rf', tmpdir], capture_output=True)
+        return findings
+
+
+    def main():
+        ap = argparse.ArgumentParser()
+        ap.add_argument('--apk', required=True)
+        ap.add_argument('--package-name', default=None)
+        ap.add_argument('--app-version', default=None)
+        ap.add_argument('--scan-id', default=None)
+        args = ap.parse_args()
+
+        apk = Path(args.apk).resolve()
+        if not apk.is_file():
+            print(f'error: not a file: {apk}', file=sys.stderr)
+            sys.exit(2)
+
+        scan_id = args.scan_id or f'mobile-binary-android-{int(time.time())}-{uuid.uuid4().hex[:8]}'
+
+        manifest_findings, pkg, target_sdk, ver = scan_manifest(apk)
+        all_findings = list(manifest_findings)
+        all_findings.extend(scan_signature(apk))
+        all_findings.extend(scan_strings_in_apk(apk))
+
+        package_name = args.package_name or pkg
+        app_version = args.app_version or ver
+
+        severity_counts = Counter()
+        type_severity_counts = Counter()
+        for f in all_findings:
+            severity_counts[f['severity']] += 1
+            type_severity_counts[(f['finding_type'], f['severity'])] += 1
+        finding_summaries = [
+            {'finding_type': ft, 'severity': sev, 'count': cnt}
+            for (ft, sev), cnt in sorted(type_severity_counts.items())
+        ]
+
+        output = {
+            'mobile_detected': {
+                'scan_id': scan_id,
+                'platform': 'android',
+                'bundle_id': None,
+                'package_name': package_name,
+                'app_version': app_version,
+                'app_version_code': None,
+                'artifact_path': str(apk),
+                'severity_counts': dict(severity_counts),
+                'finding_summaries': finding_summaries,
+            },
+            'detail_findings': all_findings,
+            'total_findings': len(all_findings),
+            'target_sdk': target_sdk,
+        }
+        print(json.dumps(output, indent=2, ensure_ascii=False))
+
+
+    if __name__ == '__main__':
+        main()
