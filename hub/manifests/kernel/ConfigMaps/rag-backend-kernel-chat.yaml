@@ -1,0 +1,464 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-backend-kernel-chat
+  namespace: rag-company1
+data:
+  chat_endpoints.py: |
+    """chat_endpoints.py — 利用者と Claude の対話フロントエンド用バックエンド。
+
+    設計:
+      - Anthropic の stream + SimpleMCPClient + tool loop の既存パターン
+        (main.py の /core/claude/stream-with-mcp と同じ構造) をそのまま流用
+      - MCP hub (対応するエンドポイント、 内部は
+        mcp-company1.mcp.svc.cluster.local に転送) を経由して全ツールを使う
+      - thread CRUD、 send 時の injection、 メッセージ永続化を提供
+      - thread_id は呼び出し元 (UI) が生成した UUID v4 を受け取る
+      - 1 スレッドあたり無制限メッセージ対応 (OpenSearch にページング保存)
+      - send 1 回につき、 利用者/Claude のメッセージ各 1 件を OpenSearch に積む
+      - send は StreamingResponse (SSE 風の line-delimited JSON) を返し、
+        delta/tool_use/tool_result/done/error を順次吐く
+
+    エンドポイント (全て /core/chat/ 配下):
+      - POST  /core/chat/threads                   : スレッド作成
+      - POST  /core/chat/threads/list              : スレッド一覧
+      - POST  /core/chat/threads/get               : スレッド 1 件取得
+      - POST  /core/chat/threads/rename            : スレッド改名
+      - POST  /core/chat/threads/archive           : スレッドアーカイブ (status 更新)
+      - POST  /core/chat/threads/delete            : スレッド (+ メッセージ) 削除
+      - POST  /core/chat/messages/list             : メッセージ一覧 (ページング)
+      - POST  /core/chat/send                      : (非 stream) レガシー同期送信
+      - POST  /core/chat/send/stream               : (stream) MCP tool loop つき SSE 送信
+      - POST  /core/chat/send/stream/claude4plus   : (stream) Opus 4-plus 固定 SSE
+      - POST  /core/chat/messages/edit             : メッセージ編集
+      - POST  /core/chat/messages/delete           : メッセージ 1 件削除
+      - POST  /core/chat/messages/regenerate       : 直前の assistant 返答を再生成
+      - POST  /core/chat/search                    : 全文検索 (タイトル + 本文)
+      - POST  /core/kb/prep_turn                   : 外部 LLM 用、 turn 開始前の下準備
+      - POST  /core/kb/record_turn                 : 外部 LLM 用、 turn 完了後の記録
+
+    OpenSearch index:
+      - chat_threads  : thread メタ (id, title, owner, model, status, timestamps,
+                        last_message_id, last_message_at, message_count, token/cost 合計)
+      - chat_messages : 1 メッセージ = 1 ドキュメント
+                        (id, thread_id, role, content, created_at, model, input_tokens,
+                         output_tokens, cost_usd, tool_calls, injected_topics,
+                         edited_at?, deleted?, parent_message_id?)
+
+    別 topic:
+      - chat_backend_endpoints_20260908 : 本モジュールの詳細仕様 (OpenSearch index の
+        正本定義、 KB 注入設計、 Jev KB gate (Phase 2-h Step F)、 外部脳エンドポイント)
+      - chat_jev_kb_gate_step_f_20260919 : Jev KB gate 設計 (needs_kb 判定 + topic 選抜)
+      - chat_jev_kb_external_brain_step_g_20260920 : 外部脳エンドポイント設計
+    """
+    from __future__ import annotations
+
+    import json
+    import os
+    import re
+    import time
+    import uuid
+    from datetime import datetime, timezone, timedelta
+    from typing import Any, Dict, List, Optional, Tuple
+
+    import httpx
+    import requests  # Ollama 直接呼出用 (requests.post は kernel 側で monkey patch 済)
+    from fastapi import APIRouter
+    from fastapi.responses import StreamingResponse
+
+    router = APIRouter()
+    logger = __import__("logging").getLogger("kernel")
+
+    MAX_OUTPUT_TOKENS = 8192  # Claude の max_tokens 既定値
+
+    CHAT_THREADS_INDEX = "chat_threads"
+    CHAT_MESSAGES_INDEX = "chat_messages"
+
+    # チャット送信時に 1 回の send で許される最大ツールコール反復回数。
+    # Claude の tool_use は model が止めるまで繰り返されるので、
+    # 暴走防止のため kernel 側で上限を設ける。
+    CHAT_MAX_TOOL_ITERATIONS = 100
+    # ollama (gemma2) 向け MCP tool loop の最大反復回数。
+    # gemma2:9b は tool_choice が弱くループに陥る可能性があるので低めに設定。
+    OLLAMA_MAX_TOOL_ITERATIONS = 20
+    # MCP tool の結果が長すぎる場合に切り詰める上限 (文字数)。
+    # Claude の context window を節約しつつ、 必要な情報は失わないバランス。
+    MCP_TOOL_RESULT_MAX_CHARS = 100_000
+    # tool_result SSE で UI に送る brief 文字数の上限。
+    # 画面に表示するプレビュー用なので小さめに (300 字程度で十分)。
+    TOOL_RESULT_BRIEF_CHAR_LIMIT = 300
+
+    # 1M context beta header を付けるべきモデルの集合。
+    # Opus 4-plus (claude-opus-4-plus-20250506) は 1M context に対応。
+    # 他モデルは 200K context のまま。
+    MODELS_SUPPORTING_1M_CONTEXT = {
+        "claude-opus-4-plus-20250506",
+    }
+
+    # Jev KB gate が使う内蔵モデル識別子 (Jev と gemma2 の混合モデル)。
+    # 内部的には Jev + gemma2:9b のパイプラインとして動く。
+    CHAT_JEV_GEMMA2_MODEL_ID = "jev-gemma2"
+    # Jev KB gate が内部で使う gemma2 の実モデル名。
+    CHAT_JEV_GEMMA2_UNDERLYING = "gemma2:9b"
+    # Jev の累積 input token を node 間で share する cap (gate が暴走しないように)。
+    CHAT_ACCUMULATED_TOKENS_CAP = 3_000_000
+
+    # ollama (gemma2) 経路で露出する MCP ツールの許可リスト。
+    # gemma2:9b は tool 選択が弱いので、 対話に役立つ最小限だけに絞る。
+    OLLAMA_ALLOWED_TOOL_NAMES = {
+        # 基本検索・調査
+        "system_brief", "system_topics", "system_lookup", "vector_search",
+        "search_rag", "retrieve_chunks", "search_temporal", "explore_related",
+        "graph_query", "opensearch_search",
+        # 人物・プロジェクト
+        "list_persons", "search_persons", "get_person_detail",
+        "list_projects", "get_project",
+        # 自分の情報
+        "whoami", "my_acl", "get_user_info",
+    }
+
+    # chat-scoped tool (チャット UI 専用、 MCP 経由ではなく直接 python で実装)。
+    # これらは MCP の call_tool 経由ではなく _execute_chat_scoped_tool で実行される。
+    CHAT_SCOPED_TOOL_NAMES = {
+        "list_my_chat_threads",
+        "read_chat_thread_messages",
+        "search_my_chat_history",
+        "search_topic_chunks",
+        "lookup_topic_chunk_range",
+    }
+
+    # chat-scoped tool のスキーマ定義 (MCP tool と並べて Claude/gemma2 に露出する用)。
+    # input_schema は MCP 互換の JSON Schema。
+    CHAT_SCOPED_TOOL_SCHEMAS = [
+        {
+            "name": "list_my_chat_threads",
+            "description": (
+                "自分の過去のチャットスレッドを一覧する (list_my_chat_threads)。"
+                " 新しい順に thread_id/title/last_message_at/message_count を返す。"
+                " 「過去の会話」「以前のスレッド」「履歴」などの質問に使う。"
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "取得件数 (default 10、 max 50)",
+                        "default": 10,
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "何件目から取得するか (ページング用、 default 0)",
+                        "default": 0,
+                    },
+                    "project_id": {
+                        "type": "string",
+                        "description": "特定プロジェクトのスレッドだけに絞る (空ならプロジェクト無し含めて全部)",
+                    },
+                    "include_archived": {
+                        "type": "boolean",
+                        "description": "アーカイブ済みも含めるか (default false)",
+                        "default": False,
+                    },
+                },
+            },
+        },
+        {
+            "name": "read_chat_thread_messages",
+            "description": (
+                "指定スレッドのメッセージを時系列順に返す (read_chat_thread_messages)。"
+                " list_my_chat_threads で得た thread_id を渡す。"
+                " role/content/created_at/tool_calls_count/cost_usd を含む。"
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "thread_id": {
+                        "type": "string",
+                        "description": "対象スレッド ID (list_my_chat_threads の返り値から)",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "取得件数 (default 50、 max 200)",
+                        "default": 50,
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "何件目から取得するか (ページング用、 default 0)",
+                        "default": 0,
+                    },
+                },
+                "required": ["thread_id"],
+            },
+        },
+        {
+            "name": "search_my_chat_history",
+            "description": (
+                "自分のチャット履歴 (全スレッド横断) を全文検索する (search_my_chat_history)。"
+                " タイトルと本文を kuromoji analyzer で検索。 スレッドごとに最新 1 件の"
+                " マッチを返す (thread_id/thread_title/matched_content/message_role)。"
+                " 「以前〇〇について話したやつ」 「〇〇のスレッドどれだっけ」 などに使う。"
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "検索クエリ (日本語 / 英語 / 混在可)",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "取得スレッド数 (default 10、 max 30)",
+                        "default": 10,
+                    },
+                    "project_id": {
+                        "type": "string",
+                        "description": "特定プロジェクトのスレッドだけに絞る (空ならプロジェクト無し含めて全部)",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+        {
+            "name": "search_topic_chunks",
+            "description": (
+                "指定 topic 内のチャンク (前後 context 行つき) を vector 検索する"
+                " (search_topic_chunks)。 大きな topic (概念まとめ系・技術仕様系) の"
+                " 中から関連箇所だけをピンポイントで返す。 topic_id は system_topics や"
+                " system_lookup で見つけたものを使う。 chunk_id/content/score を返す。"
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "topic_id": {
+                        "type": "string",
+                        "description": "対象 topic の id (例: openspoke_hub_composition_20260906)",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "topic 内で何を探すか (日本語 / 英語)",
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "description": "返すチャンク数 (default 5、 max 20)",
+                        "default": 5,
+                    },
+                },
+                "required": ["topic_id", "query"],
+            },
+        },
+        {
+            "name": "lookup_topic_chunk_range",
+            "description": (
+                "指定 topic のチャンク番号の範囲を取得する (lookup_topic_chunk_range)。"
+                " search_topic_chunks で見つけたチャンクの前後をもっと広く見たいときに使う。"
+                " chunk_id ではなく seq (そのチャンクが topic 内の何番目か) で指定する。"
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "topic_id": {
+                        "type": "string",
+                        "description": "対象 topic の id",
+                    },
+                    "start_seq": {
+                        "type": "integer",
+                        "description": "開始チャンク番号 (0-based)",
+                        "default": 0,
+                    },
+                    "end_seq": {
+                        "type": "integer",
+                        "description": "終了チャンク番号 (exclusive、 default は start_seq + 5)",
+                    },
+                },
+                "required": ["topic_id"],
+            },
+        },
+    ]
+
+    # ----------------------------------------------------------------------
+    # 共通 util: ISO 8601 UTC 時刻、 UUID 生成
+    # ----------------------------------------------------------------------
+
+    def _now_iso() -> str:
+        return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace(
+            "+00:00", "Z",
+        )
+
+    def _gen_id() -> str:
+        return str(uuid.uuid4())
+
+
+    # ----------------------------------------------------------------------
+    # OpenSearch (kernel 内の opensearch_app 経由) 操作 util
+    # ----------------------------------------------------------------------
+    # kernel 本体が opensearch namespace の OpenSearch にアクセスする HTTP ラッパ
+    # (opensearch_app.py の _os_post など) を直接使えないので、 HTTP で kernel 内の
+    # 既存エンドポイント (/core/opensearch/*) を叩いて実質同じ処理をする。
+    # こうすることで本モジュールは opensearch 操作の実装詳細に依存しない。
+
+    def _os_post(url: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        """kernel 内の /core/opensearch/raw-post を叩いて OpenSearch に POST。"""
+        try:
+            with httpx.Client(timeout=30.0) as cli:
+                r = cli.post(
+                    "http://127.0.0.1:8000/core/opensearch/raw-post",
+                    json={"url_path": url, "body": body},
+                )
+                r.raise_for_status()
+                return r.json()
+        except Exception as e:
+            logger.error(f"[CHAT] _os_post {url} failed: {e}", exc_info=True)
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+    def _os_get(url: str) -> Dict[str, Any]:
+        """kernel 内の /core/opensearch/raw-get を叩いて OpenSearch に GET。"""
+        try:
+            with httpx.Client(timeout=30.0) as cli:
+                r = cli.get(
+                    "http://127.0.0.1:8000/core/opensearch/raw-get",
+                    params={"url_path": url},
+                )
+                r.raise_for_status()
+                return r.json()
+        except Exception as e:
+            logger.error(f"[CHAT] _os_get {url} failed: {e}", exc_info=True)
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+    def _os_delete(url: str) -> Dict[str, Any]:
+        """kernel 内の /core/opensearch/raw-delete を叩いて OpenSearch に DELETE。"""
+        try:
+            with httpx.Client(timeout=30.0) as cli:
+                r = cli.delete(
+                    "http://127.0.0.1:8000/core/opensearch/raw-delete",
+                    params={"url_path": url},
+                )
+                r.raise_for_status()
+                return r.json()
+        except Exception as e:
+            logger.error(f"[CHAT] _os_delete {url} failed: {e}", exc_info=True)
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+    # ----------------------------------------------------------------------
+    # インデックス初期化
+    # ----------------------------------------------------------------------
+    # chat_threads / chat_messages インデックスは app 起動時に _ensure_indexes
+    # を呼んで idempotent に作成する。 既存であれば何もしない。
+
+    def _ensure_indexes():
+        """chat_threads / chat_messages インデックスが無ければ作る。"""
+        _ensure_threads_index()
+        _ensure_messages_index()
+
+
+    def _ensure_threads_index():
+        """chat_threads インデックスの mapping を保証。"""
+        head = _os_get(f"/{CHAT_THREADS_INDEX}")
+        if head.get("ok"):
+            return  # 既存
+        body = {
+            "settings": {"number_of_shards": 1, "number_of_replicas": 0},
+            "mappings": {
+                "properties": {
+                    "id": {"type": "keyword"},
+                    "owner": {"type": "keyword"},
+                    "title": {
+                        "type": "text",
+                        "analyzer": "kuromoji",
+                        "fields": {"keyword": {"type": "keyword"}},
+                    },
+                    "model": {"type": "keyword"},
+                    "project_id": {"type": "keyword"},
+                    "status": {"type": "keyword"},  # active | archived | deleted
+                    "created_at": {"type": "date"},
+                    "updated_at": {"type": "date"},
+                    "last_message_id": {"type": "keyword"},
+                    "last_message_at": {"type": "date"},
+                    "message_count": {"type": "integer"},
+                    "total_input_tokens": {"type": "long"},
+                    "total_output_tokens": {"type": "long"},
+                    "total_cost_usd": {"type": "double"},
+                },
+            },
+        }
+        res = _os_post(f"/{CHAT_THREADS_INDEX}", body)
+        if res.get("ok"):
+            logger.info(f"[CHAT] created index {CHAT_THREADS_INDEX}")
+        else:
+            logger.warning(f"[CHAT] failed to create index {CHAT_THREADS_INDEX}: {res}")
+
+
+    def _ensure_messages_index():
+        """chat_messages インデックスの mapping を保証。"""
+        head = _os_get(f"/{CHAT_MESSAGES_INDEX}")
+        if head.get("ok"):
+            return  # 既存
+        body = {
+            "settings": {"number_of_shards": 1, "number_of_replicas": 0},
+            "mappings": {
+                "properties": {
+                    "id": {"type": "keyword"},
+                    "thread_id": {"type": "keyword"},
+                    "role": {"type": "keyword"},
+                    "content": {
+                        "type": "text",
+                        "analyzer": "kuromoji",
+                    },
+                    "created_at": {"type": "date"},
+                    "edited_at": {"type": "date"},
+                    "deleted": {"type": "boolean"},
+                    "parent_message_id": {"type": "keyword"},
+                    "model": {"type": "keyword"},
+                    "input_tokens": {"type": "integer"},
+                    "output_tokens": {"type": "integer"},
+                    "cache_write_tokens": {"type": "integer"},
+                    "cache_read_tokens": {"type": "integer"},
+                    "cost_usd": {"type": "double"},
+                    "tool_calls": {"type": "object", "enabled": False},
+                    "injected_topics": {"type": "object", "enabled": False},
+                    "stop_reason": {"type": "keyword"},
+                },
+            },
+        }
+        res = _os_post(f"/{CHAT_MESSAGES_INDEX}", body)
+        if res.get("ok"):
+            logger.info(f"[CHAT] created index {CHAT_MESSAGES_INDEX}")
+        else:
+            logger.warning(f"[CHAT] failed to create index {CHAT_MESSAGES_INDEX}: {res}")
+
+
+    # ----------------------------------------------------------------------
+    # Jev KB 外部脳 (claude.ai の対話 Claude 用) 用の topic 検索と埋め込み
+    # ----------------------------------------------------------------------
+
+    def _get_neo4j_driver():
+        """main.py が持つ neo4j_driver を遅延 import で取得。 なければ None。"""
+        try:
+            from main import neo4j_driver
+            return neo4j_driver
+        except Exception as e:
+            logger.warning(f"[CHAT/SEARCH] neo4j_driver import failed: {e}")
+            return None
+
+
+    def _memgraph_list_recent_topics(limit: int) -> List[Dict[str, Any]]:
+        """Memgraph から新しい順に topic を limit 件取得する。"""
+        _neo4j_driver = _get_neo4j_driver()
+        if _neo4j_driver is None:
+            logger.warning("[CHAT/SEARCH] neo4j_driver is None (fallback to empty)")
+            return []
+        try:
+            from main import neo4j_driver as _driver_check
+            if _driver_check is None:
+                return []
+        except Exception as e:
+            logger.warning(f"[CHAT/SEARCH] neo4j_driver import failed: {e}")
+            return []
+        if _neo4j_driver is None:
+            logger.warning("[CHAT/SEARCH] neo4j_driver is None")
+            return []
+        cypher = (
+            "MATCH (t:Topic) "
+            "RETURN t.id AS id, t.title AS title, t.summ
