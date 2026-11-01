@@ -1,0 +1,21 @@
+# .yamllint.yml
+# Relaxed rules matched to the current state of the repository.
+# Purpose: catch syntax errors and gross formatting mistakes without
+# flagging every stylistic choice in existing manifests.
+
+extends: default
+
+ignore: |
+  .git/
+
+rules:
+  line-length: disable
+  comments: disable
+  indentation:
+    spaces: 2
+    indent-sequences: consistent
+  empty-lines: disable
+  trailing-spaces: disable
+  document-start: disable
+  truthy: disable
+  new-line-at-end-of-file: disable

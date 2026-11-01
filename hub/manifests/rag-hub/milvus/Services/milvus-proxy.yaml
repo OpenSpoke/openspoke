@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: milvus-proxy
+  namespace: milvus
+spec:
+  internalTrafficPolicy: Cluster
+  ipFamilies:
+    - IPv4
+  ipFamilyPolicy: SingleStack
+  ports:
+    - name: grpc
+      port: 19530
+      protocol: TCP
+      targetPort: 19530
+    - name: metrics
+      port: 9091
+      protocol: TCP
+      targetPort: 9091
+  selector:
+    app: milvus-proxy
+  sessionAffinity: None
+  type: ClusterIP

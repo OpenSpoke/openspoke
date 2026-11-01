@@ -1,0 +1,788 @@
+/*  OpenSpoke 管理ダッシュボード — 見た目の決まり
+ *
+ *  方針
+ *    - 見た目の部品 (Vuetify / Tailwind 等) を持ち込まない。ここだけで決める
+ *    - 色は意味にだけ使う。飾りに使わない
+ *    - 基調は墨色。差し色は 1 つ (青緑)。状態の色は 4 つだけ
+ *    - 階層は大きさと余白で作る。色では作らない
+ *    - 数値と識別子は等幅。桁が揃って読める
+ */
+
+:root {
+  /*  地と面。奥から手前へ 4 段 */
+  --bg: #0d1014;
+  --surface: #141920;
+  --surface-2: #1b212a;
+  --surface-3: #232b36;
+
+  /*  境界。濃淡 2 段 */
+  --line: #283240;
+  --line-soft: #1e252f;
+
+  /*  文字。主・副・薄の 3 段 */
+  --ink: #e6eaf0;
+  --ink-2: #9aa5b4;
+  --ink-3: #6b7685;
+
+  /*  差し色。ここだけが彩度を持つ */
+  --accent: #35c2b0;
+  --accent-ink: #062521;
+  --accent-soft: rgba(53, 194, 176, 0.14);
+
+  /*  状態。この 4 色以外を状態に使わない */
+  --run: #4c8dff;
+  --ok: #2e9e5b;
+  --ng: #d9534f;
+  --idle: #7b8594;
+
+  /*  間隔。4 の倍数で揃える */
+  --s1: 4px;
+  --s2: 8px;
+  --s3: 12px;
+  --s4: 16px;
+  --s5: 24px;
+  --s6: 32px;
+  --s7: 48px;
+
+  --radius: 10px;
+  --radius-sm: 6px;
+
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.22);
+
+  --sans: "Hiragino Sans", "Noto Sans JP", "Yu Gothic", system-ui, sans-serif;
+  --mono: "SFMono-Regular", "SF Mono", Menlo, Consolas, "Noto Sans Mono", monospace;
+
+  --sidebar-w: 232px;
+}
+
+/*  明るい地を好む人に合わせる。意味の割り当ては変えない */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg: #f5f7fa;
+    --surface: #ffffff;
+    --surface-2: #eef1f6;
+    --surface-3: #e3e8ef;
+    --line: #d4dae3;
+    --line-soft: #e6eaf0;
+    --ink: #1b212a;
+    --ink-2: #566070;
+    --ink-3: #8b94a3;
+    --accent: #11867a;
+    --accent-ink: #ffffff;
+    --accent-soft: rgba(17, 134, 122, 0.1);
+    --shadow: 0 1px 2px rgba(16, 24, 40, 0.06), 0 8px 24px rgba(16, 24, 40, 0.08);
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#__nuxt {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+}
+
+/*  見出し。色ではなく大きさと字詰めで段を作る */
+h1,
+h2,
+h3 {
+  margin: 0;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+h1 {
+  font-size: 23px;
+}
+h2 {
+  font-size: 16px;
+}
+h3 {
+  font-size: 14px;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+code,
+pre,
+.mono {
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+
+/* ============================================================
+ *  骨組み
+ * ============================================================ */
+
+.shell {
+  display: flex;
+  min-height: 100vh;
+}
+
+.main {
+  flex: 1;
+  min-width: 0;
+  padding: var(--s6) var(--s6) var(--s7);
+}
+
+.page-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--s4);
+  padding-bottom: var(--s4);
+  margin-bottom: var(--s5);
+  border-bottom: 1px solid var(--line);
+}
+
+.page-head .sub {
+  margin-top: var(--s1);
+  color: var(--ink-3);
+  font-size: 12px;
+}
+
+.section {
+  margin-top: var(--s6);
+}
+
+.section > h2 {
+  margin-bottom: var(--s3);
+}
+
+.section-note {
+  margin: 0 0 var(--s3);
+  color: var(--ink-3);
+  font-size: 12px;
+}
+
+/* ============================================================
+ *  横の案内
+ * ============================================================ */
+
+.sidebar {
+  width: var(--sidebar-w);
+  flex: 0 0 var(--sidebar-w);
+  background: var(--surface);
+  border-right: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow-y: auto;
+}
+
+.brand {
+  padding: var(--s5) var(--s4) var(--s4);
+  font-size: 15px;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+}
+
+.brand .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex: 0 0 7px;
+}
+
+.who {
+  padding: 0 var(--s4) var(--s4);
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.who .name {
+  font-size: 12.5px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.who .mail {
+  font-size: 11px;
+  color: var(--ink-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nav {
+  padding: var(--s3) var(--s2);
+  flex: 1;
+}
+
+.nav-group {
+  padding: var(--s3) var(--s3) var(--s1);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+.nav a {
+  display: block;
+  padding: 7px var(--s3);
+  margin: 1px 0;
+  border-radius: var(--radius-sm);
+  color: var(--ink-2);
+  font-size: 13px;
+  text-decoration: none;
+  transition: background 0.12s, color 0.12s;
+}
+
+.nav a:hover {
+  background: var(--surface-2);
+  color: var(--ink);
+  text-decoration: none;
+}
+
+.nav a.on {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.sidebar-foot {
+  padding: var(--s3) var(--s4) var(--s5);
+  border-top: 1px solid var(--line-soft);
+  font-size: 12px;
+}
+
+/* ============================================================
+ *  面と表
+ * ============================================================ */
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: var(--s4);
+}
+
+.card + .card {
+  margin-top: var(--s3);
+}
+
+.grid {
+  display: grid;
+  gap: var(--s3);
+}
+
+.grid-2 {
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+}
+
+.grid-3 {
+  grid-template-columns: repeat(auto-fit, minmax(232px, 1fr));
+}
+
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(136px, 1fr));
+  gap: var(--s3);
+}
+
+.metric {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: var(--s3) var(--s4);
+}
+
+.metric .label {
+  font-size: 11.5px;
+  color: var(--ink-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.metric .value {
+  font-family: var(--mono);
+  font-size: 26px;
+  font-weight: 600;
+  line-height: 1.25;
+  letter-spacing: -0.02em;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+th {
+  text-align: left;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  padding: var(--s2) var(--s3);
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+
+td {
+  padding: var(--s2) var(--s3);
+  border-bottom: 1px solid var(--line-soft);
+  vertical-align: top;
+}
+
+tbody tr:hover td {
+  background: var(--surface-2);
+}
+
+td.num,
+th.num {
+  text-align: right;
+  font-family: var(--mono);
+}
+
+/* ============================================================
+ *  部品
+ * ============================================================ */
+
+button,
+.btn {
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 550;
+  padding: 7px var(--s4);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--ink);
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s, opacity 0.12s;
+}
+
+button:hover:not(:disabled),
+.btn:hover {
+  background: var(--surface-3);
+  border-color: var(--ink-3);
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+}
+
+button.primary:hover:not(:disabled) {
+  filter: brightness(1.08);
+  border-color: var(--accent);
+}
+
+button.quiet {
+  background: transparent;
+}
+
+button.danger {
+  color: var(--ng);
+  border-color: var(--ng);
+  background: transparent;
+}
+
+button.danger:hover:not(:disabled) {
+  background: rgba(217, 83, 79, 0.1);
+  border-color: var(--ng);
+}
+
+button.sm {
+  font-size: 12px;
+  padding: 4px var(--s3);
+}
+
+input,
+select,
+textarea {
+  font-family: inherit;
+  font-size: 13px;
+  padding: 7px var(--s3);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--ink);
+  width: 100%;
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+label {
+  display: block;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--ink-2);
+  margin-bottom: var(--s1);
+}
+
+.field + .field {
+  margin-top: var(--s3);
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  flex-wrap: wrap;
+}
+
+.row.end {
+  justify-content: flex-end;
+}
+
+.spacer {
+  flex: 1;
+}
+
+/*  状態のタグ。色は 4 つの状態にだけ対応する */
+.tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 2px var(--s2);
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  white-space: nowrap;
+}
+
+.tag::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.tag.run {
+  color: var(--run);
+}
+.tag.ok {
+  color: var(--ok);
+}
+.tag.ng {
+  color: var(--ng);
+}
+.tag.idle {
+  color: var(--idle);
+}
+
+.tag.plain {
+  color: var(--ink-3);
+  border-color: var(--line);
+}
+
+.tag.plain::before {
+  display: none;
+}
+
+/*  動いていることを示す脈。色は使わず明るさだけで表す */
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.tag.run::before {
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+.muted {
+  color: var(--ink-3);
+}
+
+.small {
+  font-size: 12px;
+}
+
+pre.log {
+  margin: 0;
+  padding: var(--s3);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  max-height: 420px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--ink-2);
+  line-height: 1.5;
+}
+
+/*  報せ。4 つの状態の色をそのまま使う */
+.note {
+  padding: var(--s3) var(--s4);
+  border-radius: var(--radius-sm);
+  border-left: 3px solid var(--line);
+  background: var(--surface);
+  font-size: 13px;
+  margin-bottom: var(--s4);
+}
+
+.note.ok {
+  border-left-color: var(--ok);
+}
+.note.ng {
+  border-left-color: var(--ng);
+}
+.note.info {
+  border-left-color: var(--run);
+}
+
+/*  開閉。details を使うので JavaScript を要さない */
+details.fold {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  margin-bottom: var(--s2);
+  overflow: hidden;
+}
+
+details.fold > summary {
+  padding: var(--s3) var(--s4);
+  cursor: pointer;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  list-style: none;
+}
+
+details.fold > summary::-webkit-details-marker {
+  display: none;
+}
+
+details.fold > summary::before {
+  content: "›";
+  color: var(--ink-3);
+  font-size: 15px;
+  transition: transform 0.15s;
+  flex: 0 0 8px;
+}
+
+details.fold[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+details.fold > summary:hover {
+  background: var(--surface-2);
+}
+
+details.fold > .body {
+  padding: 0 var(--s4) var(--s4);
+  border-top: 1px solid var(--line-soft);
+  padding-top: var(--s3);
+}
+
+/*  切り替え */
+.switch {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s2);
+  font-size: 12.5px;
+  color: var(--ink-2);
+  cursor: pointer;
+  user-select: none;
+}
+
+.switch input {
+  width: auto;
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.segmented {
+  display: inline-flex;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.segmented button {
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  font-size: 12px;
+  padding: 5px var(--s3);
+  color: var(--ink-2);
+}
+
+.segmented button.on {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.segmented button + button {
+  border-left: 1px solid var(--line);
+}
+
+/*  時間軸 */
+.tl-row {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  margin: 3px 0;
+}
+
+.tl-name {
+  width: 272px;
+  flex: 0 0 272px;
+  font-size: 12.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tl-track {
+  flex: 1;
+  position: relative;
+  height: 18px;
+  background: var(--surface-2);
+  border-radius: var(--radius-sm);
+  min-width: 0;
+}
+
+.tl-bar {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  min-width: 4px;
+  border-radius: var(--radius-sm);
+}
+
+.tl-bar.run {
+  background: var(--run);
+  background-image: repeating-linear-gradient(
+    45deg,
+    rgba(255, 255, 255, 0.22) 0 6px,
+    rgba(255, 255, 255, 0) 6px 12px
+  );
+}
+
+.tl-bar.ok {
+  background: var(--ok);
+}
+.tl-bar.ng {
+  background: var(--ng);
+}
+.tl-bar.idle {
+  background: var(--idle);
+}
+
+.tl-dur {
+  width: 80px;
+  flex: 0 0 80px;
+  text-align: right;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink-2);
+}
+
+.tl-ticks {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--ink-3);
+  font-family: var(--mono);
+}
+
+.legend {
+  display: flex;
+  gap: var(--s4);
+  margin-top: var(--s3);
+  font-size: 11.5px;
+  color: var(--ink-3);
+}
+
+.legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.legend i {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  display: inline-block;
+}
+
+/*  狭い画面 */
+@media (max-width: 860px) {
+  .shell {
+    flex-direction: column;
+  }
+
+  .sidebar {
+    width: 100%;
+    flex: none;
+    height: auto;
+    position: static;
+    border-right: none;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .nav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--s1);
+  }
+
+  .nav-group {
+    display: none;
+  }
+
+  .main {
+    padding: var(--s4) var(--s4) var(--s6);
+  }
+
+  .tl-name {
+    width: 148px;
+    flex: 0 0 148px;
+  }
+}

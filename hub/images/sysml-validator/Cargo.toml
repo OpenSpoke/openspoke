@@ -1,0 +1,18 @@
+[package]
+name = "sysml-validator"
+version = "0.1.0"
+edition = "2021"
+description = "OpenSpoke の知識ベースに書く SysML v2 本文を、構文チェッカー (sysml2) とバリデーター (mercurio-sysml) で調べる HTTP サービス"
+publish = false
+
+[dependencies]
+sysml2 = "=0.3.1"
+mercurio-sysml = "=0.86.0"
+tiny_http = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+strip = true

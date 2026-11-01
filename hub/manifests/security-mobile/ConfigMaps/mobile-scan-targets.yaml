@@ -1,0 +1,69 @@
+---
+# Vulnerability-scan targets managed per OpenSpoke module.
+#
+# module_id lines up with the ledger's category/module_name so the ACL check
+# is_module_allowed(scope, module_id) can filter results per viewer.
+# Each module may hold multiple mobile apps (iOS and/or Android).
+#
+# Add or remove entries here and let GitOps reconcile.
+#
+# Both the source scanner (mobile-scan) and the binary scanner
+# (mobile-binary-scan) read the same list. The binary scanner locates a
+# build artifact on the native spoke by bundle_id (iOS) or package_name
+# (Android; an applicationIdSuffix variant is treated as a match) and scans
+# the most recent one. Apps with no artifact are skipped. Set binary: false
+# on an app to exclude it from the binary path.
+#
+# The entries below are illustrative placeholders. Replace them with your
+# own modules before rolling out.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mobile-scan-targets
+  namespace: security-mobile
+  labels:
+    purpose: mobile-vulnerability-scan-targets
+data:
+  targets.yaml: |
+    modules:
+      # Example: an authentication service that ships iOS and Android
+      # companion apps from the same repository.
+      - module_id: Application/example-org/auth-app/auth-app
+        display_name: Example Auth App
+        repo: example-org/auth-app
+        enabled: false
+        apps:
+          - name: Auth App iOS
+            platform: ios
+            subpath: ios/AuthApp
+            bundle_id: com.example.authapp
+            app_version: "1.0.0"
+          - name: Auth App Android
+            platform: android
+            subpath: android/AuthApp
+            package_name: com.example.authapp
+            app_version: "1.0.0"
+
+      # Example: a customer-facing storefront with separate iOS and Android
+      # implementations sitting in the same monorepo.
+      - module_id: Application/example-org/storefront/StorefrontIos
+        display_name: Example Storefront iOS
+        repo: example-org/storefront
+        enabled: false
+        apps:
+          - name: Storefront iOS
+            platform: ios
+            subpath: ios
+            bundle_id: com.example.storefront
+            app_version: "0.1.0"
+
+      - module_id: Application/example-org/storefront/StorefrontAndroid
+        display_name: Example Storefront Android
+        repo: example-org/storefront
+        enabled: false
+        apps:
+          - name: Storefront Android
+            platform: android
+            subpath: android
+            package_name: com.example.storefront
+            app_version: "0.1.0"

@@ -1,0 +1,48 @@
+[package]
+name = "tunnel-client"
+version = "0.1.0"
+edition = "2021"
+description = "OpenSpoke spoke -> hub reverse tunnel client (Rust implementation)"
+
+[dependencies]
+# gRPC bidirectional streaming + TLS (rustls + webpki-roots).
+# Routing TLS through rustls means the runtime image (distroless/
+# cc-debian12:nonroot) does not need to carry a system CA store.
+tonic = { version = "0.12", default-features = false, features = [
+    "transport",
+    "codegen",
+    "prost",
+    "tls",
+    "tls-webpki-roots",
+] }
+prost = "0.13"
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "net",
+    "sync",
+    "time",
+    "io-util",
+] }
+tokio-stream = "0.1"
+
+# HTTP proxy mode (activated when KERNEL_PROXY_LISTEN is set).
+# axum 0.8 shares the same hyper 1.x that tonic 0.12 uses.
+axum = "0.8"
+
+# Structured logging. Emits JSON to stdout to match the previous
+# Go implementation's slog JSON handler.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+[build-dependencies]
+tonic-build = { version = "0.12", default-features = false, features = [
+    "transport",
+    "prost",
+] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

@@ -1,0 +1,437 @@
+---
+# Phase 4 段階 3: scan-runner Python スクリプト
+# 動作: mobile-scan-targets の targets.yaml を読み、 enabled=true の各対象に
+# ついて GitHub から shallow clone → mobile_scan.py 実行 → 結果を kernel
+# `/core/security/events` に POST する。
+# Mac / MCP 依存なし。 純粋な K8s 内実行 (git + python3 + urllib のみ)。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mobile-scan-runner
+  namespace: security-mobile
+  labels:
+    purpose: mobile-vulnerability-scan-runner
+data:
+  scan_runner.py: |
+    #!/usr/bin/env python3
+    """
+    モバイルアプリスキャン runner (Phase 4 段階 3)。
+
+    Fleet モジュール security-mobile 内の K8s Job / CronJob として動作する。
+
+    処理:
+      1. /config/targets.yaml から scan targets 読み込み
+      2. enabled: true の各 target について:
+         a. GITHUB_TOKEN で target.repo を /tmp/scan/<repo-slug> に shallow clone
+         b. /scripts/mobile_scan.py を subprocess 呼び出し
+         c. stdout の JSON を parse
+         d. kernel `/core/security/events` に POST
+      3. summary を stdout に書く
+
+    環境変数:
+      KERNEL_URL           : kernel Service URL
+                             (default: http://rag-backend-kernel.rag-company1.svc.cluster.local:8000)
+      TARGETS_CONFIG_PATH  : targets.yaml (default: /config/targets.yaml)
+      SCANNER_SCRIPT_PATH  : mobile_scan.py (default: /scripts/mobile_scan.py)
+      DRY_RUN              : "true" なら POST を skip して JSON を stdout に流すのみ
+
+    認証:
+      GitHub PAT は K8s Secret ではなく OpenSearch `git_credentials` に集約管理される
+      (git_credentials_store_design_20260914 参照)。 runner は kernel の
+      内部 endpoint `POST /core/git_credentials/github/org/{owner}/token` から
+      target ごとに owner の PAT を fetch して git clone に使う。 fetch は
+      per-owner に cache する (last_used_at が過剰 bump しないため)。
+    """
+    import json
+    import os
+    import shutil
+    import subprocess
+    import sys
+    import tempfile
+    import urllib.request
+    import urllib.error
+    from datetime import datetime, timezone
+    from pathlib import Path
+    from urllib.parse import quote
+
+    import yaml  # PyYAML
+
+    TARGETS_CONFIG_PATH = os.environ.get("TARGETS_CONFIG_PATH", "/config/targets.yaml")
+    SCANNER_SCRIPT_PATH = os.environ.get("SCANNER_SCRIPT_PATH", "/scripts/mobile_scan.py")
+    KERNEL_URL = os.environ.get(
+        "KERNEL_URL",
+        "http://rag-backend-kernel.rag-company1.svc.cluster.local:8000",
+    )
+    DRY_RUN = os.environ.get("DRY_RUN", "").lower() == "true"
+
+    # owner (GitHub org) 別の PAT cache。 fetch_github_token が populate する。
+    _token_cache: dict = {}
+
+
+    def fetch_github_token(owner: str):
+        """kernel の内部 endpoint から owner の PAT を取得する。 同一 owner は cache する。"""
+        if owner in _token_cache:
+            return _token_cache[owner]
+        url = f"{KERNEL_URL}/core/git_credentials/github/org/{quote(owner)}/token"
+        req = urllib.request.Request(url, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                data = json.loads(r.read())
+                token = data.get("token")
+                if not token:
+                    print(f"[error] git_credentials/{owner}: token not in response", file=sys.stderr)
+                    return None
+                _token_cache[owner] = token
+                return token
+        except urllib.error.HTTPError as e:
+            print(f"[error] git_credentials/{owner} HTTP {e.code}: {e.read().decode()[:200]}", file=sys.stderr)
+            return None
+        except Exception as e:
+            print(f"[error] git_credentials/{owner} {type(e).__name__}: {e}", file=sys.stderr)
+            return None
+
+
+    def clone_repo(owner_repo: str, dest: Path, subpaths: list[str] | None = None) -> bool:
+        """owner_repo を dest に取り込む。 既存なら fetch。
+
+        PAT は kernel の git_credentials 保管庫から owner ごとに取得する。
+
+        subpaths を渡すと **部分取得** になる。
+          - `--filter=blob:none` で中身 (blob) を最初は取らず、
+          - `--sparse` で作業木を根直下だけにしておき、
+          - `git sparse-checkout set <副パス...>` でその副パスの中身だけを取る。
+        リポジトリ全体を取らないので、 大きなリポジトリでも記憶領域と
+        一時領域を食い潰さない。
+
+        これが要る理由: 原本・変換結果・統合アプリを同梱する大きなリポジトリは
+        ShoppingApp 配下に原本・変換結果・統合アプリが全部入っており、
+        `--depth 1` だけでは 512Mi の上限に当たって OOMKilled (終了符号 137)
+        になった (job mobile-scan-manual-20261016)。 検査するのは
+        products/ と Transpile/ の一部だけなので、 そこだけ取れば足りる。
+
+        副パスを渡さない (または部分取得に失敗した) ときは、 従来どおり
+        全部を `--depth 1` で取る。
+        """
+        owner = owner_repo.split("/", 1)[0]
+        token = fetch_github_token(owner)
+        if not token:
+            return False
+        if (dest / ".git").exists():
+            r = subprocess.run(
+                ["git", "-C", str(dest), "fetch", "--depth", "1", "--quiet"],
+                capture_output=True, text=True,
+            )
+            if r.returncode != 0:
+                return False
+            # 同じリポジトリを別モジュールでも検査するとき (例えば
+            # ShoppingApp と ShoppingAppTranspile のように) は、 取り込み済みの
+            # 作業木にその副パスがまだ無い。 部分取得の対象に足す。
+            if subpaths:
+                r2 = subprocess.run(
+                    ["git", "-C", str(dest), "sparse-checkout", "add", *subpaths],
+                    capture_output=True, text=True,
+                )
+                if r2.returncode != 0:
+                    # 部分取得になっていない作業木なら add は使えない。
+                    # その場合は全部入っているので何もしなくてよい。
+                    print(
+                        f"[info] {owner_repo}: 副パスの追加は不要または不可 "
+                        f"({r2.stderr.strip()[:120]})",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[info] {owner_repo}: 副パスを追加 ({len(subpaths)} 件)",
+                        flush=True,
+                    )
+            return True
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        url = f"https://x-access-token:{token}@github.com/{owner_repo}.git"
+
+        def _mask(text: str) -> str:
+            return text.replace(token, "***")
+
+        if subpaths:
+            cmd = [
+                "git", "clone", "--depth", "1", "--quiet",
+                "--filter=blob:none", "--sparse", url, str(dest),
+            ]
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode == 0:
+                # 副パスは必ずディレクトリなので cone 方式でよい。
+                r2 = subprocess.run(
+                    ["git", "-C", str(dest), "sparse-checkout", "set", *subpaths],
+                    capture_output=True, text=True,
+                )
+                if r2.returncode == 0:
+                    print(
+                        f"[info] clone {owner_repo}: 部分取得 "
+                        f"({len(subpaths)} 副パス)",
+                        flush=True,
+                    )
+                    return True
+                print(
+                    f"[warn] clone {owner_repo}: 副パスの取り出しに失敗、 "
+                    f"全部取りに切り替える: {_mask(r2.stderr)[:200]}",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"[warn] clone {owner_repo}: 部分取得に失敗、 "
+                    f"全部取りに切り替える: {_mask(r.stderr)[:200]}",
+                    file=sys.stderr,
+                )
+            # 作りかけを消してから全部取りをやり直す
+            if dest.exists():
+                shutil.rmtree(dest, ignore_errors=True)
+
+        r = subprocess.run(
+            ["git", "clone", "--depth", "1", "--quiet", url, str(dest)],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            # url に token が入っているのでログには出さない
+            err = _mask(r.stderr)
+            print(f"[error] clone {owner_repo}: {err[:200]}", file=sys.stderr)
+            return False
+        return True
+
+
+    def run_scanner(root: Path, target: dict) -> dict | None:
+        """mobile_scan.py を呼んで JSON を返す。"""
+        args = [
+            sys.executable, SCANNER_SCRIPT_PATH,
+            "--root", str(root),
+            "--platform", target["platform"],
+        ]
+        if target.get("app_version"):
+            args += ["--app-version", target["app_version"]]
+        if target.get("bundle_id"):
+            args += ["--bundle-id", target["bundle_id"]]
+        if target.get("package_name"):
+            args += ["--package-name", target["package_name"]]
+        r = subprocess.run(args, capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f"[error] scan failed (rc={r.returncode}): {r.stderr[:200]}", file=sys.stderr)
+            return None
+        try:
+            return json.loads(r.stdout)
+        except json.JSONDecodeError as e:
+            print(f"[error] JSON decode: {e}", file=sys.stderr)
+            return None
+
+
+    def post_event(mobile_detected: dict, module_id) -> str | None:
+        """kernel `/core/security/events` に POST し event_id を返す。
+
+        module_id (台帳の category/module_name) を payload に含めることで
+        user_acl の is_module_allowed 経路で filter できるようにする。
+        """
+        if module_id:
+            mobile_detected = dict(mobile_detected)
+            mobile_detected["module_id"] = module_id
+        body = {
+            "event_type": "detected",
+            "target_type": "mobile_app",
+            "cluster": "rag",
+            "mobile_detected": mobile_detected,
+        }
+        req = urllib.request.Request(
+            f"{KERNEL_URL}/core/security/events",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.loads(r.read())["event_id"]
+        except urllib.error.HTTPError as e:
+            print(f"[error] kernel POST {e.code}: {e.read().decode()[:200]}", file=sys.stderr)
+            return None
+        except Exception as e:
+            print(f"[error] kernel POST: {e}", file=sys.stderr)
+            return None
+
+
+    # 指摘の明細 (detail_findings) の保存先。 event は kernel の vuln_events、
+    # 明細はここ (段階 1 で決めた分離: モバイル用 findings は vuln_findings_mobile)。
+    # Phase 1 のコンテナ検査と同じく OpenSearch に直接書く (kernel は経由しない)。
+    OPENSEARCH_URL = os.environ.get(
+        "OPENSEARCH_URL", "http://opensearch.opensearch.svc.cluster.local:9200")
+    FINDINGS_INDEX = "vuln_findings_mobile"
+    _FINDINGS_MAPPING = {"mappings": {"properties": {
+        "event_id": {"type": "keyword"}, "scan_id": {"type": "keyword"},
+        "scan_kind": {"type": "keyword"}, "module_id": {"type": "keyword"},
+        "app_name": {"type": "keyword"}, "platform": {"type": "keyword"},
+        "bundle_id": {"type": "keyword"}, "package_name": {"type": "keyword"},
+        "app_version": {"type": "keyword"}, "artifact_path": {"type": "keyword"},
+        "finding_type": {"type": "keyword"}, "severity": {"type": "keyword"},
+        "severity_rank": {"type": "integer"},
+        "file": {"type": "keyword"}, "line": {"type": "integer"},
+        "snippet": {"type": "text"}, "description": {"type": "text"},
+        "timestamp": {"type": "date"},
+    }}}
+    _SEV_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+    _findings_index_ready = False
+
+
+    def _os_call(method: str, path: str, body=None, ndjson=None) -> dict:
+        if ndjson is not None:
+            data, ctype = ndjson.encode(), "application/x-ndjson"
+        else:
+            data = json.dumps(body).encode() if body is not None else None
+            ctype = "application/json"
+        req = urllib.request.Request(f"{OPENSEARCH_URL}{path}", data=data, method=method,
+                                     headers={"Content-Type": ctype})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            raw = r.read()
+        return json.loads(raw) if raw else {}
+
+
+    def _ensure_findings_index() -> None:
+        global _findings_index_ready
+        if _findings_index_ready:
+            return
+        try:
+            _os_call("HEAD", f"/{FINDINGS_INDEX}")
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise
+            try:
+                _os_call("PUT", f"/{FINDINGS_INDEX}", _FINDINGS_MAPPING)
+            except urllib.error.HTTPError as e2:
+                if e2.code != 400:  # 400 = 同時に作られた (resource_already_exists)
+                    raise
+        _findings_index_ready = True
+
+
+    def index_findings(findings: list, event_id: str, module_id, md: dict,
+                       app_name: str, scan_kind: str) -> int:
+        """指摘の明細を 1 件 1 文書で保存する。 _id は event_id-連番 (再実行しても重複しない)。
+        失敗しても event は登録済みなので警告だけ出して続ける。"""
+        if not findings:
+            return 0
+        try:
+            _ensure_findings_index()
+            ts = datetime.now(timezone.utc).isoformat()
+            common = {
+                "event_id": event_id, "scan_id": md.get("scan_id"), "scan_kind": scan_kind,
+                "module_id": module_id, "app_name": app_name, "platform": md.get("platform"),
+                "bundle_id": md.get("bundle_id"), "package_name": md.get("package_name"),
+                "app_version": md.get("app_version"), "artifact_path": md.get("artifact_path"),
+                "timestamp": ts,
+            }
+            lines = []
+            for i, f in enumerate(findings):
+                sev = f.get("severity") or "info"
+                doc = dict(common)
+                doc.update({
+                    "finding_type": f.get("finding_type"), "severity": sev,
+                    "severity_rank": _SEV_RANK.get(sev, 5),
+                    "file": f.get("file"), "line": int(f.get("line") or 0),
+                    "snippet": str(f.get("snippet") or "")[:1000],
+                    "description": str(f.get("description") or "")[:1000],
+                })
+                lines.append(json.dumps({"index": {"_index": FINDINGS_INDEX,
+                                                   "_id": f"{event_id}-{i:04d}"}}))
+                lines.append(json.dumps(doc, ensure_ascii=False))
+            res = _os_call("POST", "/_bulk?refresh=true", ndjson="\n".join(lines) + "\n")
+            if res.get("errors"):
+                bad = [it for it in res.get("items", []) if it.get("index", {}).get("error")]
+                print(f"[warn] 明細の一部が保存できない ({event_id}): "
+                      f"{len(bad)} 件、 例 {str(bad[:1])[:300]}", file=sys.stderr)
+                return len(findings) - len(bad)
+            return len(findings)
+        except Exception as e:
+            print(f"[warn] 明細の保存に失敗 ({event_id}): {type(e).__name__}: {e}", file=sys.stderr)
+            return 0
+
+
+    def main():
+        if not Path(TARGETS_CONFIG_PATH).exists():
+            print(f"[fatal] targets config 無し: {TARGETS_CONFIG_PATH}", file=sys.stderr)
+            sys.exit(2)
+        if not Path(SCANNER_SCRIPT_PATH).exists():
+            print(f"[fatal] scanner script 無し: {SCANNER_SCRIPT_PATH}", file=sys.stderr)
+            sys.exit(2)
+
+        with open(TARGETS_CONFIG_PATH) as f:
+            config = yaml.safe_load(f)
+
+        modules = [m for m in config.get("modules", []) if m.get("enabled")]
+        # 横断集計用に app 件数も数える
+        total_apps = sum(len(m.get("apps", [])) for m in modules)
+        print(f"[info] {len(modules)} module(s) enabled ({total_apps} apps), dry_run={DRY_RUN}", flush=True)
+
+        workdir = Path(tempfile.mkdtemp(prefix="mobile-scan-"))
+        print(f"[info] workdir: {workdir}", flush=True)
+
+        ok = 0
+        fail = 0
+        for module in modules:
+            module_id = module.get("module_id")
+            display_name = module.get("display_name") or module_id or "?"
+            repo = module.get("repo")
+            print(f"[info] module={module_id} ({display_name}) repo={repo}", flush=True)
+            if not repo:
+                print(f"[error] {module_id}: repo 未設定", file=sys.stderr)
+                fail += len(module.get("apps", []))
+                continue
+
+            # 1. clone (モジュール内 apps で共通)
+            # 検査するのは apps の副パスだけなので、 その一覧を渡して
+            # 部分取得させる (大きなリポジトリで記憶領域を食い潰さないため)。
+            repo_dir = workdir / repo.replace("/", "_")
+            subpaths = [
+                a["subpath"] for a in module.get("apps", []) if a.get("subpath")
+            ]
+            if not clone_repo(repo, repo_dir, subpaths):
+                fail += len(module.get("apps", []))
+                continue
+
+            for target in module.get("apps", []):
+                name = target["name"]
+                subpath = target["subpath"]
+                print(f"[info]   scanning {name} (subpath={subpath})", flush=True)
+
+                # 2. scan
+                scan_root = repo_dir / subpath
+                if not scan_root.is_dir():
+                    print(f"[error]   subpath not exist: {scan_root}", file=sys.stderr)
+                    fail += 1
+                    continue
+                result = run_scanner(scan_root, target)
+                if result is None:
+                    fail += 1
+                    continue
+
+                total = result.get("total_findings", 0)
+                severity = result["mobile_detected"].get("severity_counts", {})
+
+                # 3. POST to kernel (dry_run なら skip)
+                if DRY_RUN:
+                    print(f"[dry-run]   {name}: total={total} severity={severity}", flush=True)
+                    ok += 1
+                    continue
+
+                event_id = post_event(result["mobile_detected"], module_id)
+                if event_id is None:
+                    fail += 1
+                    continue
+                n_saved = index_findings(result.get("detail_findings") or [], event_id,
+                                         module_id, result["mobile_detected"], name, "source")
+                print(f"[info]   明細 {n_saved} 件を {FINDINGS_INDEX} に保存", flush=True)
+
+                print(
+                    f"[ok]   {name}: total={total} severity={severity} "
+                    f"event_id={event_id}",
+                    flush=True,
+                )
+                ok += 1
+
+        print(f"[summary] ok={ok} fail={fail}", flush=True)
+        sys.exit(0 if fail == 0 else 1)
+
+
+    if __name__ == "__main__":
+        main()

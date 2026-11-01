@@ -1,0 +1,69 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    workload.user.cattle.io/workloadselector: apps.deployment-milvus-minio
+  name: minio
+  namespace: milvus
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      workload.user.cattle.io/workloadselector: apps.deployment-milvus-minio
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: minio
+        workload.user.cattle.io/workloadselector: apps.deployment-milvus-minio
+      name: minio
+      namespace: milvus
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: rag-type
+                    operator: In
+                    values:
+                      - milvus
+      containers:
+        - args:
+            - server
+            - /data
+            - '--address'
+            - '0.0.0.0:9000'
+          env:
+            - name: SILO_ACCESS_KEY_ID
+              value: minioadmin
+            - name: SILO_SECRET_ACCESS_KEY
+              value: minioadminpassword
+            - name: RUST_LOG
+              value: info
+          image: your-registry.example.com/silo-rust:latest
+          imagePullPolicy: IfNotPresent
+          name: minio
+          ports:
+            - containerPort: 9000
+              hostPort: 9000
+              name: 9000tcp
+              protocol: TCP
+          resources: {}
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+            - mountPath: /data
+              name: minio-data-local
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
+      volumes:
+        - name: minio-data-local
+          persistentVolumeClaim:
+            claimName: minio-data-local

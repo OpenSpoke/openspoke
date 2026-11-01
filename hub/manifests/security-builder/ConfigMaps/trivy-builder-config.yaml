@@ -1,0 +1,28 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trivy-builder-config
+  namespace: security-builder
+data:
+  trivy_repo: "https://github.com/aquasecurity/trivy.git"
+  trivy_tag: "v0.72.0"
+  image_ref: "your-registry.example.com/openspoke-trivy:v0.72.0"
+  Dockerfile: |
+    # syntax=docker/dockerfile:1
+    FROM golang:1.26-alpine AS builder
+    RUN apk add --no-cache git make ca-certificates
+    ARG TRIVY_REPO
+    ARG TRIVY_SHA
+    WORKDIR /src
+    RUN git clone "${TRIVY_REPO}" . && git checkout "${TRIVY_SHA}"
+    RUN go mod download && \
+        CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOEXPERIMENT=jsonv2 \
+        go build \
+          -ldflags="-s -w -X github.com/aquasecurity/trivy/pkg/version/app.ver=0.72.0" \
+          -o /out/trivy \
+          ./cmd/trivy
+
+    FROM gcr.io/distroless/base-debian12:nonroot
+    COPY --from=builder /out/trivy /usr/local/bin/trivy
+    ENTRYPOINT ["/usr/local/bin/trivy"]

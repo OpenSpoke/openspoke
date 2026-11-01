@@ -1,0 +1,23 @@
+OpenSpoke
+Copyright 2026 Intelligent Software Corp.
+
+Developed by Dr. Akihiro Hasegawa <hasegawa@intelligent.jp>
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+--------------------------------------------------------------------------------
+
+This product includes or depends on the following third-party software.
+Each is redistributed under its own license terms; refer to each project's
+upstream documentation for the full license text.
+
+  Rancher Fleet          https://github.com/rancher/fleet          Apache-2.0
+  Rancher                https://github.com/rancher/rancher        Apache-2.0
+  Kubernetes             https://kubernetes.io/                    Apache-2.0
+  OpenSearch             https://opensearch.org/                   Apache-2.0
+  Memgraph               https://memgraph.com/                     BSL-1.1 / MEL
+  Milvus                 https://milvus.io/                        Apache-2.0
+  Valkey                 https://valkey.io/                        BSD-3-Clause
+  Keycloak               https://www.keycloak.org/                 Apache-2.0
+  oauth2-proxy           https://oauth2-proxy.github.io/           MIT
+  cloudflared            https://github.com/cloudflare/cloudflared Apache-2.0

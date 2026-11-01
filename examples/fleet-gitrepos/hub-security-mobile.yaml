@@ -1,0 +1,36 @@
+# Example Fleet GitRepo for deploying the mobile-app vulnerability
+# scanning bundle. The bundle runs iOS and Android scanners on a
+# weekly CronJob, feeds findings into the hub kernel's
+# /core/vuln/* endpoints, and populates the Security dashboard view.
+#
+# The scanner image is ghcr.io/openspoke/openspoke-vuln-scanner:0.1.0
+# by default; override REGISTRY in the CronJob to point at your own
+# registry.
+#
+# Adjust:
+#   - spec.repo:    your fork URL or the upstream OpenSpoke repo
+#   - spec.branch:  branch to track
+#   - spec.paths:   subdirectory to watch (hub/manifests/security-mobile
+#                   is not yet in this staging branch; see
+#                   docs/operations/security-scanning.md for status)
+#   - spec.targets: cluster selector labels
+apiVersion: fleet.cattle.io/v1alpha1
+kind: GitRepo
+metadata:
+  name: hub-security-mobile
+  namespace: fleet-default
+spec:
+  repo: https://github.com/OpenSpoke/openspoke.git
+  branch: main
+  # For private forks, create a Secret in the fleet-default namespace and
+  # uncomment the line below:
+  # clientSecretName: fleet-git-credentials
+  paths:
+    - hub/manifests/security-mobile
+  pollingInterval: 1m0s
+  keepResources: true
+  targets:
+    - name: hub
+      clusterSelector:
+        matchLabels:
+          role: hub

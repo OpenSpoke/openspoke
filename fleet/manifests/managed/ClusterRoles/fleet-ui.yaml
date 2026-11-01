@@ -1,0 +1,48 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: fleet-ui
+rules:
+  # Fleet 本体の CR を全種類フルアクセス
+  - apiGroups: ["fleet.cattle.io"]
+    resources:
+      - gitrepos
+      - gitreporestrictions
+      - bundles
+      - bundledeployments
+      - bundlenamespacemappings
+      - clusters
+      - clustergroups
+      - clusterregistrations
+      - clusterregistrationtokens
+      - contents
+      - imagescans
+      - helmops
+      - helmapps
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # GitRepo / Cluster 作成時に参照する Secret (gitrepo-auth / helm-repo / caBundle)
+  - apiGroups: [""]
+    resources:
+      - secrets
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # Workspace = Namespace なので一覧と作成が必要
+  - apiGroups: [""]
+    resources:
+      - namespaces
+    verbs: ["get", "list", "watch", "create"]
+
+  # ConfigMap (Fleet 設定の参照)
+  - apiGroups: [""]
+    resources:
+      - configmaps
+    verbs: ["get", "list", "watch"]
+
+  # トラブルシュート用: Pod ログと Event の閲覧
+  - apiGroups: [""]
+    resources:
+      - pods
+      - pods/log
+      - events
+    verbs: ["get", "list", "watch"]

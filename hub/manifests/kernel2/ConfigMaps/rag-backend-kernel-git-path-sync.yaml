@@ -1,0 +1,1095 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-backend-kernel-git-path-sync
+  namespace: rag-company1
+data:
+  git_path_sync.py: |
+    """
+    git_path_sync.py
+    ====================================================================
+    リポジトリの「パス単位」コピー・移動・同期サービス。
+
+    git_mirror.py がリポジトリ丸ごと (全 ref) を相手にするのに対し、
+    こちらは「GitHub の owner/repo/path 配下」 と
+    「GitLab の owner/repo/path 配下」 のように、
+    ディレクトリまたはファイル単位で中身を運ぶ。
+    向きは双方向 (github → gitlab、 gitlab → github、 同種間も可)。
+
+    動作の型 (mode):
+      - copy : 元にあるものを先へ上書き・追加する。
+               先にしか無いものはそのまま残す。
+      - sync : 先を元と完全に一致させる。
+               先にしか無いものは削除する。
+      - move : sync と同じことをしたあと、 元の path を削除して
+               元リポジトリにも push する (運び出し)。
+
+    設計:
+      - 非同期実行 (threading.Thread、 git_mirror.py と同じ流儀)
+      - job 状態は OpenSearch `git_path_sync_jobs` index に保存
+      - 両側の PAT を git_credentials 保管庫から解決する
+        (provider=github の scope_id は owner、
+         gitlab は "{host}:{owner}")
+      - 浅い clone (--depth 1) を両側に対して行い、 作業木の上で
+        ファイルを突き合わせ、 1 commit にまとめて push する
+      - 履歴は運ばない。 履歴ごと運びたいときは git_mirror を使う
+
+    エンドポイント (prefix=/core/git_path_sync):
+      - GET  /health
+      - POST /jobs                  ジョブ作成 (即返る、 job_id を返す)
+      - GET  /jobs                  一覧
+      - GET  /jobs/{job_id}         詳細
+      - POST /jobs/{job_id}/cancel  キャンセル要求
+
+    実行環境の必要条件:
+      - image に `git` が含まれること (v0.1.3 以降)
+      - /tmp が書き込み可能で作業領域があること
+
+    参照: knowledge base の topic `git_path_sync_tool_20261021`
+    """
+    from __future__ import annotations
+
+    import fnmatch
+    import logging
+    import os
+    import shutil
+    import subprocess
+    import tempfile
+    import threading
+    import uuid
+    from datetime import datetime, timezone
+    from typing import Any, Dict, List, Optional, Tuple
+    from urllib.parse import quote as _urlquote, urlsplit
+
+    from fastapi import APIRouter, HTTPException, Request
+    from pydantic import BaseModel
+
+    logger = logging.getLogger(__name__)
+
+    # ── requests (遅延 import、 git_mirror と同じ流儀) ──
+    try:
+        import requests
+        _REQUESTS_AVAILABLE = True
+    except ImportError as _e:
+        logger.warning(f"[GIT_PATH_SYNC] requests not available: {_e}")
+        _REQUESTS_AVAILABLE = False
+        requests = None
+
+
+    # ── 設定 ──
+    OPENSEARCH_URL = os.environ.get(
+        "OPENSEARCH_URL",
+        "http://opensearch.opensearch.svc.cluster.local:9200",
+    )
+    IDX_JOBS = os.environ.get(
+        "GIT_PATH_SYNC_IDX_JOBS", "git_path_sync_jobs",
+    )
+
+    WORK_ROOT = os.environ.get(
+        "GIT_PATH_SYNC_WORK_ROOT", "/tmp/git-path-sync",
+    )
+
+    GIT_TIMEOUT_SECONDS = int(
+        os.environ.get("GIT_PATH_SYNC_TIMEOUT_SECONDS", "1800")
+    )
+
+    # 1 ジョブで扱えるファイル数の上限 (暴走よけ)
+    MAX_FILES = int(os.environ.get("GIT_PATH_SYNC_MAX_FILES", "20000"))
+
+    GIT_AUTHOR_NAME = os.environ.get(
+        "GIT_PATH_SYNC_AUTHOR_NAME", "OpenSpoke kernel",
+    )
+    GIT_AUTHOR_EMAIL = os.environ.get(
+        "GIT_PATH_SYNC_AUTHOR_EMAIL", "openspoke@example.com",
+    )
+
+    _LIST_LIMIT_DEFAULT = 20
+    _LIST_LIMIT_MAX = 100
+
+    _VALID_PROVIDERS = ("github", "gitlab")
+    _VALID_MODES = ("copy", "sync", "move")
+
+    _DEFAULT_HOST = {
+        "github": "github.com",
+        "gitlab": "gitlab.example.com",
+    }
+
+    # ── in-memory (cancel フラグとログ蓄積) ──
+    _ACTIVE_JOBS: Dict[str, Dict[str, Any]] = {}
+    _ACTIVE_JOBS_LOCK = threading.Lock()
+
+
+    # ====================================================================
+    # 補助
+    # ====================================================================
+
+    def _now_iso() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+
+    def _job_id_new() -> str:
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        return f"gps-{ts}-{uuid.uuid4().hex[:8]}"
+
+
+    def _extract_login_identity(request: Request) -> Dict[str, str]:
+        """oauth2-proxy が入れるヘッダから login 情報を抜き出す。"""
+        try:
+            headers = {k.lower(): v for k, v in request.headers.items()}
+        except Exception:
+            return {"user": "", "email": "", "groups": ""}
+        return {
+            "user":   headers.get("x-forwarded-preferred-username")
+                       or headers.get("x-forwarded-user")
+                       or headers.get("x-auth-request-user")
+                       or "",
+            "email":  headers.get("x-forwarded-email")
+                       or headers.get("x-auth-request-email")
+                       or "",
+            "groups": headers.get("x-forwarded-groups") or "",
+        }
+
+
+    def _mask_url(url: str) -> str:
+        """log 出力用に URL の認証部分を伏せる。"""
+        try:
+            p = urlsplit(url)
+            if not (p.username or p.password):
+                return url
+            return f"{p.scheme}://***:***@{p.hostname}{p.path}"
+        except Exception:
+            return url
+
+
+    def _auth_url(url: str, token: Optional[str], provider: str) -> str:
+        """PAT を URL に埋め込む。 github: x-access-token, gitlab: oauth2。"""
+        if not token:
+            return url
+        user = "x-access-token" if provider == "github" else "oauth2"
+        p = urlsplit(url)
+        return (
+            f"{p.scheme}://{user}:{_urlquote(token, safe='')}"
+            f"@{p.netloc}{p.path}"
+        )
+
+
+    def _repo_url(host: str, owner: str, repo: str) -> str:
+        name = repo[:-4] if repo.endswith(".git") else repo
+        return f"https://{host}/{owner}/{name}.git"
+
+
+    def _norm_path(p: str) -> str:
+        """リポジトリ内パスを正規化する。 空文字はリポジトリ直下を指す。"""
+        raw = (p or "").strip().replace("\\", "/").strip("/")
+        if not raw:
+            return ""
+        parts: List[str] = []
+        for seg in raw.split("/"):
+            if seg in ("", "."):
+                continue
+            if seg == "..":
+                raise ValueError("path に .. は使えません")
+            if seg == ".git":
+                raise ValueError("path に .git は使えません")
+            parts.append(seg)
+        return "/".join(parts)
+
+
+    def _run(cmd: List[str], cwd: Optional[str] = None,
+             env: Optional[Dict[str, str]] = None,
+             timeout: int = GIT_TIMEOUT_SECONDS
+             ) -> subprocess.CompletedProcess:
+        e = os.environ.copy()
+        e["GIT_TERMINAL_PROMPT"] = "0"
+        if env:
+            e.update(env)
+        return subprocess.run(
+            cmd, cwd=cwd, env=e,
+            capture_output=True, text=True,
+            timeout=timeout, check=False,
+        )
+
+
+    # ====================================================================
+    # OpenSearch helper (git_mirror と同じ流儀、 auth 無し)
+    # ====================================================================
+
+    def _ensure_index() -> None:
+        """index が無ければ作成する (冪等)。"""
+        if not _REQUESTS_AVAILABLE:
+            return
+        try:
+            resp = requests.head(f"{OPENSEARCH_URL}/{IDX_JOBS}", timeout=3)
+            if resp.status_code == 200:
+                return
+        except Exception as e:
+            logger.warning(f"[GIT_PATH_SYNC] index HEAD failed: {e}")
+            return
+
+        mapping = {
+            "settings": {
+                "number_of_shards": 1,
+                "number_of_replicas": 0,
+            },
+            "mappings": {
+                "properties": {
+                    "job_id":            {"type": "keyword"},
+                    "state":             {"type": "keyword"},
+                    "mode":              {"type": "keyword"},
+                    "dry_run":           {"type": "boolean"},
+                    "source_provider":   {"type": "keyword"},
+                    "source_host":       {"type": "keyword"},
+                    "source_owner":      {"type": "keyword"},
+                    "source_repo":       {"type": "keyword"},
+                    "source_branch":     {"type": "keyword"},
+                    "source_path":       {"type": "keyword"},
+                    "dest_provider":     {"type": "keyword"},
+                    "dest_host":         {"type": "keyword"},
+                    "dest_owner":        {"type": "keyword"},
+                    "dest_repo":         {"type": "keyword"},
+                    "dest_branch":       {"type": "keyword"},
+                    "dest_path":         {"type": "keyword"},
+                    "include":           {"type": "keyword"},
+                    "exclude":           {"type": "keyword"},
+                    "message":           {"type": "text"},
+                    "created_at":        {"type": "date"},
+                    "started_at":        {"type": "date"},
+                    "finished_at":       {"type": "date"},
+                    "requested_by":      {"type": "keyword"},
+                    "cancel_requested":  {"type": "boolean"},
+                    "progress":          {"type": "keyword"},
+                    "dest_commit":       {"type": "keyword"},
+                    "source_commit":     {"type": "keyword"},
+                    "counters": {
+                        "properties": {
+                            "scanned":   {"type": "integer"},
+                            "added":     {"type": "integer"},
+                            "updated":   {"type": "integer"},
+                            "unchanged": {"type": "integer"},
+                            "deleted":   {"type": "integer"},
+                            "skipped":   {"type": "integer"},
+                        }
+                    },
+                    "changed_files": {"type": "keyword"},
+                    "error":         {"type": "text"},
+                    "log":           {"type": "text"},
+                }
+            }
+        }
+        try:
+            resp = requests.put(
+                f"{OPENSEARCH_URL}/{IDX_JOBS}",
+                json=mapping, timeout=5,
+            )
+            if resp.status_code >= 400:
+                logger.warning(
+                    f"[GIT_PATH_SYNC] index create failed: "
+                    f"{resp.status_code} {resp.text[:200]}"
+                )
+            else:
+                logger.info(f"[GIT_PATH_SYNC] index created: {IDX_JOBS}")
+        except Exception as e:
+            logger.warning(f"[GIT_PATH_SYNC] index create error: {e}")
+
+
+    def _os_put(doc_id: str, doc: Dict[str, Any]) -> None:
+        if not _REQUESTS_AVAILABLE:
+            return
+        try:
+            resp = requests.put(
+                f"{OPENSEARCH_URL}/{IDX_JOBS}/_doc/"
+                f"{_urlquote(doc_id, safe='')}?refresh=false",
+                json=doc, timeout=5,
+            )
+            if resp.status_code >= 400:
+                logger.warning(
+                    f"[GIT_PATH_SYNC] _os_put failed: "
+                    f"{resp.status_code} {resp.text[:200]}"
+                )
+        except Exception as e:
+            logger.warning(f"[GIT_PATH_SYNC] _os_put error: {e}")
+
+
+    def _os_patch(doc_id: str, patch: Dict[str, Any]) -> None:
+        if not _REQUESTS_AVAILABLE:
+            return
+        body = {"doc": patch, "doc_as_upsert": True}
+        try:
+            resp = requests.post(
+                f"{OPENSEARCH_URL}/{IDX_JOBS}/_update/"
+                f"{_urlquote(doc_id, safe='')}?refresh=false",
+                json=body, timeout=5,
+            )
+            if resp.status_code >= 400:
+                logger.warning(
+                    f"[GIT_PATH_SYNC] _os_patch failed: "
+                    f"{resp.status_code} {resp.text[:200]}"
+                )
+        except Exception as e:
+            logger.warning(f"[GIT_PATH_SYNC] _os_patch error: {e}")
+
+
+    def _os_get(doc_id: str) -> Optional[Dict[str, Any]]:
+        if not _REQUESTS_AVAILABLE:
+            return None
+        try:
+            resp = requests.get(
+                f"{OPENSEARCH_URL}/{IDX_JOBS}/_doc/"
+                f"{_urlquote(doc_id, safe='')}",
+                timeout=3,
+            )
+            if resp.status_code >= 400:
+                return None
+            return resp.json().get("_source")
+        except Exception:
+            return None
+
+
+    def _os_list(limit: int) -> List[Dict[str, Any]]:
+        if not _REQUESTS_AVAILABLE:
+            return []
+        body = {
+            "query": {"match_all": {}},
+            "sort": [{"created_at": {"order": "desc"}}],
+            "size": limit,
+        }
+        try:
+            resp = requests.post(
+                f"{OPENSEARCH_URL}/{IDX_JOBS}/_search",
+                json=body, timeout=5,
+            )
+            if resp.status_code >= 400:
+                return []
+            hits = resp.json().get("hits", {}).get("hits", [])
+            return [h.get("_source", {}) for h in hits]
+        except Exception:
+            return []
+
+
+    # ====================================================================
+    # PAT 解決 (git_credentials 保管庫から)
+    # ====================================================================
+
+    def _resolve_token(provider: str, owner: str, host: str
+                       ) -> Optional[str]:
+        """保管庫の org スコープからトークンを引く。 provider=github の
+        scope_id は owner、 gitlab は "{host}:{owner}"。"""
+        scope_id = owner if provider == "github" else f"{host}:{owner}"
+        try:
+            from git_credentials import (
+                _os_get as _cred_os_get,
+                _doc_id as _cred_doc_id,
+            )
+        except Exception as e:
+            logger.warning(
+                f"[GIT_PATH_SYNC] cannot import git_credentials helpers: {e}"
+            )
+            return None
+        try:
+            doc = _cred_os_get(_cred_doc_id("org", provider, scope_id))
+            if not doc:
+                return None
+            token = doc.get("token") or ""
+            return token or None
+        except Exception as e:
+            logger.warning(f"[GIT_PATH_SYNC] token resolve failed: {e}")
+            return None
+
+
+    # ====================================================================
+    # ログとキャンセル
+    # ====================================================================
+
+    def _log_line(job_id: str, msg: str) -> None:
+        stamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        line = f"[{stamp}] {msg}"
+        logger.info(f"[GIT_PATH_SYNC] {job_id}: {msg}")
+        with _ACTIVE_JOBS_LOCK:
+            entry = _ACTIVE_JOBS.get(job_id)
+            if entry is not None:
+                entry["log_lines"].append(line)
+
+
+    def _cancel_requested(job_id: str) -> bool:
+        with _ACTIVE_JOBS_LOCK:
+            entry = _ACTIVE_JOBS.get(job_id)
+            return bool(entry and entry.get("cancel"))
+
+
+    def _check_cancel(job_id: str, where: str) -> None:
+        if _cancel_requested(job_id):
+            raise RuntimeError(f"cancelled ({where})")
+
+
+    # ====================================================================
+    # git 操作
+    # ====================================================================
+
+    def _clone_shallow(url: str, token: Optional[str], provider: str,
+                       branch: str, dest_dir: str, job_id: str,
+                       label: str) -> Tuple[str, bool]:
+        """浅い clone を行う。 戻り値は (実ブランチ名, 空リポか)。"""
+        auth = _auth_url(url, token, provider)
+        base = ["git", "clone", "--depth", "1"]
+        cmd = list(base)
+        if branch:
+            cmd += ["--branch", branch]
+        cmd += [auth, dest_dir]
+        _log_line(
+            job_id,
+            f"[{label}] git clone --depth 1 {_mask_url(auth)}"
+            + (f" (branch={branch})" if branch else "")
+        )
+        r = _run(cmd)
+        if r.returncode != 0 and branch:
+            # 空リポや既定ブランチ名違いに備えて branch 指定なしで再試行
+            _log_line(
+                job_id,
+                f"[{label}] branch={branch} での clone に失敗、 "
+                f"branch 指定なしで再試行します"
+            )
+            if os.path.exists(dest_dir):
+                shutil.rmtree(dest_dir, ignore_errors=True)
+            r = _run(base + [auth, dest_dir])
+        if r.returncode != 0:
+            raise RuntimeError(f"{label} clone failed: {r.stderr[-500:]}")
+
+        rv = _run(
+            ["git", "-C", dest_dir, "rev-parse", "--verify", "HEAD"],
+            timeout=30,
+        )
+        if rv.returncode != 0:
+            # 空リポジトリ
+            b = branch or "main"
+            _run(["git", "-C", dest_dir, "checkout", "-b", b], timeout=30)
+            _log_line(job_id, f"[{label}] 空のリポジトリです (branch={b})")
+            return b, True
+
+        rb = _run(
+            ["git", "-C", dest_dir, "rev-parse", "--abbrev-ref", "HEAD"],
+            timeout=30,
+        )
+        actual = rb.stdout.strip() or branch or "main"
+        if branch and actual != branch:
+            # 既存ブランチが無く既定ブランチが落ちてきた場合は作る
+            _run(["git", "-C", dest_dir, "checkout", "-b", branch],
+                 timeout=30)
+            actual = branch
+        return actual, False
+
+
+    def _commit_and_push(repo_dir: str, branch: str, message: str,
+                         url: str, token: Optional[str], provider: str,
+                         job_id: str, label: str) -> Tuple[bool, str]:
+        """作業木の変更を 1 commit にして push する。
+        戻り値は (push したか, commit SHA)。"""
+        r = _run(["git", "-C", repo_dir, "add", "-A"], timeout=600)
+        if r.returncode != 0:
+            raise RuntimeError(f"{label} git add failed: {r.stderr[-500:]}")
+
+        r = _run(["git", "-C", repo_dir, "status", "--porcelain"],
+                 timeout=300)
+        if not r.stdout.strip():
+            _log_line(job_id, f"[{label}] 変更はありません (commit しません)")
+            return False, ""
+
+        r = _run([
+            "git", "-C", repo_dir,
+            "-c", f"user.name={GIT_AUTHOR_NAME}",
+            "-c", f"user.email={GIT_AUTHOR_EMAIL}",
+            "commit", "-m", message,
+        ], timeout=600)
+        if r.returncode != 0:
+            raise RuntimeError(
+                f"{label} git commit failed: "
+                f"{(r.stderr or r.stdout)[-500:]}"
+            )
+
+        head = _run(["git", "-C", repo_dir, "rev-parse", "HEAD"],
+                    timeout=30).stdout.strip()
+
+        auth = _auth_url(url, token, provider)
+        _log_line(
+            job_id,
+            f"[{label}] git push {_mask_url(auth)} HEAD:refs/heads/{branch}"
+        )
+        r = _run(["git", "-C", repo_dir, "push", auth,
+                  f"HEAD:refs/heads/{branch}"])
+        if r.returncode != 0:
+            raise RuntimeError(f"{label} git push failed: {r.stderr[-500:]}")
+        return True, head
+
+
+    # ====================================================================
+    # ファイル突き合わせ
+    # ====================================================================
+
+    def _walk_files(base: str) -> Dict[str, str]:
+        """base 配下のファイルを {base からの相対パス: 絶対パス} で返す。
+        .git 配下は除外する。"""
+        out: Dict[str, str] = {}
+        if os.path.isfile(base):
+            out[os.path.basename(base)] = base
+            return out
+        if not os.path.isdir(base):
+            return out
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames[:] = [d for d in dirnames if d != ".git"]
+            for fn in filenames:
+                ap = os.path.join(dirpath, fn)
+                rp = os.path.relpath(ap, base).replace(os.sep, "/")
+                out[rp] = ap
+        return out
+
+
+    def _matches(rel: str, patterns: List[str]) -> bool:
+        for p in patterns:
+            if fnmatch.fnmatch(rel, p) or fnmatch.fnmatch(
+                os.path.basename(rel), p
+            ):
+                return True
+        return False
+
+
+    def _same_bytes(a: str, b: str) -> bool:
+        try:
+            if os.path.getsize(a) != os.path.getsize(b):
+                return False
+            with open(a, "rb") as fa, open(b, "rb") as fb:
+                while True:
+                    ca = fa.read(65536)
+                    cb = fb.read(65536)
+                    if ca != cb:
+                        return False
+                    if not ca:
+                        return True
+        except Exception:
+            return False
+
+
+    # ====================================================================
+    # ワーカー本体 (background thread)
+    # ====================================================================
+
+    def _sync_worker(job_id: str, p: Dict[str, Any]) -> None:
+        mode        = p["mode"]
+        dry_run     = bool(p.get("dry_run", False))
+        src_prov    = p["source_provider"]
+        src_host    = p["source_host"]
+        src_owner   = p["source_owner"]
+        src_repo    = p["source_repo"]
+        src_branch  = p.get("source_branch") or ""
+        src_path    = p.get("source_path") or ""
+        dst_prov    = p["dest_provider"]
+        dst_host    = p["dest_host"]
+        dst_owner   = p["dest_owner"]
+        dst_repo    = p["dest_repo"]
+        dst_branch  = p.get("dest_branch") or ""
+        dst_path    = p.get("dest_path") or ""
+        include     = list(p.get("include") or [])
+        exclude     = list(p.get("exclude") or [])
+        message     = p.get("message") or ""
+
+        work_dir: Optional[str] = None
+        counters = {
+            "scanned": 0, "added": 0, "updated": 0,
+            "unchanged": 0, "deleted": 0, "skipped": 0,
+        }
+        changed_files: List[str] = []
+
+        try:
+            _os_patch(job_id, {
+                "state": "running",
+                "started_at": _now_iso(),
+                "progress": "トークン解決中",
+            })
+
+            src_url = _repo_url(src_host, src_owner, src_repo)
+            dst_url = _repo_url(dst_host, dst_owner, dst_repo)
+
+            src_token = _resolve_token(src_prov, src_owner, src_host)
+            dst_token = _resolve_token(dst_prov, dst_owner, dst_host)
+            if not dst_token:
+                raise RuntimeError(
+                    f"コピー先のトークンが保管庫にありません: "
+                    f"org:{dst_prov}:"
+                    f"{dst_owner if dst_prov == 'github' else dst_host + ':' + dst_owner}"
+                )
+            if not src_token:
+                _log_line(job_id, "コピー元は無認証 (公開リポジトリ扱い)")
+            if mode == "move" and not src_token:
+                raise RuntimeError(
+                    "move はコピー元への push が必要です。 "
+                    "コピー元のトークンが保管庫にありません"
+                )
+
+            # 元と先が同じリポジトリの同じブランチか
+            same_repo = (
+                src_prov == dst_prov
+                and (src_host or "").lower() == (dst_host or "").lower()
+                and (src_owner or "").lower() == (dst_owner or "").lower()
+                and (src_repo or "").lower() == (dst_repo or "").lower()
+                and (not dst_branch or not src_branch
+                     or dst_branch == src_branch)
+            )
+
+            os.makedirs(WORK_ROOT, exist_ok=True)
+            work_dir = tempfile.mkdtemp(prefix=f"{job_id}-", dir=WORK_ROOT)
+            src_dir = os.path.join(work_dir, "source")
+            dst_dir = os.path.join(work_dir, "dest")
+
+            # ── clone ──
+            _check_cancel(job_id, "clone 前")
+            _os_patch(job_id, {"progress": "コピー元を clone 中"})
+            src_branch_actual, _ = _clone_shallow(
+                src_url, src_token, src_prov, src_branch,
+                src_dir, job_id, "source",
+            )
+
+            # 同じリポジトリを 2 回 clone すると、 先への push でブランチが
+            # 進んだあと、 古いままの元の作業木からの push が弾かれる。
+            # 1 つの作業木を使い、 commit も 1 つにまとめる。
+            one_tree = bool(same_repo)
+            if one_tree:
+                dst_dir = src_dir
+                dst_branch_actual = src_branch_actual
+                _log_line(
+                    job_id,
+                    "元と先が同じリポジトリなので 1 つの作業木で処理します",
+                )
+            else:
+                _check_cancel(job_id, "コピー先 clone 前")
+                _os_patch(job_id, {"progress": "コピー先を clone 中"})
+                dst_branch_actual, _ = _clone_shallow(
+                    dst_url, dst_token, dst_prov, dst_branch,
+                    dst_dir, job_id, "dest",
+                )
+
+            # ── 対象の実体 ──
+            src_base = os.path.join(src_dir, src_path) if src_path \
+                else src_dir
+            if not os.path.exists(src_base):
+                raise RuntimeError(
+                    f"コピー元にパスがありません: {src_path or '(リポジトリ直下)'}"
+                )
+            src_is_file = os.path.isfile(src_base)
+
+            if src_is_file:
+                # ファイル 1 本。 dest_path がディレクトリ指定ならその下に置く
+                dst_file_rel = dst_path or os.path.basename(src_base)
+                dst_base = os.path.join(dst_dir, os.path.dirname(dst_file_rel)) \
+                    if os.path.dirname(dst_file_rel) else dst_dir
+                src_files = {os.path.basename(dst_file_rel): src_base}
+                # changed_files の表示用。 ここに dst_file_rel を入れると
+                # 親ディレクトリ + ファイル名 + ファイル名 と二重になる
+                dst_scope_rel = os.path.dirname(dst_file_rel)
+            else:
+                dst_base = os.path.join(dst_dir, dst_path) if dst_path \
+                    else dst_dir
+                src_files = _walk_files(src_base)
+                dst_scope_rel = dst_path
+
+            # ── 絞り込み ──
+            picked: Dict[str, str] = {}
+            for rel, ap in src_files.items():
+                if include and not _matches(rel, include):
+                    counters["skipped"] += 1
+                    continue
+                if exclude and _matches(rel, exclude):
+                    counters["skipped"] += 1
+                    continue
+                picked[rel] = ap
+            counters["scanned"] = len(picked)
+
+            if len(picked) > MAX_FILES:
+                raise RuntimeError(
+                    f"対象ファイルが多すぎます ({len(picked)} 件、 "
+                    f"上限 {MAX_FILES} 件)。 include / exclude で絞ってください"
+                )
+            _log_line(
+                job_id,
+                f"対象 {len(picked)} 件 (除外 {counters['skipped']} 件)"
+            )
+
+            # ── 反映 ──
+            _check_cancel(job_id, "反映前")
+            _os_patch(job_id, {"progress": "ファイル反映中"})
+            for rel, ap in sorted(picked.items()):
+                target = os.path.join(dst_base, rel)
+                if os.path.exists(target):
+                    if _same_bytes(ap, target):
+                        counters["unchanged"] += 1
+                        continue
+                    counters["updated"] += 1
+                else:
+                    counters["added"] += 1
+                changed_files.append(
+                    f"{dst_scope_rel + '/' if dst_scope_rel else ''}{rel}"
+                )
+                if not dry_run:
+                    os.makedirs(os.path.dirname(target) or dst_base,
+                                exist_ok=True)
+                    shutil.copy2(ap, target)
+
+            # ── sync / move は先の余りを消す ──
+            if mode in ("sync", "move") and not src_is_file:
+                existing = _walk_files(dst_base)
+                for rel in sorted(existing.keys()):
+                    if rel in picked:
+                        continue
+                    if include and not _matches(rel, include):
+                        continue
+                    if exclude and _matches(rel, exclude):
+                        continue
+                    counters["deleted"] += 1
+                    changed_files.append(
+                        f"- {dst_scope_rel + '/' if dst_scope_rel else ''}{rel}"
+                    )
+                    if not dry_run:
+                        try:
+                            os.remove(existing[rel])
+                        except Exception as e:
+                            logger.warning(
+                                f"[GIT_PATH_SYNC] remove failed {rel}: {e}"
+                            )
+
+            _os_patch(job_id, {
+                "counters": counters,
+                "changed_files": changed_files[:500],
+            })
+            _log_line(
+                job_id,
+                f"追加 {counters['added']} / 更新 {counters['updated']} / "
+                f"削除 {counters['deleted']} / 同一 {counters['unchanged']}"
+            )
+
+            if dry_run:
+                _os_patch(job_id, {
+                    "state": "succeeded",
+                    "finished_at": _now_iso(),
+                    "progress": "下見のみ (push していません)",
+                })
+                _log_line(job_id, "dry_run のため push しませんでした")
+                return
+
+            # ── 同一作業木の move は、 先への push の前に元を消して
+            #    1 つの commit にまとめる ──
+            if mode == "move":
+                if not src_path:
+                    raise RuntimeError(
+                        "move でコピー元のリポジトリ直下は指定できません"
+                    )
+                if one_tree:
+                    _check_cancel(job_id, "コピー元削除前")
+                    _os_patch(job_id, {"progress": "コピー元から削除中"})
+                    if src_is_file:
+                        os.remove(src_base)
+                    else:
+                        shutil.rmtree(src_base, ignore_errors=True)
+                    _log_line(
+                        job_id,
+                        "同じリポジトリなので、 元の削除も同じ commit に"
+                        "含めます",
+                    )
+
+            # ── コピー先へ push ──
+            _check_cancel(job_id, "push 前")
+            _os_patch(job_id, {"progress": "コピー先へ push 中"})
+            msg = message or (
+                f"{mode}: {src_owner}/{src_repo}"
+                f"{'/' + src_path if src_path else ''} -> "
+                f"{dst_owner}/{dst_repo}"
+                f"{'/' + dst_path if dst_path else ''}"
+            )
+            pushed, dest_commit = _commit_and_push(
+                dst_dir, dst_branch_actual, msg,
+                dst_url, dst_token, dst_prov, job_id, "dest",
+            )
+            _os_patch(job_id, {"dest_commit": dest_commit})
+
+            # ── 別リポジトリの move は、 元を消して元にも push する ──
+            source_commit = ""
+            if mode == "move":
+                if one_tree:
+                    source_commit = dest_commit
+                else:
+                    _check_cancel(job_id, "コピー元削除前")
+                    _os_patch(job_id, {"progress": "コピー元から削除中"})
+                    if src_is_file:
+                        os.remove(src_base)
+                    else:
+                        shutil.rmtree(src_base, ignore_errors=True)
+                    _, source_commit = _commit_and_push(
+                        src_dir, src_branch_actual,
+                        f"move: {src_path} を "
+                        f"{dst_owner}/{dst_repo} へ移しました",
+                        src_url, src_token, src_prov, job_id, "source",
+                    )
+                _os_patch(job_id, {"source_commit": source_commit})
+
+            _os_patch(job_id, {
+                "state": "succeeded",
+                "finished_at": _now_iso(),
+                "progress": "完了" if pushed else "変更なしで完了",
+            })
+            _log_line(
+                job_id,
+                f"完了: dest_commit={dest_commit or '(変更なし)'} "
+                f"source_commit={source_commit or '-'}"
+            )
+
+        except Exception as e:
+            err = f"{type(e).__name__}: {str(e)[:800]}"
+            _log_line(job_id, f"失敗: {err}")
+            try:
+                _os_patch(job_id, {
+                    "state": "failed",
+                    "finished_at": _now_iso(),
+                    "error": err,
+                    "counters": counters,
+                })
+            except Exception:
+                pass
+
+        finally:
+            with _ACTIVE_JOBS_LOCK:
+                entry = _ACTIVE_JOBS.pop(job_id, None)
+            try:
+                if entry is not None:
+                    log_text = "\n".join(entry.get("log_lines", []))
+                    _os_patch(job_id, {"log": log_text})
+            except Exception:
+                pass
+            if work_dir and os.path.exists(work_dir):
+                try:
+                    shutil.rmtree(work_dir)
+                except Exception as e:
+                    logger.warning(f"[GIT_PATH_SYNC] cleanup failed: {e}")
+
+
+    # ====================================================================
+    # API
+    # ====================================================================
+
+    router = APIRouter(prefix="/core/git_path_sync", tags=["git-path-sync"])
+
+
+    class PathSyncJobCreate(BaseModel):
+        source_owner: str
+        source_repo: str
+        dest_owner: str
+        dest_repo: str
+        source_provider: str = "github"
+        dest_provider: str = "gitlab"
+        source_host: str = ""
+        dest_host: str = ""
+        source_branch: str = ""
+        dest_branch: str = ""
+        source_path: str = ""
+        dest_path: str = ""
+        mode: str = "copy"
+        include: List[str] = []
+        exclude: List[str] = []
+        message: str = ""
+        dry_run: bool = False
+        allow_repo_root: bool = False
+        user_id: Optional[str] = None
+
+
+    @router.get("/health")
+    async def health() -> Dict[str, Any]:
+        return {
+            "ok": True,
+            "opensearch_url": OPENSEARCH_URL,
+            "index": IDX_JOBS,
+            "requests": _REQUESTS_AVAILABLE,
+            "active_jobs": len(_ACTIVE_JOBS),
+            "work_root": WORK_ROOT,
+            "modes": list(_VALID_MODES),
+            "max_files": MAX_FILES,
+        }
+
+
+    @router.post("/jobs")
+    async def create_job(payload: PathSyncJobCreate,
+                         request: Request) -> Dict[str, Any]:
+        if payload.mode not in _VALID_MODES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"mode は {_VALID_MODES} のいずれかです",
+            )
+        for name, prov in (("source_provider", payload.source_provider),
+                           ("dest_provider", payload.dest_provider)):
+            if prov not in _VALID_PROVIDERS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{name} は {_VALID_PROVIDERS} のいずれかです",
+                )
+        if not (payload.source_owner and payload.source_repo
+                and payload.dest_owner and payload.dest_repo):
+            raise HTTPException(
+                status_code=400,
+                detail="source_owner / source_repo / dest_owner / "
+                       "dest_repo は必須です",
+            )
+
+        try:
+            src_path = _norm_path(payload.source_path)
+            dst_path = _norm_path(payload.dest_path)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        src_host = payload.source_host or _DEFAULT_HOST[payload.source_provider]
+        dst_host = payload.dest_host or _DEFAULT_HOST[payload.dest_provider]
+
+        # 安全装置: リポジトリ直下を丸ごと sync / move するのは明示が要る
+        if payload.mode in ("sync", "move") and not dst_path \
+                and not payload.allow_repo_root:
+            raise HTTPException(
+                status_code=400,
+                detail="dest_path 未指定で mode=sync / move は "
+                       "コピー先リポジトリ全体を書き換えます。 "
+                       "本当に行う場合は allow_repo_root=true を指定してください",
+            )
+        if payload.mode == "move" and not src_path:
+            raise HTTPException(
+                status_code=400,
+                detail="move でコピー元のリポジトリ直下は指定できません",
+            )
+        same_repo = (
+            payload.source_provider == payload.dest_provider
+            and src_host.lower() == dst_host.lower()
+            and payload.source_owner.lower() == payload.dest_owner.lower()
+            and payload.source_repo.lower() == payload.dest_repo.lower()
+        )
+        if same_repo:
+            if src_path == dst_path:
+                raise HTTPException(
+                    status_code=400,
+                    detail="同じリポジトリの同じ場所が元と先に指定されています",
+                )
+            # 片方がもう片方の配下にあると、 同じ作業木の上で
+            # 書き込みと削除がぶつかる
+            if (src_path and dst_path
+                    and (dst_path.startswith(src_path + "/")
+                         or src_path.startswith(dst_path + "/"))):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "同じリポジトリで、 元と先のパスが入れ子になって"
+                        "います。 重ならない場所を指定してください"
+                    ),
+                )
+
+        _ensure_index()
+
+        ident = _extract_login_identity(request)
+        requested_by = ident.get("user") or "unknown"
+
+        job_id = _job_id_new()
+        doc = {
+            "job_id": job_id,
+            "state": "queued",
+            "mode": payload.mode,
+            "dry_run": bool(payload.dry_run),
+            "source_provider": payload.source_provider,
+            "source_host": src_host,
+            "source_owner": payload.source_owner,
+            "source_repo": payload.source_repo,
+            "source_branch": payload.source_branch,
+            "source_path": src_path,
+            "dest_provider": payload.dest_provider,
+            "dest_host": dst_host,
+            "dest_owner": payload.dest_owner,
+            "dest_repo": payload.dest_repo,
+            "dest_branch": payload.dest_branch,
+            "dest_path": dst_path,
+            "include": payload.include,
+            "exclude": payload.exclude,
+            "message": payload.message or "",
+            "created_at": _now_iso(),
+            "requested_by": requested_by,
+            "cancel_requested": False,
+            "progress": "queued",
+        }
+        _os_put(job_id, doc)
+
+        with _ACTIVE_JOBS_LOCK:
+            _ACTIVE_JOBS[job_id] = {"cancel": False, "log_lines": []}
+
+        work = dict(payload.dict())
+        work.update({
+            "source_host": src_host,
+            "dest_host": dst_host,
+            "source_path": src_path,
+            "dest_path": dst_path,
+        })
+
+        t = threading.Thread(
+            target=_sync_worker,
+            args=(job_id, work),
+            daemon=True,
+            name=f"git_path_sync_worker[{job_id}]",
+        )
+        t.start()
+
+        return {
+            "ok": True,
+            "job_id": job_id,
+            "mode": payload.mode,
+            "dry_run": bool(payload.dry_run),
+            "source": f"{payload.source_owner}/{payload.source_repo}"
+                      f"{'/' + src_path if src_path else ''}",
+            "dest": f"{payload.dest_owner}/{payload.dest_repo}"
+                    f"{'/' + dst_path if dst_path else ''}",
+        }
+
+
+    @router.get("/jobs")
+    async def list_jobs(limit: int = _LIST_LIMIT_DEFAULT) -> Dict[str, Any]:
+        limit = max(1, min(int(limit or _LIST_LIMIT_DEFAULT),
+                           _LIST_LIMIT_MAX))
+        return {"jobs": _os_list(limit)}
+
+
+    @router.get("/jobs/{job_id}")
+    async def get_job(job_id: str) -> Dict[str, Any]:
+        doc = _os_get(job_id)
+        if not doc:
+            raise HTTPException(
+                status_code=404, detail=f"job {job_id} not found"
+            )
+        return doc
+
+
+    @router.post("/jobs/{job_id}/cancel")
+    async def cancel_job(job_id: str) -> Dict[str, Any]:
+        doc = _os_get(job_id)
+        if not doc:
+            raise HTTPException(
+                status_code=404, detail=f"job {job_id} not found"
+            )
+        if doc.get("state") in ("succeeded", "failed", "cancelled"):
+            return {
+                "ok": True,
+                "state": doc.get("state"),
+                "note": "already finished",
+            }
+        with _ACTIVE_JOBS_LOCK:
+            entry = _ACTIVE_JOBS.get(job_id)
+            if entry is not None:
+                entry["cancel"] = True
+        _os_patch(job_id, {"cancel_requested": True})
+        return {"ok": True, "state": "cancel_requested"}
+
+
+    # ====================================================================
+    # 起動時に index を冪等作成
+    # ====================================================================
+    try:
+        _ensure_index()
+    except Exception as _e:
+        logger.warning(
+            f"[GIT_PATH_SYNC] initial ensure_index failed: "
+            f"{type(_e).__name__}: {_e}"
+        )

@@ -1,0 +1,114 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oauth2-proxy
+  namespace: rag-company1
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: oauth2-proxy
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: oauth2-proxy
+      annotations:
+        restarted-at: "2026-06-10T05:30:00Z"
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: rag-type
+                    operator: In
+                    values:
+                      - milvus
+      containers:
+        - name: oauth2-proxy
+          image: quay.io/oauth2-proxy/oauth2-proxy:v7.15.2
+          imagePullPolicy: IfNotPresent
+          args:
+            - '--provider=keycloak-oidc'
+            - '--oidc-issuer-url=https://keycloak.example.com/realms/rag'
+            - '--client-id=rag-frontend1'
+            - '--whitelist-domain=keycloak.example.com'
+            #  Nuxt 版 (Node.js)。これが本番の転送先。
+            #  戻すときはこの 1 行を
+            #  http://rag-frontend.rag-company1.svc.cluster.local:8501
+            #  に入れ替える (Streamlit 版の Deployment は残してある)。
+            - '--upstream=http://openspoke-frontend.rag-company1.svc.cluster.local:3000'
+            - '--http-address=0.0.0.0:4180'
+            - '--redirect-url=https://llm.example.com/oauth2/callback'
+            - '--email-domain=*'
+            - '--cookie-secure=true'
+            - '--cookie-samesite=none'
+            - '--cookie-name=_oauth2_proxy_rag_company1'
+            - '--cookie-domain=llm.example.com'
+            - '--session-store-type=cookie'
+            - '--skip-provider-button=true'
+            - '--set-xauthrequest=true'
+            - '--pass-access-token=false'
+            - '--proxy-websockets=true'
+            - '--cookie-expire=8h'
+            - '--skip-auth-route=^/ping$'
+            - '--skip-auth-route=^/favicon\.ico$'
+            - '--oidc-extra-audience=account'
+            - '--reverse-proxy=true'
+            - '--session-cookie-minimal=true'
+          env:
+            - name: OAUTH2_PROXY_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  key: client-secret
+                  name: oauth2-proxy-secret
+            - name: OAUTH2_PROXY_COOKIE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  key: cookie-secret
+                  name: oauth2-proxy-secret
+          ports:
+            - containerPort: 4180
+              name: http
+              protocol: TCP
+          livenessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /ping
+              port: 4180
+              scheme: HTTP
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            successThreshold: 1
+            timeoutSeconds: 3
+          readinessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /ping
+              port: 4180
+              scheme: HTTP
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 3
+          resources:
+            limits:
+              cpu: 200m
+              memory: 128Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30

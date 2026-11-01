@@ -1,0 +1,95 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oauth2-proxy
+  namespace: fleet-ui
+  labels:
+    app: oauth2-proxy
+spec:
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: oauth2-proxy
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: oauth2-proxy
+    spec:
+      containers:
+        - name: oauth2-proxy
+          image: quay.io/oauth2-proxy/oauth2-proxy:v7.6.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - '--provider=keycloak-oidc'
+            - '--oidc-issuer-url=https://keycloak.example.com/realms/intelligent'
+            - '--client-id=fleet-ui'
+            - '--upstream=http://fleet-ui.fleet-ui.svc.cluster.local:80'
+            - '--http-address=0.0.0.0:4180'
+            - '--redirect-url=https://fleet.example.com/oauth2/callback'
+            - '--email-domain=*'
+            - '--cookie-secure=true'
+            - '--cookie-samesite=none'
+            - '--cookie-name=_oauth2_proxy_fleet_ui'
+            - '--cookie-domain=fleet.example.com'
+            # rancher クラスタに valkey が無いので cookie ベース
+            - '--session-store-type=cookie'
+            - '--session-cookie-minimal=true'
+            - '--skip-provider-button=true'
+            - '--set-xauthrequest=true'
+            - '--pass-access-token=false'
+            - '--proxy-websockets=true'
+            - '--cookie-expire=8h'
+            - '--skip-auth-route=^/ping$'
+            - '--skip-auth-route=^/favicon\.ico$'
+            - '--skip-auth-route=^/healthz$'
+            - '--oidc-extra-audience=account'
+            - '--reverse-proxy=true'
+            - '--backend-logout-url=https://keycloak.example.com/realms/intelligent/protocol/openid-connect/logout?id_token_hint={id_token}'
+          env:
+            - name: OAUTH2_PROXY_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: oauth2-proxy-secret
+                  key: client-secret
+            - name: OAUTH2_PROXY_COOKIE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: oauth2-proxy-secret
+                  key: cookie-secret
+          ports:
+            - containerPort: 4180
+              name: http
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          readinessProbe:
+            httpGet:
+              path: /ping
+              port: 4180
+              scheme: HTTP
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /ping
+              port: 4180
+              scheme: HTTP
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 3
+            failureThreshold: 3
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30

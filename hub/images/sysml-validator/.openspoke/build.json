@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "name": "sysml-validator",
+  "branch": "main",
+  "jobs": [
+    {
+      "name": "image",
+      "workdir": "hub/images/sysml-validator",
+      "dockerfile": "Dockerfile",
+      "image_push": "your-registry.example.com/sysml-validator",
+      "manifest_bump": { "paths": ["hub/manifests/sysml-validator/Deployments/sysml-validator.yaml"] },
+      "cpu": "4",
+      "memory": "8Gi"
+    }
+  ]
+}

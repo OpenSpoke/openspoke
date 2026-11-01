@@ -1,0 +1,10 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: rag-backend-kernel
+  namespace: rag-company1
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: rag-backend-kernel

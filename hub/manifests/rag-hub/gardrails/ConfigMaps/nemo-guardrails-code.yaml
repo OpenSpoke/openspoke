@@ -1,0 +1,255 @@
+apiVersion: v1
+data:
+  guardrails_server.py: |
+    """
+    NeMo Guardrails Service
+    RAGパイプラインの入力・チャンク・出力に対する安全制御を提供。
+    Bedrock Guardrailsにないretrieval rails（チャンクフィルタ）を独自実装。
+    """
+
+    import os
+    import re
+    import time
+    import logging
+    import uvicorn
+    from fastapi import FastAPI, HTTPException
+    from pydantic import BaseModel
+    from typing import List, Dict, Any, Optional
+
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    logger = logging.getLogger(__name__)
+
+    app = FastAPI(title="NeMo Guardrails Service")
+
+    # ── 設定 ────────────────────────────────────────────────
+
+    PII_PATTERNS = {
+        "phone": re.compile(r'0\d{1,4}[-\s]?\d{1,4}[-\s]?\d{3,4}'),
+        "email": re.compile(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+'),
+        "postal_code": re.compile(r'〒?\d{3}[-ー]\d{4}'),
+        "credit_card": re.compile(r'\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}'),
+        "my_number": re.compile(r'\d{4}\s?\d{4}\s?\d{4}'),
+    }
+
+    ADDRESS_MASK_PATTERN = re.compile(
+        r'((?:東京都|北海道|(?:京都|大阪)府|.{2,3}県)'
+        r'(?:[^\s]{1,5}[市区町村郡]))'
+        r'([^\s、。\n]+)'
+    )
+
+    JAILBREAK_PATTERNS = [
+        re.compile(r'前の指示を(?:無視|忘れ)', re.IGNORECASE),
+        re.compile(r'(?:ignore|forget|disregard)\s+(?:previous|above|all)\s+(?:instructions?|prompts?|rules?)', re.IGNORECASE),
+        re.compile(r'(?:system\s*prompt|システムプロンプト)(?:を|が|は).*(?:教え|表示|出力|見せ)', re.IGNORECASE),
+        re.compile(r'(?:jailbreak|DAN|do\s+anything\s+now)', re.IGNORECASE),
+        re.compile(r'(?:全データ|全て|すべて).*(?:ダンプ|出力|抽出|エクスポート)', re.IGNORECASE),
+        re.compile(r'(?:role\s*play|ロールプレイ).*(?:制限|ルール|制約).*(?:ない|なし|解除)', re.IGNORECASE),
+        re.compile(r'(?:pretend|act\s+as\s+if).*(?:no\s+restrictions?|unlimited)', re.IGNORECASE),
+    ]
+
+    BLOCKED_TOPICS = [
+        re.compile(r'(?:爆弾|爆発物|武器).*(?:作り方|製造|作成)', re.IGNORECASE),
+        re.compile(r'(?:how\s+to\s+(?:make|build|create)).*(?:bomb|weapon|explosive)', re.IGNORECASE),
+        re.compile(r'(?:ハッキング|不正アクセス).*(?:方法|やり方|手順)', re.IGNORECASE),
+    ]
+
+    # ── Pydantic モデル ────────────────────────────────────
+
+    class InputGuardRequest(BaseModel):
+        text: str
+        tenant: str = "default"
+
+    class ChunkGuardRequest(BaseModel):
+        chunks: List[Dict[str, Any]]
+        tenant: str = "default"
+        mask_pii: bool = True
+
+    class OutputGuardRequest(BaseModel):
+        question: str
+        context: str
+        answer: str
+        tenant: str = "default"
+
+    # ── PII検出・マスク ────────────────────────────────────
+
+    def detect_pii(text):
+        findings = []
+        for pii_type, pattern in PII_PATTERNS.items():
+            for match in pattern.finditer(text):
+                findings.append({"type": pii_type, "match": match.group(), "start": match.start(), "end": match.end()})
+        return findings
+
+    def mask_pii_in_text(text):
+        masked = text
+        pii_count = 0
+
+        def mask_address(m):
+            nonlocal pii_count
+            pii_count += 1
+            return m.group(1) + "[住所詳細マスク済み]"
+
+        masked = ADDRESS_MASK_PATTERN.sub(mask_address, masked)
+
+        for pii_type, pattern in PII_PATTERNS.items():
+            def mask_fn(m, pt=pii_type):
+                nonlocal pii_count
+                pii_count += 1
+                return "[" + pt + "マスク済み]"
+            masked = pattern.sub(mask_fn, masked)
+
+        return masked, pii_count
+
+    # ── Jailbreak検出 ──────────────────────────────────────
+
+    def detect_jailbreak(text):
+        for pattern in JAILBREAK_PATTERNS:
+            if pattern.search(text):
+                return pattern.pattern[:50]
+        return None
+
+    # ── トピック制御 ───────────────────────────────────────
+
+    def detect_blocked_topic(text):
+        for pattern in BLOCKED_TOPICS:
+            if pattern.search(text):
+                return pattern.pattern[:50]
+        return None
+
+    # ── ハルシネーション検出（ルールベース簡易版）──────────
+
+    def detect_hallucination_simple(question, context, answer):
+        def extract_nouns(text):
+            katakana = set(re.findall(r'[\u30A0-\u30FF]{2,}', text))
+            english = set(re.findall(r'[A-Za-z]{3,}', text))
+            numbers = set(re.findall(r'\d+[\w]*', text))
+            return katakana | english | numbers
+
+        context_nouns = extract_nouns(context)
+        question_nouns = extract_nouns(question)
+        answer_nouns = extract_nouns(answer)
+
+        suspicious = answer_nouns - context_nouns - question_nouns
+        common_words = {'the', 'and', 'for', 'that', 'this', 'with', 'from', 'are', 'was', 'has', 'not', 'can', 'but', 'all', 'one', 'two'}
+        suspicious = {w for w in suspicious if w.lower() not in common_words and len(w) >= 3}
+
+        if suspicious:
+            return {"detected": True, "suspicious_terms": list(suspicious)[:10], "confidence": min(len(suspicious) / 3.0, 1.0)}
+        return {"detected": False, "suspicious_terms": [], "confidence": 0.0}
+
+    # ── エンドポイント ─────────────────────────────────────
+
+    @app.get("/health")
+    async def health():
+        return {
+            "status": "healthy",
+            "service": "NeMo Guardrails",
+            "rails": ["input", "retrieval", "output"],
+            "features": {
+                "pii_detection": True,
+                "pii_masking": True,
+                "jailbreak_detection": True,
+                "topic_control": True,
+                "hallucination_detection": "rule_based",
+            }
+        }
+
+    @app.post("/guard/input")
+    async def guard_input(request: InputGuardRequest):
+        start = time.time()
+        logger.info(f"[INPUT_RAIL] tenant={request.tenant}, text_len={len(request.text)}")
+
+        result = {"allowed": True, "reason": None, "modified_text": None, "details": {}}
+
+        jailbreak = detect_jailbreak(request.text)
+        if jailbreak:
+            logger.warning(f"[INPUT_RAIL] Jailbreak detected: {jailbreak}")
+            result["allowed"] = False
+            result["reason"] = "jailbreak_detected"
+            result["details"]["jailbreak_pattern"] = jailbreak
+            result["processing_time_sec"] = round(time.time() - start, 4)
+            return result
+
+        blocked = detect_blocked_topic(request.text)
+        if blocked:
+            logger.warning(f"[INPUT_RAIL] Blocked topic detected: {blocked}")
+            result["allowed"] = False
+            result["reason"] = "blocked_topic"
+            result["details"]["topic_pattern"] = blocked
+            result["processing_time_sec"] = round(time.time() - start, 4)
+            return result
+
+        pii_findings = detect_pii(request.text)
+        if pii_findings:
+            result["details"]["pii_in_input"] = len(pii_findings)
+
+        result["processing_time_sec"] = round(time.time() - start, 4)
+        return result
+
+    @app.post("/guard/chunks")
+    async def guard_chunks(request: ChunkGuardRequest):
+        start = time.time()
+        logger.info(f"[RETRIEVAL_RAIL] tenant={request.tenant}, chunks={len(request.chunks)}")
+
+        processed_chunks = []
+        total_masked = 0
+        total_filtered = 0
+
+        for chunk in request.chunks:
+            text = chunk.get("text", "")
+            chunk_result = {**chunk, "masked": False, "filtered": False}
+
+            if request.mask_pii:
+                masked_text, pii_count = mask_pii_in_text(text)
+                if pii_count > 0:
+                    chunk_result["text"] = masked_text
+                    chunk_result["masked"] = True
+                    chunk_result["pii_masked_count"] = pii_count
+                    total_masked += 1
+                    logger.info(f"[RETRIEVAL_RAIL] Masked {pii_count} PII in chunk")
+
+            processed_chunks.append(chunk_result)
+
+        elapsed = time.time() - start
+        logger.info(f"[RETRIEVAL_RAIL] Processed {len(request.chunks)} chunks: {total_masked} masked, {total_filtered} filtered in {elapsed:.4f}s")
+
+        return {
+            "chunks": processed_chunks,
+            "masked_count": total_masked,
+            "filtered_count": total_filtered,
+            "processing_time_sec": round(elapsed, 4),
+        }
+
+    @app.post("/guard/output")
+    async def guard_output(request: OutputGuardRequest):
+        start = time.time()
+        logger.info(f"[OUTPUT_RAIL] tenant={request.tenant}, answer_len={len(request.answer)}")
+
+        result = {"allowed": True, "reason": None, "details": {}}
+
+        hallucination = detect_hallucination_simple(request.question, request.context, request.answer)
+        if hallucination["detected"] and hallucination["confidence"] >= 0.5:
+            result["allowed"] = False
+            result["reason"] = "hallucination_detected"
+            result["details"]["suspicious_terms"] = hallucination["suspicious_terms"]
+            result["details"]["confidence"] = hallucination["confidence"]
+            logger.warning(f"[OUTPUT_RAIL] Hallucination detected: terms={hallucination['suspicious_terms']}")
+        elif hallucination["detected"]:
+            result["details"]["hallucination_warning"] = {
+                "suspicious_terms": hallucination["suspicious_terms"],
+                "confidence": hallucination["confidence"],
+            }
+
+        pii_findings = detect_pii(request.answer)
+        if pii_findings:
+            result["details"]["pii_in_output"] = len(pii_findings)
+
+        result["processing_time_sec"] = round(time.time() - start, 4)
+        return result
+
+    if __name__ == "__main__":
+        port = int(os.environ.get("GUARDRAILS_PORT", "8000"))
+        uvicorn.run("guardrails_server:app", host="0.0.0.0", port=port, workers=1)
+kind: ConfigMap
+metadata:
+  name: nemo-guardrails-code
+  namespace: guardrails

@@ -1,0 +1,123 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-backend-kernel-cloudflare-account
+  namespace: rag-company1
+data:
+  cloudflare_account.py: |
+    """
+    cloudflare_account.py
+    ====================================================================
+    Cloudflare API Token Resolver
+    ====================================================================
+
+    Phase 2-i (2026-10-24): Cloudflare API Token を git_credentials 保管庫 +
+    env フォールバック経路で解決する。 Anthropic (Phase 2-e) / GitHub
+    (Phase 2-f) / GitLab (Phase 2-g) / TypeSafe (Phase 2-h) と対称の実装。
+
+    解決順:
+      1. account_id 指定あり + git_credentials 保管庫に
+         "org:cloudflare:{account_id}" あり → 保管庫 token
+      2. CREDENTIALS_BOOTSTRAP_MODE が 'bootstrap' かつ
+         env `CLOUDFLARE_API_TOKEN` あり → env token
+      3. どれも無ければ RuntimeError
+
+    呼び出し側は `resolve_cloudflare_token(account_id=...)` を呼び、
+    戻り値の `CloudflareCredentials` dataclass を使う。
+    """
+
+    from __future__ import annotations
+
+    import logging
+    import os
+    from dataclasses import dataclass
+    from typing import Optional
+
+    logger = logging.getLogger(__name__)
+
+
+    DEFAULT_API_BASE = "https://api.cloudflare.com/client/v4"
+
+
+    @dataclass
+    class CloudflareCredentials:
+        """Cloudflare API 呼び出しに必要な資格情報。"""
+
+        token: str
+        account_id: str
+        base_url: str = DEFAULT_API_BASE
+
+
+    def _fetch_token_from_store(account_id: str) -> Optional[str]:
+        """git_credentials.resolve_cloudflare_token_for_account への橋渡し。
+
+        import は遅延で行う (git_credentials.py が同じプロセス空間に
+        subPath mount されている前提、import 失敗時は None 返却)。
+        """
+        if not account_id:
+            return None
+        try:
+            from git_credentials import resolve_cloudflare_token_for_account
+
+            return resolve_cloudflare_token_for_account(account_id)
+        except Exception as _e:
+            logger.debug(
+                f"[CF_ACCOUNT] git_credentials import or call failed: {_e}"
+            )
+            return None
+
+
+    def resolve_cloudflare_token(
+        account_id: str = "",
+        bootstrap_mode: Optional[str] = None,
+    ) -> CloudflareCredentials:
+        """Cloudflare API Token を解決する。
+
+        Args:
+            account_id: Cloudflare account ID (UUID 形式)。
+                        省略時は env `CLOUDFLARE_ACCOUNT_ID` から読む。
+            bootstrap_mode: 'bootstrap' or 'strict' (省略時は env
+                            `CREDENTIALS_BOOTSTRAP_MODE` を参照、既定 'strict')。
+
+        Returns:
+            CloudflareCredentials (token + account_id + base_url)。
+
+        Raises:
+            RuntimeError: どの経路でも token を得られなかった場合。
+        """
+        account_id = (account_id or "").strip()
+        if not account_id:
+            account_id = (os.environ.get("CLOUDFLARE_ACCOUNT_ID") or "").strip()
+
+        # 段 1: 保管庫
+        store_token = _fetch_token_from_store(account_id)
+        if store_token:
+            return CloudflareCredentials(
+                token=store_token,
+                account_id=account_id,
+                base_url=DEFAULT_API_BASE,
+            )
+
+        # 段 2: env fallback (bootstrap モードのみ)
+        if bootstrap_mode is None:
+            bootstrap_mode = (
+                os.environ.get("CREDENTIALS_BOOTSTRAP_MODE") or "strict"
+            ).strip()
+
+        if bootstrap_mode == "bootstrap":
+            env_token = (os.environ.get("CLOUDFLARE_API_TOKEN") or "").strip()
+            if env_token:
+                logger.warning(
+                    "[CF_ACCOUNT] 保管庫未登録なので env CLOUDFLARE_API_TOKEN に "
+                    "フォールバック (bootstrap モード)"
+                )
+                return CloudflareCredentials(
+                    token=env_token,
+                    account_id=account_id,
+                    base_url=DEFAULT_API_BASE,
+                )
+
+        raise RuntimeError(
+            f"Cloudflare API Token not available: no token in git_credentials "
+            f"store (scope_id={account_id!r}), bootstrap_mode={bootstrap_mode!r}"
+        )

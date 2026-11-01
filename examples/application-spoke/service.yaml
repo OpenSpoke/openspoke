@@ -1,0 +1,19 @@
+# Application spoke: in-cluster Service in front of the kernel-proxy
+# sidecar. Application workloads reach the hub kernel through this
+# Service (http://kernel-proxy.<namespace>.svc.cluster.local:8080).
+apiVersion: v1
+kind: Service
+metadata:
+  name: kernel-proxy
+  namespace: example-app
+  labels:
+    app.kubernetes.io/name: kernel-proxy
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: kernel-proxy
+  ports:
+    - name: kernel-proxy
+      port: 8080
+      targetPort: 8080
+      protocol: TCP

@@ -1,0 +1,65 @@
+# Application spoke: tunnel-client sidecar in HTTP-proxy mode.
+#
+# The container runs tunnel-client with KERNEL_PROXY_LISTEN set, which
+# turns it into a local HTTP endpoint that forwards every request to the
+# hub kernel over the reverse tunnel. There is no TARGET set, so the
+# pre-v3 TCP-tunnelling mode is disabled for this deployment.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kernel-proxy
+  namespace: example-app
+  labels:
+    app.kubernetes.io/name: kernel-proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kernel-proxy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kernel-proxy
+    spec:
+      containers:
+        - name: tunnel-client
+          image: ghcr.io/openspoke/tunnel-client:v3.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: HUB_URL
+              value: "https://hub.example.com"
+            - name: KERNEL_PROXY_LISTEN
+              value: "0.0.0.0:8080"
+            - name: TUNNEL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: kernel-proxy-tunnel
+                  key: TUNNEL_TOKEN
+            - name: SPOKE_ID
+              valueFrom:
+                secretKeyRef:
+                  name: kernel-proxy-tunnel
+                  key: SPOKE_ID
+          ports:
+            - name: kernel-proxy
+              containerPort: 8080
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20

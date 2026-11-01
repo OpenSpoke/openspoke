@@ -1,0 +1,105 @@
+# 毎日 JST 03:00 (UTC 18:00) に OpenSearch の指定 index を MinIO へバックアップする CronJob。
+# 保持期間は 14 日。 古いスナップショット (daily-* で 14 日以上前のもの) は自動削除する。
+#
+# 仕組み:
+#   1. curl で OpenSearch に PUT _snapshot/minio_repo/daily-YYYYMMDD-HHMMSS を投げる
+#   2. その後 GET _snapshot/minio_repo/_all で全スナップショット一覧を取得、
+#      daily- で始まり、 14 日以上前のものを DELETE する
+#
+# image: curlimages/curl は curl と date と sh が入った 5MB 程度の軽量 image。
+# OpenSearch Service: cluster-local の http://opensearch.opensearch.svc.cluster.local:9200。
+# 認証: OpenSearch 側で security disabled なので不要。
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: opensearch-snapshot-daily
+  namespace: opensearch
+spec:
+  # JST 03:00 = UTC 18:00 (毎日)。 利用が少ない時間帯
+  schedule: "0 18 * * *"
+  # 前回 Job がまだ走っていれば今回 skip (同時実行で repository 競合を避ける)
+  concurrencyPolicy: Forbid
+  # 失敗 Job も成功 Job も 3 つまで Pod を残してログ確認できるようにする
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  # Job 起動を遅延させない (デフォルト)
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      # スナップショット作成 + 古い snapshot 削除をまとめて 1 Job で
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: snapshot
+              image: curlimages/curl:8.10.1
+              env:
+                # OpenSearch endpoint (同 namespace 内なので短縮形でも可)
+                - name: OS_URL
+                  value: "http://opensearch.opensearch.svc.cluster.local:9200"
+                - name: REPO
+                  value: "minio_repo"
+                # スナップショット保持日数 (この日数より古い daily-* は削除)
+                - name: RETENTION_DAYS
+                  value: "14"
+                # バックアップ対象 index (wildcard 指定。 環境に合わせてカスタマイズ)
+                - name: INDICES
+                  value: "rag_chunks,claude_usage"
+              command:
+                - sh
+                - -c
+                - |
+                  set -e
+                  # スナップショット名 (UTC、 daily- prefix で識別)
+                  NOW_UTC=$(date -u +%Y%m%d-%H%M%S)
+                  SNAPSHOT_NAME="daily-${NOW_UTC}"
+                  echo "[$(date -u +%FT%TZ)] Starting snapshot: ${SNAPSHOT_NAME}"
+                  echo "[$(date -u +%FT%TZ)] Target indices: ${INDICES}"
+
+                  # スナップショット作成 (wait_for_completion=true で完了まで待つ)
+                  RESPONSE=$(curl -sS -X PUT \
+                    "${OS_URL}/_snapshot/${REPO}/${SNAPSHOT_NAME}?wait_for_completion=true" \
+                    -H 'Content-Type: application/json' \
+                    -d "{\"indices\":\"${INDICES}\",\"include_global_state\":false,\"ignore_unavailable\":true}")
+                  echo "[$(date -u +%FT%TZ)] Create response: ${RESPONSE}"
+
+                  # state が SUCCESS でなければ Job 失敗扱い
+                  echo "${RESPONSE}" | grep -q '"state":"SUCCESS"' || {
+                    echo "[$(date -u +%FT%TZ)] ERROR: snapshot did not succeed"
+                    exit 1
+                  }
+                  echo "[$(date -u +%FT%TZ)] Snapshot created successfully"
+
+                  # 古い daily- snapshot を削除 (RETENTION_DAYS 日より前のもの)
+                  echo "[$(date -u +%FT%TZ)] Cleaning up snapshots older than ${RETENTION_DAYS} days"
+                  CUTOFF_EPOCH=$(($(date -u +%s) - RETENTION_DAYS * 86400))
+                  ALL_SNAPSHOTS=$(curl -sS "${OS_URL}/_snapshot/${REPO}/_all")
+                  # 「"snapshot":"daily-..."」と「"start_time_in_millis":数字」 を 1 行ずつ取り出して
+                  # 1 件 1 行の "name epoch_seconds" に整形して走査
+                  echo "${ALL_SNAPSHOTS}" \
+                    | sed 's/},{/}\n{/g' \
+                    | grep -E '"snapshot":"daily-' \
+                    | while read line; do
+                        NAME=$(echo "${line}" | sed -n 's/.*"snapshot":"\(daily-[^"]*\)".*/\1/p')
+                        START_MS=$(echo "${line}" | sed -n 's/.*"start_time_in_millis":\([0-9]*\).*/\1/p')
+                        if [ -z "${NAME}" ] || [ -z "${START_MS}" ]; then
+                          continue
+                        fi
+                        START_EPOCH=$((START_MS / 1000))
+                        if [ "${START_EPOCH}" -lt "${CUTOFF_EPOCH}" ]; then
+                          echo "[$(date -u +%FT%TZ)] Deleting old snapshot: ${NAME} (start_epoch=${START_EPOCH})"
+                          curl -sS -X DELETE "${OS_URL}/_snapshot/${REPO}/${NAME}" && echo
+                        else
+                          echo "[$(date -u +%FT%TZ)] Keeping snapshot: ${NAME} (start_epoch=${START_EPOCH})"
+                        fi
+                      done
+
+                  echo "[$(date -u +%FT%TZ)] Done"
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 32Mi
+                limits:
+                  cpu: 500m
+                  memory: 128Mi

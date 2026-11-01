@@ -1,0 +1,88 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcp-opensearch-migrate
+  namespace: mcp
+data:
+  opensearch_migrate_tool.py: |
+    """OpenSearch index 移行の制御ツール (ハブ / 検証 MCP 用)。
+
+    target kernel の /core/opensearch/migrate_pull を Cloudflare 経由で叩く。
+    target が source の /core/opensearch/migrate_export を pull して自分の
+    OpenSearch に bulk index する。 doc は kernel 間を直接流れ、 MCP / Claude
+    のコンテキストには載らない (summary のみ返る)。
+
+    mcp-server-code.py から
+      import opensearch_migrate_tool as _osm
+      _osm.register_opensearch_migrate_tools(mcp)
+    で取り込む (knowledge_migrate_tool と同じ流儀)。
+
+    NOTE: mcp_server には typing が import されていないため、 型注釈は builtin
+    (dict / list / str / bool) のみ使用する。
+    """
+    import os
+    import httpx
+
+
+    _KERNELS = {
+        "aws": "https://kernel-0001.example.com",
+        "aws2": "https://kernel-0002.example.com",
+        "rag": "https://kernel-9001.example.com",
+    }
+
+
+    def register_opensearch_migrate_tools(mcp):
+        _token = os.environ.get("KNOWLEDGE_MIGRATE_TOKEN", "")
+
+        @mcp.tool()
+        async def migrate_opensearch_indices(target: str, source: str, indices: list,
+                                             batch_size: int = 1000,
+                                             dry_run: bool = False) -> dict:
+            """OpenSearch index を source kernel から target kernel に移行 (pull) する。
+
+            target / source は "aws" | "aws2" | "rag"。 target kernel の
+            /core/opensearch/migrate_pull を起動し、 target が source の
+            /core/opensearch/migrate_export を scroll で pull して自分に bulk index する。
+            同 _id は上書きされる (upsert 相当)。 dry_run=True なら fetched 件数のみ確認。
+
+            Args:
+                target:     投入先クラスタ "aws" | "aws2" | "rag"
+                source:     取得元クラスタ "aws" | "aws2" | "rag"
+                indices:    移行対象 index 名のリスト (例: ["secretary_messages", "claude_usage"])
+                batch_size: scroll の 1 ページ件数 (既定 1000)
+                dry_run:    True で件数のみ確認 (非破壊)
+            Returns:
+                target kernel の migrate_pull の結果
+                (index ごとの fetched / upserted / failed を含む dict)。
+            """
+            if not _token:
+                return {"ok": False, "error": "KNOWLEDGE_MIGRATE_TOKEN not configured on this MCP"}
+            if target not in _KERNELS or source not in _KERNELS:
+                return {"ok": False, "error": f"target/source must be one of {list(_KERNELS.keys())}"}
+            if target == source:
+                return {"ok": False, "error": "target and source must differ"}
+            if not isinstance(indices, list) or not indices:
+                return {"ok": False, "error": "indices must be a non-empty list"}
+
+            target_url = _KERNELS[target]
+            source_url = _KERNELS[source]
+            try:
+                async with httpx.AsyncClient(timeout=600.0) as c:
+                    r = await c.post(
+                        f"{target_url}/core/opensearch/migrate_pull",
+                        json={
+                            "source_base_url": source_url,
+                            "source_token": _token,
+                            "indices": indices,
+                            "batch_size": batch_size,
+                            "dry_run": dry_run,
+                        },
+                        headers={"Authorization": f"Bearer {_token}"},
+                    )
+                try:
+                    return r.json()
+                except Exception:
+                    return {"ok": False,
+                            "error": f"non-JSON response (status {r.status_code}): {r.text[:300]}"}
+            except Exception as e:
+                return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}

@@ -1,0 +1,32 @@
+# Read-only cluster access for the spoke MCP.
+#
+# Until now the mcp-spoke ServiceAccount had exactly one binding, to
+# cluster-admin, carried in mcp/ServiceAccounts/mcp-spoke.yaml. That grant
+# exists only so fleet_agent_install can install a fleet-agent, which needs
+# to create ClusterRoleBindings. On a cluster that will never run it, a
+# cluster-admin ServiceAccount is a standing capability with nothing asking
+# for it.
+#
+# Taking it away on its own leaves the MCP with no permissions at all, not
+# even reading pods in its own namespace, so node_list stops working and with
+# it cluster_node_exec. This binding is what makes withholding cluster-admin
+# a usable default: it reuses rag-backend-kernel-observer-spoke, the
+# read-only ClusterRole the spoke kernel already uses, which grants get and
+# list and nothing else, and no access to Secrets.
+#
+# The ClusterRole itself lives in kernel/RBAC/kernel-observer.yaml. A binding
+# may be created before its role exists and simply grants nothing until it
+# does, so the order of delivery does not matter for correctness; the
+# installer applies the kernel first anyway.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mcp-spoke-observer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: rag-backend-kernel-observer-spoke
+subjects:
+  - kind: ServiceAccount
+    name: mcp-spoke
+    namespace: rag-spoke

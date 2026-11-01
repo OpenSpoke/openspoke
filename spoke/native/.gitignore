@@ -1,0 +1,15 @@
+# Binaries
+/native-spoke
+/native-spoke.exe
+/dist/
+
+# Test artifacts
+*.test
+*.out
+coverage.html
+coverage.out
+
+# IDE
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,130 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: etcd-ha-headless
+  namespace: milvus
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - name: client
+      port: 2379
+      targetPort: 2379
+      protocol: TCP
+    - name: peer
+      port: 2380
+      targetPort: 2380
+      protocol: TCP
+  selector:
+    app: etcd-ha
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: etcd-ha
+  namespace: milvus
+spec:
+  type: ClusterIP
+  ports:
+    - name: client
+      port: 2379
+      targetPort: 2379
+      protocol: TCP
+  selector:
+    app: etcd-ha
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: etcd-ha
+  namespace: milvus
+  labels:
+    app: etcd-ha
+spec:
+  serviceName: etcd-ha-headless
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: etcd-ha
+  template:
+    metadata:
+      labels:
+        app: etcd-ha
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: Exists
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: etcd-ha
+              topologyKey: kubernetes.io/hostname
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: etcd
+          image: quay.io/coreos/etcd:v3.5.5
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              exec etcd \
+                --name=${HOSTNAME} \
+                --data-dir=/etcd-data \
+                --listen-client-urls=http://0.0.0.0:2379 \
+                --advertise-client-urls=http://${HOSTNAME}.etcd-ha-headless.milvus.svc.cluster.local:2379 \
+                --listen-peer-urls=http://0.0.0.0:2380 \
+                --initial-advertise-peer-urls=http://${HOSTNAME}.etcd-ha-headless.milvus.svc.cluster.local:2380 \
+                --initial-cluster=etcd-ha-0=http://etcd-ha-0.etcd-ha-headless.milvus.svc.cluster.local:2380,etcd-ha-1=http://etcd-ha-1.etcd-ha-headless.milvus.svc.cluster.local:2380,etcd-ha-2=http://etcd-ha-2.etcd-ha-headless.milvus.svc.cluster.local:2380 \
+                --initial-cluster-state=new \
+                --initial-cluster-token=milvus-etcd-ha \
+                --auto-compaction-mode=periodic \
+                --auto-compaction-retention=1h \
+                --quota-backend-bytes=8589934592
+          env:
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ports:
+            - name: client
+              containerPort: 2379
+              protocol: TCP
+            - name: peer
+              containerPort: 2380
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 2379
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 2379
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: etcd-data
+              mountPath: /etcd-data
+          resources: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: etcd-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: local-path
+        resources:
+          requests:
+            storage: 10Gi

@@ -1,0 +1,49 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: spoke-probe
+  namespace: rag-company1
+spec:
+  schedule: "*/1 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 60
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      ttlSecondsAfterFinished: 600
+      template:
+        metadata:
+          labels:
+            app: spoke-probe
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: probe
+              image: python:3.12-slim
+              imagePullPolicy: IfNotPresent
+              command:
+                - python3
+                - /code/probe.py
+              env:
+                - name: HUB_OS_URL
+                  value: "http://opensearch.opensearch.svc.cluster.local:9200"
+                - name: PROBE_TIMEOUT
+                  value: "5"
+              resources:
+                limits:
+                  cpu: 200m
+                  memory: 128Mi
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+              volumeMounts:
+                - name: code
+                  mountPath: /code
+                  readOnly: true
+          volumes:
+            - name: code
+              configMap:
+                name: spoke-probe-code
+                defaultMode: 420

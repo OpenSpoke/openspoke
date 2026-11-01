@@ -1,0 +1,387 @@
+---
+# Phase 4 段階 5': バイナリ検査 runner
+# 動作: mobile-scan-targets の各アプリについて、 Mac (nsmt、 spoke-example) 上の
+# ビルド済み成果物を bundle_id / package_name で照合し、 ConfigMap の scanner
+# (mobile-binary-scan-ios-script / -android-script) を Mac に書き戻してから
+# 実行、 結果を kernel `/core/security/events` に POST する。
+# Mac への経路は tunnel-server の内部口 (JSON-RPC tools/call nsm_sh_exec)。
+# kernel・mcp1 を経由せず、 認証用の Secret も不要。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mobile-binary-scan-runner
+  namespace: security-mobile
+  labels:
+    purpose: mobile-vulnerability-scan
+data:
+  binary_scan_runner.py: |
+    #!/usr/bin/env python3
+    """
+    モバイルアプリ バイナリスキャン runner (Phase 4 段階 5')。
+
+    Fleet モジュール security-mobile 内の K8s CronJob として動作する。
+    Mac (nsmt、 spoke-example) 上でビルド済みの .app / .apk を検査し、
+    結果を kernel `/core/security/events` に POST する。
+
+    経路:
+      K8s Pod → tunnel-server.mcp.svc.cluster.local:<spoke port>/mcp
+      (JSON-RPC 2.0 tools/call nsm_sh_exec) → nsmt (--hub モード) → zsh
+      nsmt は tunnel 経由の要求に Bearer を求めない (hub の
+      _native_spoke_call_raw と同じ方式)。 kernel も mcp1 も経由しない。
+
+    処理 (app ごと、 nsm_sh_exec 1 回):
+      1. ConfigMap の scanner を base64 で Mac の SCANNER_DIR に書き戻す
+         (正本は ConfigMap。 Mac 上の実物は毎回これで上書きされる)
+      2. 成果物を bundle_id (iOS) / applicationId (Android) で照合し、
+         一致したもののうち更新時刻が最新を採用する
+         - iOS: *.app の Info.plist の CFBundleIdentifier が完全一致
+           (Index.noindex 配下の殻は除外)
+         - Android: aapt2 dump packagename が package_name と一致、
+           または package_name + "." で始まる (applicationIdSuffix 対応、
+           例: com.example.app.debug)
+      3. scanner を実行し stdout の JSON を返す
+      成果物が見つからない app は skip (失敗扱いにしない)。
+
+    環境変数:
+      KERNEL_URL            : kernel Service URL
+      NSMT_MCP_URL          : nsmt の MCP 口 (tunnel-server 経由)
+      TARGETS_CONFIG_PATH   : targets.yaml
+      IOS_SCANNER_PATH      : mobile_binary_scan_ios.py (ConfigMap)
+      ANDROID_SCANNER_PATH  : mobile_binary_scan_android.py (ConfigMap)
+      SCANNER_DIR           : Mac 側の scanner 置き場 (default: $HOME/nsm-work/auto)
+      IOS_SEARCH_ROOTS      : ":" 区切り、 Mac 側の .app 探索起点
+      ANDROID_SEARCH_ROOTS  : ":" 区切り、 Mac 側の .apk 探索起点
+      DRY_RUN               : "true" なら POST しない
+
+    終了コード:
+      0 = 設定読み込みまで成功 (app 単位の失敗や skip はログのみ)
+      2 = 致命的失敗 (設定なし / Mac に届かない)
+      event 発行を伴うので、 CronJob 側は backoffLimit: 0 で再試行しない。
+    """
+    import base64
+    import json
+    import os
+    import shlex
+    import sys
+    import time
+    import urllib.error
+    import urllib.request
+    import uuid
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    import yaml  # PyYAML
+
+    KERNEL_URL = os.environ.get(
+        "KERNEL_URL", "http://rag-backend-kernel.rag-company1.svc.cluster.local:8000")
+    NSMT_MCP_URL = os.environ.get(
+        "NSMT_MCP_URL", "http://tunnel-server.mcp.svc.cluster.local:10008/mcp")
+    TARGETS_CONFIG_PATH = os.environ.get("TARGETS_CONFIG_PATH", "/config/targets.yaml")
+    IOS_SCANNER_PATH = os.environ.get(
+        "IOS_SCANNER_PATH", "/scanners/ios/mobile_binary_scan_ios.py")
+    ANDROID_SCANNER_PATH = os.environ.get(
+        "ANDROID_SCANNER_PATH", "/scanners/android/mobile_binary_scan_android.py")
+    SCANNER_DIR = os.environ.get("SCANNER_DIR", "$HOME/nsm-work/auto")
+    IOS_SEARCH_ROOTS = os.environ.get(
+        "IOS_SEARCH_ROOTS",
+        "$HOME/Library/Application Support/NativeSpokeMacTool/work/ios-dd"
+        ":$HOME/Library/Developer/Xcode/DerivedData")
+    ANDROID_SEARCH_ROOTS = os.environ.get(
+        "ANDROID_SEARCH_ROOTS",
+        "$HOME/Documents:$HOME/Library/Application Support/NativeSpokeMacTool/work")
+    DRY_RUN = os.environ.get("DRY_RUN", "").lower() == "true"
+
+    BEGIN = "@@SCAN_JSON_BEGIN@@"
+    END = "@@SCAN_JSON_END@@"
+
+
+    def nsm_sh_exec(script: str, timeout_sec: int = 45) -> dict:
+        """nsmt の nsm_sh_exec を呼び、 {exit_code, stdout, stderr, ...} を返す。
+        通信失敗時は RuntimeError。"""
+        body = {
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "nsm_sh_exec",
+                       "arguments": {"script": script, "timeout_sec": timeout_sec}},
+        }
+        req = urllib.request.Request(
+            NSMT_MCP_URL, data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json",
+                     "Accept": "application/json, text/event-stream"},
+            method="POST")
+        with urllib.request.urlopen(req, timeout=timeout_sec + 20) as r:
+            res = json.loads(r.read())
+        if "error" in res:
+            raise RuntimeError(f"nsmt error: {res['error']}")
+        content = res.get("result", {}).get("content", [])
+        text = "".join(c.get("text", "") for c in content if c.get("type") == "text")
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            raise RuntimeError(f"nsm_sh_exec 応答が JSON でない: {text[:300]}")
+
+
+    def _roots_expr(roots: str) -> str:
+        """':' 区切りの探索起点を zsh の配列リテラルにする ($HOME は展開させる)。"""
+        parts = [p for p in roots.split(":") if p]
+        return " ".join('"' + p.replace('"', '\\"') + '"' for p in parts)
+
+
+    def build_script(app: dict, scanner_b64: str, scanner_name: str, scan_id: str) -> str:
+        platform = app["platform"]
+        ident = app.get("bundle_id") if platform == "ios" else app.get("package_name")
+        q_ident = shlex.quote(ident)
+        q_scan_id = shlex.quote(scan_id)
+        head = f'''set -u
+    SD="{SCANNER_DIR}"
+    mkdir -p "$SD"
+    echo {shlex.quote(scanner_b64)} | base64 -D > "$SD/{scanner_name}.tmp" && mv "$SD/{scanner_name}.tmp" "$SD/{scanner_name}"
+    IDENT={q_ident}
+    BEST=""; BEST_T=0
+    '''
+        if platform == "ios":
+            find_part = f'''for R in {_roots_expr(IOS_SEARCH_ROOTS)}; do
+      [ -d "$R" ] || continue
+      while IFS= read -r A; do
+        case "$A" in *Index.noindex*|*/PlugIns/*) continue;; esac
+        [ -f "$A/Info.plist" ] || continue
+        B=$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$A/Info.plist" 2>/dev/null)
+        [ "$B" = "$IDENT" ] || continue
+        T=$(stat -f %m "$A")
+        if [ "$T" -gt "$BEST_T" ]; then BEST="$A"; BEST_T=$T; fi
+      done < <(find "$R" -maxdepth 6 -type d -name '*.app' -path '*Build/Products*' 2>/dev/null)
+    done
+    [ -n "$BEST" ] || {{ echo "NO_ARTIFACT"; exit 0; }}
+    echo "ARTIFACT $BEST_T $BEST"
+    echo "{BEGIN}"
+    python3 "$SD/{scanner_name}" --app "$BEST" --bundle-id "$IDENT" --scan-id {q_scan_id}
+    RC=$?
+    echo "{END}"
+    exit $RC
+    '''
+        else:
+            find_part = f'''BT=$(ls -d "$HOME"/Library/Android/sdk/build-tools/* 2>/dev/null | sort -r | head -1)
+    [ -x "$BT/aapt2" ] || {{ echo "NO_AAPT2"; exit 3; }}
+    for R in {_roots_expr(ANDROID_SEARCH_ROOTS)}; do
+      [ -d "$R" ] || continue
+      while IFS= read -r A; do
+        P=$("$BT/aapt2" dump packagename "$A" 2>/dev/null)
+        case "$P" in "$IDENT"|"$IDENT".*) ;; *) continue;; esac
+        T=$(stat -f %m "$A")
+        if [ "$T" -gt "$BEST_T" ]; then BEST="$A"; BEST_T=$T; fi
+      done < <(find "$R" -maxdepth 9 -type f -name '*.apk' -path '*build/outputs/apk*' 2>/dev/null)
+    done
+    [ -n "$BEST" ] || {{ echo "NO_ARTIFACT"; exit 0; }}
+    echo "ARTIFACT $BEST_T $BEST"
+    echo "{BEGIN}"
+    python3 "$SD/{scanner_name}" --apk "$BEST" --package-name "$IDENT" --scan-id {q_scan_id}
+    RC=$?
+    echo "{END}"
+    exit $RC
+    '''
+        return head + find_part
+
+
+    def post_event(mobile_detected: dict, module_id) -> str | None:
+        if module_id:
+            mobile_detected = dict(mobile_detected)
+            mobile_detected["module_id"] = module_id
+        body = {"event_type": "detected", "target_type": "mobile_app",
+                "cluster": "rag", "mobile_detected": mobile_detected}
+        req = urllib.request.Request(
+            f"{KERNEL_URL}/core/security/events", data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.loads(r.read())["event_id"]
+        except urllib.error.HTTPError as e:
+            print(f"[error] kernel POST {e.code}: {e.read().decode()[:200]}", file=sys.stderr)
+        except Exception as e:
+            print(f"[error] kernel POST: {e}", file=sys.stderr)
+        return None
+
+
+    # 指摘の明細 (detail_findings) の保存先。 event は kernel の vuln_events、
+    # 明細はここ (段階 1 で決めた分離: モバイル用 findings は vuln_findings_mobile)。
+    # Phase 1 のコンテナ検査と同じく OpenSearch に直接書く (kernel は経由しない)。
+    OPENSEARCH_URL = os.environ.get(
+        "OPENSEARCH_URL", "http://opensearch.opensearch.svc.cluster.local:9200")
+    FINDINGS_INDEX = "vuln_findings_mobile"
+    _FINDINGS_MAPPING = {"mappings": {"properties": {
+        "event_id": {"type": "keyword"}, "scan_id": {"type": "keyword"},
+        "scan_kind": {"type": "keyword"}, "module_id": {"type": "keyword"},
+        "app_name": {"type": "keyword"}, "platform": {"type": "keyword"},
+        "bundle_id": {"type": "keyword"}, "package_name": {"type": "keyword"},
+        "app_version": {"type": "keyword"}, "artifact_path": {"type": "keyword"},
+        "finding_type": {"type": "keyword"}, "severity": {"type": "keyword"},
+        "severity_rank": {"type": "integer"},
+        "file": {"type": "keyword"}, "line": {"type": "integer"},
+        "snippet": {"type": "text"}, "description": {"type": "text"},
+        "timestamp": {"type": "date"},
+    }}}
+    _SEV_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+    _findings_index_ready = False
+
+
+    def _os_call(method: str, path: str, body=None, ndjson=None) -> dict:
+        if ndjson is not None:
+            data, ctype = ndjson.encode(), "application/x-ndjson"
+        else:
+            data = json.dumps(body).encode() if body is not None else None
+            ctype = "application/json"
+        req = urllib.request.Request(f"{OPENSEARCH_URL}{path}", data=data, method=method,
+                                     headers={"Content-Type": ctype})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            raw = r.read()
+        return json.loads(raw) if raw else {}
+
+
+    def _ensure_findings_index() -> None:
+        global _findings_index_ready
+        if _findings_index_ready:
+            return
+        try:
+            _os_call("HEAD", f"/{FINDINGS_INDEX}")
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise
+            try:
+                _os_call("PUT", f"/{FINDINGS_INDEX}", _FINDINGS_MAPPING)
+            except urllib.error.HTTPError as e2:
+                if e2.code != 400:  # 400 = 同時に作られた (resource_already_exists)
+                    raise
+        _findings_index_ready = True
+
+
+    def index_findings(findings: list, event_id: str, module_id, md: dict,
+                       app_name: str, scan_kind: str) -> int:
+        """指摘の明細を 1 件 1 文書で保存する。 _id は event_id-連番 (再実行しても重複しない)。
+        失敗しても event は登録済みなので警告だけ出して続ける。"""
+        if not findings:
+            return 0
+        try:
+            _ensure_findings_index()
+            ts = datetime.now(timezone.utc).isoformat()
+            common = {
+                "event_id": event_id, "scan_id": md.get("scan_id"), "scan_kind": scan_kind,
+                "module_id": module_id, "app_name": app_name, "platform": md.get("platform"),
+                "bundle_id": md.get("bundle_id"), "package_name": md.get("package_name"),
+                "app_version": md.get("app_version"), "artifact_path": md.get("artifact_path"),
+                "timestamp": ts,
+            }
+            lines = []
+            for i, f in enumerate(findings):
+                sev = f.get("severity") or "info"
+                doc = dict(common)
+                doc.update({
+                    "finding_type": f.get("finding_type"), "severity": sev,
+                    "severity_rank": _SEV_RANK.get(sev, 5),
+                    "file": f.get("file"), "line": int(f.get("line") or 0),
+                    "snippet": str(f.get("snippet") or "")[:1000],
+                    "description": str(f.get("description") or "")[:1000],
+                })
+                lines.append(json.dumps({"index": {"_index": FINDINGS_INDEX,
+                                                   "_id": f"{event_id}-{i:04d}"}}))
+                lines.append(json.dumps(doc, ensure_ascii=False))
+            res = _os_call("POST", "/_bulk?refresh=true", ndjson="\n".join(lines) + "\n")
+            if res.get("errors"):
+                bad = [it for it in res.get("items", []) if it.get("index", {}).get("error")]
+                print(f"[warn] 明細の一部が保存できない ({event_id}): "
+                      f"{len(bad)} 件、 例 {str(bad[:1])[:300]}", file=sys.stderr)
+                return len(findings) - len(bad)
+            return len(findings)
+        except Exception as e:
+            print(f"[warn] 明細の保存に失敗 ({event_id}): {type(e).__name__}: {e}", file=sys.stderr)
+            return 0
+
+
+    def main():
+        for p in (TARGETS_CONFIG_PATH, IOS_SCANNER_PATH, ANDROID_SCANNER_PATH):
+            if not Path(p).exists():
+                print(f"[fatal] 無し: {p}", file=sys.stderr)
+                sys.exit(2)
+        with open(TARGETS_CONFIG_PATH) as f:
+            config = yaml.safe_load(f)
+        scanners = {
+            "ios": ("mobile_binary_scan_ios.py",
+                    base64.b64encode(Path(IOS_SCANNER_PATH).read_bytes()).decode()),
+            "android": ("mobile_binary_scan_android.py",
+                        base64.b64encode(Path(ANDROID_SCANNER_PATH).read_bytes()).decode()),
+        }
+
+        # 到達確認 (届かなければ致命的)
+        try:
+            r = nsm_sh_exec("hostname", 15)
+            print(f"[info] nsmt reachable: {r.get('stdout', '').strip()} via {NSMT_MCP_URL}", flush=True)
+        except Exception as e:
+            print(f"[fatal] nsmt に届かない ({NSMT_MCP_URL}): {e}", file=sys.stderr)
+            sys.exit(2)
+
+        modules = [m for m in config.get("modules", []) if m.get("enabled")]
+        print(f"[info] {len(modules)} module(s) enabled, dry_run={DRY_RUN}", flush=True)
+        ok = skip = fail = 0
+        for module in modules:
+            module_id = module.get("module_id")
+            print(f"[info] module={module_id}", flush=True)
+            for app in module.get("apps", []):
+                name = app.get("name", "?")
+                platform = app.get("platform")
+                if app.get("binary") is False:
+                    print(f"[skip]   {name}: binary: false", flush=True)
+                    skip += 1
+                    continue
+                ident = app.get("bundle_id") if platform == "ios" else app.get("package_name")
+                if platform not in scanners or not ident:
+                    print(f"[error]  {name}: platform/識別子 不備", file=sys.stderr)
+                    fail += 1
+                    continue
+                scan_id = f"{name.replace(' ', '')}-{platform}-binary-{int(time.time())}-{uuid.uuid4().hex[:6]}"
+                sc_name, sc_b64 = scanners[platform]
+                try:
+                    res = nsm_sh_exec(build_script(app, sc_b64, sc_name, scan_id), 45)
+                except Exception as e:
+                    print(f"[error]  {name}: nsm_sh_exec {type(e).__name__}: {e}", file=sys.stderr)
+                    fail += 1
+                    continue
+                out = res.get("stdout", "")
+                if res.get("timed_out"):
+                    print(f"[error]  {name}: Mac 側で時間切れ", file=sys.stderr)
+                    fail += 1
+                    continue
+                if "NO_ARTIFACT" in out:
+                    print(f"[skip]   {name}: {ident} の成果物が Mac に無い", flush=True)
+                    skip += 1
+                    continue
+                if BEGIN not in out or END not in out or res.get("exit_code") != 0:
+                    print(f"[error]  {name}: exit={res.get('exit_code')} "
+                          f"stdout={out[-300:]} stderr={res.get('stderr', '')[-300:]}", file=sys.stderr)
+                    fail += 1
+                    continue
+                artifact = next((l for l in out.splitlines() if l.startswith("ARTIFACT ")), "")
+                try:
+                    result = json.loads(out.split(BEGIN, 1)[1].split(END, 1)[0])
+                except json.JSONDecodeError as e:
+                    print(f"[error]  {name}: JSON decode {e}", file=sys.stderr)
+                    fail += 1
+                    continue
+                md = result["mobile_detected"]
+                sev = md.get("severity_counts", {})
+                print(f"[info]   {name}: {artifact}", flush=True)
+                if DRY_RUN:
+                    print(f"[dry-run] {name}: total={result.get('total_findings')} severity={sev}", flush=True)
+                    ok += 1
+                    continue
+                event_id = post_event(md, module_id)
+                if event_id is None:
+                    fail += 1
+                    continue
+                n_saved = index_findings(result.get("detail_findings") or [], event_id,
+                                         module_id, md, name, "binary")
+                print(f"[info]   明細 {n_saved} 件を {FINDINGS_INDEX} に保存", flush=True)
+                print(f"[ok]     {name}: total={result.get('total_findings')} severity={sev} event_id={event_id}", flush=True)
+                ok += 1
+        print(f"[summary] ok={ok} skip={skip} fail={fail}", flush=True)
+        sys.exit(0)
+
+
+    if __name__ == "__main__":
+        main()

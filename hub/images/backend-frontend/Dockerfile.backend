@@ -1,0 +1,60 @@
+FROM python:3.12-slim
+
+# 現在の構成と同じシステムパッケージをインストール
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgomp1 \
+    patchelf \
+    wget \
+    build-essential \
+    tesseract-ocr \
+    tesseract-ocr-jpn \
+    poppler-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# 注意: PyTorchとIPEXは /model-cache/packages にインストール済み（PV経由）
+# ここではアプリケーション依存パッケージのみインストール
+
+# アプリケーション依存パッケージをインストール
+RUN pip install --no-cache-dir \
+    setuptools==67.8.0 \
+    fastapi==0.104.1 \
+    uvicorn==0.24.0 \
+    pymilvus==2.4.0 \
+    marshmallow==3.20.0 \
+    environs==9.5.0 \
+    requests==2.31.0 \
+    pydantic==2.5.0 \
+    python-multipart==0.0.6 \
+    python-docx==1.1.0 \
+    openpyxl==3.1.2 \
+    python-pptx==0.6.23 \
+    pypdf==4.3.1 \
+    pdfplumber==0.11.4 \
+    neo4j==5.15.0 \
+    beautifulsoup4==4.12.2 \
+    lxml==4.9.3 \
+    pytesseract==0.3.10 \
+    pdf2image==1.17.0
+
+# sentence-transformers を依存関係なしでインストール
+RUN pip install --no-cache-dir --no-deps sentence-transformers
+
+# sentence-transformers の依存関係をインストール
+RUN pip install --no-cache-dir \
+    transformers \
+    tqdm \
+    huggingface-hub \
+    tokenizers \
+    scikit-learn \
+    scipy \
+    numpy \
+    pillow
+
+# 注意: Rerankerモデルは initContainer で /model-cache にダウンロードされる
+# （PyTorchが必要なため、ここではダウンロードしない）
+
+# 作業ディレクトリ
+WORKDIR /app
+
+# 起動コマンド（Deploymentで上書きされる）
+CMD ["python3"]

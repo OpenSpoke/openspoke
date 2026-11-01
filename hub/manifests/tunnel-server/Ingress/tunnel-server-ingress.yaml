@@ -1,0 +1,29 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: tunnel-server-ingress
+  namespace: mcp
+  annotations:
+    # gRPC backend needs a hint to nginx-ingress.
+    nginx.ingress.kubernetes.io/backend-protocol: "GRPC"
+    # Keep-alive timings need to be longer than any intermediate
+    # proxy's idle timeout (typically 100s for Cloudflare edge)
+    # so keepalive drives session lifetime from tunnel-server itself.
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: '60'
+    nginx.ingress.kubernetes.io/proxy-read-timeout: '86400'
+    nginx.ingress.kubernetes.io/proxy-send-timeout: '86400'
+    # Uncap gRPC frame size for large-object migrations over the tunnel.
+    nginx.ingress.kubernetes.io/proxy-body-size: '0'
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: hub.example.com
+      http:
+        paths:
+          - backend:
+              service:
+                name: tunnel-server
+                port:
+                  number: 8080
+            path: /
+            pathType: Prefix

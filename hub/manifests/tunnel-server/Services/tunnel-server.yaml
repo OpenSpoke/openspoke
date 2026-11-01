@@ -1,0 +1,45 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: tunnel-server
+  namespace: mcp
+  labels:
+    app: tunnel-server
+spec:
+  type: ClusterIP
+  selector:
+    app: tunnel-server
+  ports:
+    # gRPC entry point. Exposed externally via the Ingress in
+    # Ingress/tunnel-server-ingress.yaml so spoke-side tunnel-client
+    # can dial the hub over TLS.
+    - name: grpc
+      port: 8080
+      targetPort: grpc
+      protocol: TCP
+    # Prometheus metrics endpoint (scrape internally).
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+      protocol: TCP
+    # Per-spoke reverse-listen ports. Any hub-side component that dials
+    # tunnel-server.mcp.svc.cluster.local:<port> reaches the spoke-side
+    # tunnel-client's TARGET (default: mcp-company1:8000 on that spoke).
+    # Add one entry per registered spoke.
+    #
+    # IMPORTANT: targetPort must be numeric here. Referencing the
+    # containerPort name (targetPort: spoke-1) breaks kube-proxy's
+    # iptables rule generation on some CNIs, so Service traffic
+    # times out even though Pod-IP traffic works.
+    - name: spoke-1
+      port: 10001
+      targetPort: 10001
+      protocol: TCP
+    - name: spoke-2
+      port: 10002
+      targetPort: 10002
+      protocol: TCP
+    - name: spoke-3
+      port: 10003
+      targetPort: 10003
+      protocol: TCP

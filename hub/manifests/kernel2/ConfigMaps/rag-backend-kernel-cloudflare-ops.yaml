@@ -1,0 +1,766 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-backend-kernel-cloudflare-ops
+  namespace: rag-company1
+data:
+  cloudflare_ops.py: |
+    """
+    cloudflare_ops.py
+    ====================================================================
+    Cloudflare API Wrapper (DNS, Tunnel Routes, Access, Device Enrollment)
+    ====================================================================
+
+    Phase 2-i (2026-10-24): Cloudflare API v4 を叩くための kernel 内 FastAPI
+    エンドポイント群。 Token は cloudflare_account.resolve_cloudflare_token
+    から取得 (保管庫経由または env fallback)。
+
+    公開 endpoint (prefix=/core/cloudflare):
+
+      DNS:
+        POST /dns/list        - DNS レコード一覧 (zone_id 必須)
+        POST /dns/create      - DNS レコード作成
+        POST /dns/update      - DNS レコード更新
+        POST /dns/delete      - DNS レコード削除 (冪等)
+        POST /zones/list      - Zone 一覧 (zone_id を調べる補助)
+
+      Tunnel Routes (WARP Private Networks):
+        POST /routes/list     - 一覧
+        POST /routes/add      - CIDR → tunnel の経路追加
+        POST /routes/delete   - 経路削除 (冪等)
+        POST /tunnels/list    - Tunnel 一覧 (tunnel_id を調べる補助)
+
+      Zero Trust Access:
+        POST /access-apps/list       - Access アプリ一覧
+        POST /access-apps/get        - 詳細 (AUD タグ含む)
+        POST /access-apps/create     - 作成
+        POST /access-apps/update     - 更新
+        POST /access-apps/delete     - 削除 (冪等)
+        POST /access-policies/list   - アプリに紐づくポリシー一覧
+        POST /access-policies/create - ポリシー作成
+        POST /access-policies/delete - 削除 (冪等)
+
+      WARP Device Enrollment:
+        POST /device-enrollment-policies/list   - 一覧
+        POST /device-enrollment-policies/create - 作成
+        POST /device-enrollment-policies/delete - 削除 (冪等)
+    """
+
+    from __future__ import annotations
+
+    import logging
+    from typing import Any, Dict, Optional
+
+    import requests
+    from fastapi import APIRouter, HTTPException
+
+    from cloudflare_account import (
+        CloudflareCredentials,
+        resolve_cloudflare_token,
+    )
+
+    logger = logging.getLogger(__name__)
+
+    router = APIRouter(prefix="/core/cloudflare", tags=["cloudflare"])
+
+
+    # ==================================================================
+    # ヘルパー
+    # ==================================================================
+
+    def _get_creds(account_id: str = "") -> CloudflareCredentials:
+        try:
+            return resolve_cloudflare_token(account_id=account_id)
+        except RuntimeError as e:
+            raise HTTPException(status_code=503, detail=str(e))
+
+
+    def _cf_request(
+        method: str,
+        path: str,
+        account_id: str = "",
+        body: Optional[Dict[str, Any]] = None,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Cloudflare API v4 を叩いて JSON を返す。 失敗時は HTTPException。"""
+        creds = _get_creds(account_id)
+        url = f"{creds.base_url}{path}"
+        headers = {
+            "Authorization": f"Bearer {creds.token}",
+            "Content-Type": "application/json",
+        }
+        try:
+            resp = requests.request(
+                method, url, headers=headers, json=body, params=params, timeout=30
+            )
+        except Exception as e:
+            raise HTTPException(
+                status_code=502, detail=f"Cloudflare API connect: {e}"
+            )
+        if resp.status_code >= 400:
+            detail = (
+                f"Cloudflare API {method} {path} -> {resp.status_code}: "
+                f"{resp.text[:400]}"
+            )
+            logger.warning(detail)
+            raise HTTPException(status_code=resp.status_code, detail=detail)
+        try:
+            return resp.json()
+        except Exception as e:
+            raise HTTPException(
+                status_code=502, detail=f"Cloudflare API JSON decode: {e}"
+            )
+
+
+    # ==================================================================
+    # Zones (list)
+    # ==================================================================
+
+    @router.post("/zones/list")
+    async def cloudflare_zones_list(request: dict):
+        """アカウント内の Zone 一覧 (zone_id を調べるのに便利)。"""
+        account_id = request.get("account_id") or ""
+        creds = _get_creds(account_id)
+        params: Dict[str, Any] = {
+            "per_page": request.get("per_page") or 50,
+            "page": request.get("page") or 1,
+            "account.id": creds.account_id,
+        }
+        if request.get("name"):
+            params["name"] = request["name"]
+        data = _cf_request("GET", "/zones", account_id=account_id, params=params)
+        return {
+            "ok": True,
+            "zones": data.get("result") or [],
+            "result_info": data.get("result_info") or {},
+        }
+
+
+    # ==================================================================
+    # DNS Records
+    # ==================================================================
+
+    @router.post("/dns/list")
+    async def cloudflare_dns_list(request: dict):
+        """Zone の DNS レコード一覧。
+
+        Body:
+          zone_id (必須)
+          per_page, page (任意)
+          type (任意): A / CNAME / TXT 等でフィルタ
+          name_contains (任意): レコード名の部分一致
+          account_id (任意)
+        """
+        zone_id = (request.get("zone_id") or "").strip()
+        if not zone_id:
+            raise HTTPException(status_code=400, detail="zone_id is required")
+        params: Dict[str, Any] = {
+            "per_page": request.get("per_page") or 50,
+            "page": request.get("page") or 1,
+        }
+        if request.get("type"):
+            params["type"] = request["type"]
+        if request.get("name_contains"):
+            params["name.contains"] = request["name_contains"]
+        data = _cf_request(
+            "GET", f"/zones/{zone_id}/dns_records",
+            account_id=request.get("account_id") or "",
+            params=params,
+        )
+        return {
+            "ok": True,
+            "records": data.get("result") or [],
+            "result_info": data.get("result_info") or {},
+        }
+
+
+    @router.post("/dns/create")
+    async def cloudflare_dns_create(request: dict):
+        """DNS レコード作成。
+
+        Body:
+          zone_id, type, name, content (必須)
+          proxied (任意, bool, default True)
+          ttl (任意, 1=auto, default 1)
+          comment (任意)
+          account_id (任意)
+        """
+        zone_id = (request.get("zone_id") or "").strip()
+        if not zone_id:
+            raise HTTPException(status_code=400, detail="zone_id is required")
+        for k in ("type", "name", "content"):
+            if not request.get(k):
+                raise HTTPException(
+                    status_code=400, detail=f"{k} is required"
+                )
+        body: Dict[str, Any] = {
+            "type": request["type"],
+            "name": request["name"],
+            "content": request["content"],
+            "proxied": bool(request.get("proxied", True)),
+            "ttl": int(request.get("ttl") or 1),
+        }
+        if request.get("comment"):
+            body["comment"] = request["comment"]
+        data = _cf_request(
+            "POST", f"/zones/{zone_id}/dns_records",
+            account_id=request.get("account_id") or "",
+            body=body,
+        )
+        return {"ok": True, "record": data.get("result") or {}}
+
+
+    @router.post("/dns/update")
+    async def cloudflare_dns_update(request: dict):
+        """DNS レコード更新。 record_id は /dns/list の各 record の id。
+
+        Body:
+          zone_id, record_id, type, name, content (必須)
+          proxied, ttl, comment (任意)
+        """
+        zone_id = (request.get("zone_id") or "").strip()
+        record_id = (request.get("record_id") or "").strip()
+        if not zone_id or not record_id:
+            raise HTTPException(
+                status_code=400,
+                detail="zone_id and record_id are required",
+            )
+        for k in ("type", "name", "content"):
+            if not request.get(k):
+                raise HTTPException(
+                    status_code=400, detail=f"{k} is required"
+                )
+        body: Dict[str, Any] = {
+            "type": request["type"],
+            "name": request["name"],
+            "content": request["content"],
+            "proxied": bool(request.get("proxied", True)),
+            "ttl": int(request.get("ttl") or 1),
+        }
+        if request.get("comment"):
+            body["comment"] = request["comment"]
+        data = _cf_request(
+            "PUT", f"/zones/{zone_id}/dns_records/{record_id}",
+            account_id=request.get("account_id") or "",
+            body=body,
+        )
+        return {"ok": True, "record": data.get("result") or {}}
+
+
+    @router.post("/dns/delete")
+    async def cloudflare_dns_delete(request: dict):
+        """DNS レコード削除 (冪等、404 は 200 扱い)。
+
+        Body:
+          zone_id, record_id (必須)
+        """
+        zone_id = (request.get("zone_id") or "").strip()
+        record_id = (request.get("record_id") or "").strip()
+        if not zone_id or not record_id:
+            raise HTTPException(
+                status_code=400,
+                detail="zone_id and record_id are required",
+            )
+        try:
+            _cf_request(
+                "DELETE", f"/zones/{zone_id}/dns_records/{record_id}",
+                account_id=request.get("account_id") or "",
+            )
+            return {"ok": True, "deleted": True, "id": record_id}
+        except HTTPException as e:
+            if e.status_code == 404:
+                return {"ok": True, "deleted": False, "note": "already absent"}
+            raise
+
+
+    # ==================================================================
+    # Tunnels (list)
+    # ==================================================================
+
+    @router.post("/tunnels/list")
+    async def cloudflare_tunnels_list(request: dict):
+        """アカウント内 Cloudflare Tunnel 一覧。
+
+        Body:
+          per_page, page (任意)
+          is_deleted (任意, default false)
+          account_id (任意)
+        """
+        account_id = request.get("account_id") or ""
+        creds = _get_creds(account_id)
+        params = {
+            "per_page": request.get("per_page") or 50,
+            "page": request.get("page") or 1,
+            "is_deleted": "true" if request.get("is_deleted") else "false",
+        }
+        data = _cf_request(
+            "GET", f"/accounts/{creds.account_id}/cfd_tunnel",
+            account_id=account_id,
+            params=params,
+        )
+        return {
+            "ok": True,
+            "tunnels": data.get("result") or [],
+            "result_info": data.get("result_info") or {},
+        }
+
+
+    # ==================================================================
+    # Tunnel Routes (Private Networks for WARP)
+    # ==================================================================
+
+    @router.post("/routes/list")
+    async def cloudflare_routes_list(request: dict):
+        """Private Network Routes 一覧。
+
+        Body:
+          tunnel_id (任意): 指定するとその tunnel のルートだけ
+          per_page, page (任意)
+          account_id (任意)
+        """
+        account_id = request.get("account_id") or ""
+        creds = _get_creds(account_id)
+        params: Dict[str, Any] = {
+            "per_page": request.get("per_page") or 100,
+            "page": request.get("page") or 1,
+        }
+        if request.get("tunnel_id"):
+            params["tunnel_id"] = request["tunnel_id"]
+        data = _cf_request(
+            "GET", f"/accounts/{creds.account_id}/teamnet/routes",
+            account_id=account_id,
+            params=params,
+        )
+        return {
+            "ok": True,
+            "routes": data.get("result") or [],
+            "result_info": data.get("result_info") or {},
+        }
+
+
+    @router.post("/routes/add")
+    async def cloudflare_routes_add(request: dict):
+        """WARP Private Network ルート追加 (CIDR → tunnel)。
+
+        Body:
+          network (必須): CIDR (例: "192.168.1.73/32")
+          tunnel_id (必須): Cloudflare Tunnel UUID
+          comment (任意)
+          virtual_network_id (任意): 省略時はデフォルト VN
+          account_id (任意)
+        """
+        network = (request.get("network") or "").strip()
+        tunnel_id = (request.get("tunnel_id") or "").strip()
+        if not network or not tunnel_id:
+            raise HTTPException(
+                status_code=400,
+                detail="network and tunnel_id are required",
+            )
+        account_id = request.get("account_id") or ""
+        creds = _get_creds(account_id)
+        body: Dict[str, Any] = {
+            "network": network,
+            "tunnel_id": tunnel_id,
+        }
+        if request.get("comment"):
+            body["comment"] = request["comment"]
+        if request.get("virtual_network_id"):
+            body["virtual_network_id"] = request["virtual_network_id"]
+        data = _cf_request(
+            "POST", f"/accounts/{creds.account_id}/teamnet/routes",
+            account_id=account_id,
+            body=body,
+        )
+        return {"ok": True, "route": data.get("result") or {}}
+
+
+    @router.post("/routes/delete")
+    async def cloudflare_routes_delete(request: dict):
+        """Private Network ルート削除 (冪等)。
+
+        Body:
+          route_id (必須)
+          account_id (任意)
+        """
+        route_id = (request.get("route_id") or "").strip()
+        if not route_id:
+            raise HTTPException(status_code=400, detail="route_id is required")
+        account_id = request.get("account_id") or ""
+        creds = _get_creds(account_id)
+        try:
+            _cf_request(
+                "DELETE",
+                f"/accounts/{creds.account_id}/teamnet/routes/{route_id}",
+                account_id=account_id,
+            )
+            return {"ok": True, "deleted": True, "id": route_id}
+        except HTTPException as e:
+            if e.status_code == 404:
+                return {"ok": True, "deleted": False, "note": "already absent"}
+            raise
+
+
+    # ==================================================================
+    # Zero Trust Access Apps
+    # ==================================================================
+
+    @router.post("/access-apps/list")
+    async def cloudflare_access_apps_list(request: dict):
+        """Access アプリ一覧。"""
+        account_id = request.get("account_id") or ""
+        creds = _get_creds(account_id)
+        data = _cf_request(
+            "GET", f"/accounts/{creds.account_id}/access/apps",
+            account_id=account_id,
+        )
+        return {"ok": True, "apps": data.get("result") or []}
+
+
+    @router.post("/access-apps/get")
+    async def cloudflare_access_apps_get(request: dict):
+        """Access アプリ詳細 (AUD タグを含む)。
+
+        Body:
+          app_id (必須)
+          account_id (任意)
+        """
+        app_id = (request.get("app_id") or "").strip()
+        if not app_id:
+            raise HTTPException(status_code=400, detail="app_id is required")
+        account_id = request.get("account_id") or ""
+        creds = _get_creds(account_id)
+        data = _cf_request(
+            "GET", f"/accounts/{creds.account_id}/access/apps/{app_id}",
+            account_id=account_id,
+        )
+        return {"ok": True, "app": data.get("result") or {}}
+
+
+    @router.post("/access-apps/create")
+    async def cloudflare_access_apps_create(request: dict):
+        """Self-hosted Access アプリを作成する。
+
+        Body:
+          name (必須)
+          domain (必須): hostname (例: "goldpoint-admin.intelligence.codes")
+          session_duration (任意, default "24h")
+          type (任意, default "self_hosted")
+          allowed_idps (任意, list[uuid])
+          auto_redirect_to_identity (任意, bool, default False)
+          account_id (任意)
+        """
+        name = (request.get("name") or "").strip()
+        domain = (request.get("domain") or "").strip()
+        if not name or not domain:
+            raise HTTPException(
+                status_code=400, detail="name and domain are required"
+            )
+        body: Dict[str, Any] = {
+            "name": name,
+            "domain": domain,
+            "type": request.get("type") or "self_hosted",
+            "session_duration": request.get("session_duration") or "24h",
+        }
+        if request.get("allowed_idps"):
+            body["allowed_idps"] = request["allowed_idps"]
+        if "auto_redirect_to_identity" in request:
+            body["auto_redirect_to_identity"] = bool(
+                request["auto_redirect_to_identity"]
+            )
+        account_id = request.get("account_id") or ""
+        creds = _get_creds(account_id)
+        data = _cf_request(
+            "POST", f"/accounts/{creds.account_id}/access/apps",
+            account_id=account_id,
+            body=body,
+        )
+        return {"ok": True, "app": data.get("result") or {}}
+
+
+    @router.post("/access-apps/update")
+    async def cloudflare_access_apps_update(request: dict):
+        """Access アプリ更新。
+
+        Body:
+          app_id (必須)
+          他は create と同じ (更新するフィールドだけ渡す)
+          account_id (任意)
+        """
+        app_id = (request.get("app_id") or "").strip()
+        if not app_id:
+            raise HTTPException(status_code=400, detail="app_id is required")
+        body: Dict[str, Any] = {}
+        for key in (
+            "name", "domain", "type", "session_duration",
+            "allowed_idps", "auto_redirect_to_identity",
+        ):
+            if key in request:
+                body[key] = request[key]
+        if not body:
+            raise HTTPException(
+                status_code=400, detail="no updatable fields given"
+            )
+        account_id = request.get("account_id") or ""
+        creds = _get_creds(account_id)
+        data = _cf_request(
+            "PUT", f"/accounts/{creds.account_id}/access/apps/{app_id}",
+            account_id=account_id,
+            body=body,
+        )
+        return {"ok": True, "app": data.get("result") or {}}
+
+
+    @router.post("/access-apps/delete")
+    async def cloudflare_access_apps_delete(request: dict):
+        """Access アプリ削除 (冪等)。
+
+        Body:
+          app_id (必須)
+          account_id (任意)
+        """
+        app_id = (request.get("app_id") or "").strip()
+        if not app_id:
+            raise HTTPException(status_code=400, detail="app_id is required")
+        account_id = request.get("account_id") or ""
+        creds = _get_creds(account_id)
+        try:
+            _cf_request(
+                "DELETE", f"/accounts/{creds.account_id}/access/apps/{app_id}",
+                account_id=account_id,
+            )
+            return {"ok": True, "deleted": True, "id": app_id}
+        except HTTPException as e:
+            if e.status_code == 404:
+                return {"ok": True, "deleted": False, "note": "already absent"}
+            raise
+
+
+    # ==================================================================
+    # Zero Trust Access Policies
+    # ==================================================================
+
+    @router.post("/access-policies/list")
+    async def cloudflare_access_policies_list(request: dict):
+        """アプリに紐づくポリシー一覧。
+
+        Body:
+          app_id (必須)
+          account_id (任意)
+        """
+        app_id = (request.get("app_id") or "").strip()
+        if not app_id:
+            raise HTTPException(status_code=400, detail="app_id is required")
+        account_id = request.get("account_id") or ""
+        creds = _get_creds(account_id)
+        data = _cf_request(
+            "GET",
+            f"/accounts/{creds.account_id}/access/apps/{app_id}/policies",
+            account_id=account_id,
+        )
+        return {"ok": True, "policies": data.get("result") or []}
+
+
+    @router.post("/access-policies/create")
+    async def cloudflare_access_policies_create(request: dict):
+        """アプリにポリシーを追加する。
+
+        Body:
+          app_id (必須)
+          name (必須): ポリシー名
+          decision (任意, default "allow"): allow/deny/non_identity/bypass
+          precedence (任意, default 1): 評価順
+          include (必須, list): 対象を特定するルール
+            例 [{"email": {"email": "user@example.com"}}]
+          require (任意): さらに AND で絞る条件
+          exclude (任意): 除外条件
+          session_duration (任意)
+          account_id (任意)
+        """
+        app_id = (request.get("app_id") or "").strip()
+        name = (request.get("name") or "").strip()
+        include = request.get("include") or []
+        if not app_id or not name or not include:
+            raise HTTPException(
+                status_code=400,
+                detail="app_id, name, include are required",
+            )
+        body: Dict[str, Any] = {
+            "name": name,
+            "decision": request.get("decision") or "allow",
+            "precedence": int(request.get("precedence") or 1),
+            "include": include,
+        }
+        if request.get("require"):
+            body["require"] = request["require"]
+        if request.get("exclude"):
+            body["exclude"] = request["exclude"]
+        if request.get("session_duration"):
+            body["session_duration"] = request["session_duration"]
+        account_id = request.get("account_id") or ""
+        creds = _get_creds(account_id)
+        data = _cf_request(
+            "POST",
+            f"/accounts/{creds.account_id}/access/apps/{app_id}/policies",
+            account_id=account_id,
+            body=body,
+        )
+        return {"ok": True, "policy": data.get("result") or {}}
+
+
+    @router.post("/access-policies/delete")
+    async def cloudflare_access_policies_delete(request: dict):
+        """ポリシー削除 (冪等)。
+
+        Body:
+          app_id, policy_id (必須)
+          account_id (任意)
+        """
+        app_id = (request.get("app_id") or "").strip()
+        policy_id = (request.get("policy_id") or "").strip()
+        if not app_id or not policy_id:
+            raise HTTPException(
+                status_code=400,
+                detail="app_id and policy_id are required",
+            )
+        account_id = request.get("account_id") or ""
+        creds = _get_creds(account_id)
+        try:
+            _cf_request(
+                "DELETE",
+                f"/accounts/{creds.account_id}/access/apps/{app_id}"
+                f"/policies/{policy_id}",
+                account_id=account_id,
+            )
+            return {"ok": True, "deleted": True, "id": policy_id}
+        except HTTPException as e:
+            if e.status_code == 404:
+                return {"ok": True, "deleted": False, "note": "already absent"}
+            raise
+
+
+    # ==================================================================
+    # WARP Device Enrollment Permissions
+    # ==================================================================
+    # Cloudflare Zero Trust では WARP 加入許可は特殊な Access Application
+    # (type="warp") に紐づく Access Policies として管理される。 1 アカウント
+    # 1 WARP アプリで、 そのアプリの policy を add/remove することで
+    # 「誰が WARP に加入できるか」を制御する。 Terraform resource
+    # `cloudflare_zero_trust_access_application` の type="warp" と同構造。
+
+    def _resolve_warp_app_id(account_id: str, creds) -> str:
+        """type=\"warp\" の Access アプリを探して app_id を返す。
+        1 アカウント 1 つしか無い想定。 無ければ 404 (Zero Trust
+        ダッシュボードで初期化すれば自動的に作成される)。
+        """
+        data = _cf_request(
+            "GET", f"/accounts/{creds.account_id}/access/apps",
+            account_id=account_id,
+        )
+        for app in (data.get("result") or []):
+            if app.get("type") == "warp":
+                app_id = app.get("id") or ""
+                if app_id:
+                    return app_id
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "WARP enrollment application not found; open Zero Trust "
+                "dashboard once to initialize it (Team & Resources > "
+                "Devices > Management > Device enrollment)"
+            ),
+        )
+
+
+    @router.post("/device-enrollment-policies/list")
+    async def cloudflare_device_enrollment_list(request: dict):
+        """WARP enrollment ポリシー一覧 (type=warp アプリ配下)。"""
+        account_id = request.get("account_id") or ""
+        creds = _get_creds(account_id)
+        app_id = _resolve_warp_app_id(account_id, creds)
+        data = _cf_request(
+            "GET",
+            f"/accounts/{creds.account_id}/access/apps/{app_id}/policies",
+            account_id=account_id,
+        )
+        return {
+            "ok": True,
+            "warp_app_id": app_id,
+            "policies": data.get("result") or [],
+        }
+
+
+    @router.post("/device-enrollment-policies/create")
+    async def cloudflare_device_enrollment_create(request: dict):
+        """WARP enrollment を許可するポリシーを作る。
+
+        内部的には type=warp アプリに policy を追加 (access-policies/create
+        と同形)。 app_id は自動解決。
+
+        Body:
+          name (必須)
+          include (必須, list)
+          decision (任意, default "allow")
+          precedence (任意, default 1)
+          session_duration (任意, default "24h")
+          require, exclude (任意)
+          account_id (任意)
+        """
+        name = (request.get("name") or "").strip()
+        include = request.get("include") or []
+        if not name or not include:
+            raise HTTPException(
+                status_code=400, detail="name and include are required"
+            )
+        account_id = request.get("account_id") or ""
+        creds = _get_creds(account_id)
+        app_id = _resolve_warp_app_id(account_id, creds)
+        body: Dict[str, Any] = {
+            "name": name,
+            "decision": request.get("decision") or "allow",
+            "precedence": int(request.get("precedence") or 1),
+            "include": include,
+            "session_duration": request.get("session_duration") or "24h",
+        }
+        if request.get("require"):
+            body["require"] = request["require"]
+        if request.get("exclude"):
+            body["exclude"] = request["exclude"]
+        data = _cf_request(
+            "POST",
+            f"/accounts/{creds.account_id}/access/apps/{app_id}/policies",
+            account_id=account_id,
+            body=body,
+        )
+        return {
+            "ok": True,
+            "warp_app_id": app_id,
+            "policy": data.get("result") or {},
+        }
+
+
+    @router.post("/device-enrollment-policies/delete")
+    async def cloudflare_device_enrollment_delete(request: dict):
+        """WARP enrollment ポリシー削除 (冪等)。 app_id は自動解決。"""
+        policy_id = (request.get("policy_id") or "").strip()
+        if not policy_id:
+            raise HTTPException(status_code=400, detail="policy_id is required")
+        account_id = request.get("account_id") or ""
+        creds = _get_creds(account_id)
+        app_id = _resolve_warp_app_id(account_id, creds)
+        try:
+            _cf_request(
+                "DELETE",
+                f"/accounts/{creds.account_id}/access/apps/{app_id}"
+                f"/policies/{policy_id}",
+                account_id=account_id,
+            )
+            return {
+                "ok": True,
+                "deleted": True,
+                "id": policy_id,
+                "warp_app_id": app_id,
+            }
+        except HTTPException as e:
+            if e.status_code == 404:
+                return {"ok": True, "deleted": False, "note": "already absent"}
+            raise

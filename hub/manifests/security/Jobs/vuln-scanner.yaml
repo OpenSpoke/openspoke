@@ -1,0 +1,52 @@
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vuln-scanner
+  namespace: security
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels:
+        app: vuln-scanner
+    spec:
+      serviceAccountName: vuln-scanner
+      restartPolicy: Never
+      containers:
+        - name: scanner
+          image: your-registry.example.com/openspoke-vuln-scanner:latest
+          command: ["python3", "/scripts/scan.py"]
+          env:
+            - name: CLUSTER_NAME
+              value: "rag"
+            - name: OPENSEARCH_URL
+              value: "http://opensearch.opensearch.svc.cluster.local:9200"
+            - name: MINIO_ENDPOINT
+              value: "minio.milvus.svc.cluster.local:9000"
+            - name: MINIO_ACCESS_KEY
+              value: "minioadmin"
+            - name: MINIO_SECRET_KEY
+              value: "minioadminpassword"
+            - name: MINIO_BUCKET
+              value: "security-scans"
+            - name: TRIVY_VERSION
+              value: "v0.72.0"
+            - name: TRIVY_IMAGE_DIGEST
+              value: "sha256:75ebe8fe37097593f2f4e41a2096c3e9e3bdd2aa45c661f602d7ea6c5b27ed22"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 512Mi
+            limits:
+              memory: 2Gi
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: scripts
+          configMap:
+            name: vuln-scanner-script
+            defaultMode: 0755

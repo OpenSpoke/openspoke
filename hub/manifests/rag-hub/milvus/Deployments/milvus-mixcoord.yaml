@@ -1,0 +1,141 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: milvus-mixcoord
+  namespace: milvus
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: milvus-mixcoord
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: milvus-mixcoord
+      namespace: milvus
+      annotations:
+        restarted-at: "2026-07-30T04:00:00Z"
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: rag-type
+                    operator: In
+                    values:
+                      - milvus
+      initContainers:
+        - name: wait-deps
+          image: milvusdb/milvus:v2.6.20
+          imagePullPolicy: IfNotPresent
+          command:
+            - bash
+            - -c
+            - |
+              for dep in etcd:2379 minio:9000 pulsar:6650; do
+                host="${dep%%:*}"
+                port="${dep##*:}"
+                until getent hosts "$host" >/dev/null 2>&1 && (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null; do
+                  echo "waiting for $dep"
+                  sleep 2
+                done
+                echo "$dep ready"
+              done
+              echo "all dependencies ready"
+          resources:
+            limits:
+              cpu: 100m
+              memory: 64Mi
+            requests:
+              cpu: 10m
+              memory: 32Mi
+      containers:
+        - command:
+            - milvus
+            - run
+            - mixture
+            - -rootcoord
+            - -querycoord
+            - -datacoord
+            - -indexcoord
+          env:
+            - name: ETCD_USE_EMBED
+              value: 'false'
+            - name: ETCD_ENDPOINTS
+              value: etcd:2379
+            - name: ETCD_ROOT_PATH
+              value: by-dev
+            - name: MINIO_ADDRESS
+              value: minio:9000
+            - name: MINIO_ACCESS_KEY_ID
+              value: minioadmin
+            - name: MINIO_SECRET_ACCESS_KEY
+              value: minioadminpassword
+            - name: MINIO_USE_SSL
+              value: 'false'
+            - name: MINIO_BUCKET_NAME
+              value: milvus-bucket
+            - name: MINIO_ROOT_PATH
+              value: file
+            - name: PULSAR_ADDRESS
+              value: pulsar://pulsar:6650
+            - name: COMMON_STORAGETYPE
+              value: remote
+          image: milvusdb/milvus:v2.6.20
+          imagePullPolicy: IfNotPresent
+          livenessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /healthz
+              port: 9091
+              scheme: HTTP
+            initialDelaySeconds: 90
+            periodSeconds: 30
+            successThreshold: 1
+            timeoutSeconds: 10
+          name: mixcoord
+          ports:
+            - containerPort: 53100
+              name: rootcoord
+              protocol: TCP
+            - containerPort: 13333
+              name: datacoord
+              protocol: TCP
+            - containerPort: 19531
+              name: querycoord
+              protocol: TCP
+            - containerPort: 31000
+              name: indexcoord
+              protocol: TCP
+            - containerPort: 9091
+              name: metrics
+              protocol: TCP
+          readinessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /healthz
+              port: 9091
+              scheme: HTTP
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 10
+          resources:
+            limits:
+              cpu: 2000m
+              memory: 4Gi
+            requests:
+              cpu: 800m
+              memory: 2Gi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30

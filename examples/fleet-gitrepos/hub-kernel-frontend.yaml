@@ -1,0 +1,32 @@
+# Example Fleet GitRepo for deploying the hub RAG frontend (dashboard).
+#
+# The frontend renders the operator dashboard (Spokes, Fleet, Clusters,
+# Modules, Knowledge Base, Chat, Cost, Security, Git 認証情報, etc.).
+# It talks to the hub kernel via cluster-internal Service, so it must
+# be deployed to the same hub cluster.
+#
+# Adjust:
+#   - spec.repo:    your fork URL or the upstream OpenSpoke repo
+#   - spec.branch:  branch to track
+#   - spec.paths:   subdirectory to watch
+#   - spec.targets: cluster selector labels
+apiVersion: fleet.cattle.io/v1alpha1
+kind: GitRepo
+metadata:
+  name: hub-kernel-frontend
+  namespace: fleet-default
+spec:
+  repo: https://github.com/OpenSpoke/openspoke.git
+  branch: main
+  # For private forks, create a Secret in the fleet-default namespace and
+  # uncomment the line below:
+  # clientSecretName: fleet-git-credentials
+  paths:
+    - hub/manifests/kernel-frontend
+  pollingInterval: 1m0s
+  keepResources: true
+  targets:
+    - name: hub
+      clusterSelector:
+        matchLabels:
+          role: hub

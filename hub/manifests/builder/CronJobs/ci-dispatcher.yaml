@@ -1,0 +1,64 @@
+---
+#  OpenSpoke CI ディスパッチャー
+#
+#  5 分おきに起きて、targets.json の各対象の先頭コミットを調べ、
+#  まだビルドしていないコミットがあればランナーの Job を作る。
+#  フロントエンドからの手動要求 (ConfigMap ci-requests) も同じ経路で捌く。
+#
+#  CronJob が毎回 Job を作るので、Job spec が immutable であることに起因する
+#  従来の delete-recreate の手作業は要らない。
+#
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ci-dispatcher
+  namespace: builder
+  labels:
+    app: ci-dispatcher
+spec:
+  schedule: "*/5 * * * *"
+  timeZone: "Asia/Tokyo"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 120
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      ttlSecondsAfterFinished: 3600
+      template:
+        metadata:
+          labels:
+            app: ci-dispatcher
+        spec:
+          restartPolicy: Never
+          serviceAccountName: ci-dispatcher
+          containers:
+            - name: dispatcher
+              image: alpine:3
+              command: ["/bin/sh", "-c", "exec sh /config/dispatch.sh"]
+              env:
+                - name: TZ
+                  value: Asia/Tokyo
+                - name: CI_NAMESPACE
+                  value: "builder"
+                - name: KERNEL_URL
+                  value: "http://rag-backend-kernel.rag-company1.svc.cluster.local:8000"
+                #  ランナーの Job を残す秒数。既定は 7 日 (履歴を兼ねる)
+                - name: CI_JOB_TTL
+                  value: "604800"
+              resources:
+                requests:
+                  cpu: "100m"
+                  memory: "128Mi"
+                limits:
+                  cpu: "500m"
+                  memory: "512Mi"
+              volumeMounts:
+                - name: config
+                  mountPath: /config
+          volumes:
+            - name: config
+              configMap:
+                name: ci-dispatcher-config
+                defaultMode: 493

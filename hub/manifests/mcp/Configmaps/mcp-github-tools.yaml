@@ -1,0 +1,1449 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcp-github-tools
+  namespace: mcp
+data:
+  github_tools.py: |
+    """
+    GitHub 関連 MCP ツール (分離モジュール 第1弾)。
+
+    mcp_server.py から register_github_tools(mcp, ensure_kernel_url) を
+    呼ぶことでツールが登録される。 mcp インスタンスと kernel URL 取得関数を
+    引数で受け取り、 mcp_server.py 側のグローバルに依存しない。
+
+    httpx クライアントはモジュールグローバルにせず毎回 async with で
+    生成する (mcp_server の _client が rollout 後に stale keep-alive を
+    抱える既知問題を避けるため。 重要パスは都度生成が安全)。
+
+    typing.Dict / List / Optional は使わない (mcp_server.py と同じ規約。
+    builtin dict / list / "X | None" を使う)。
+    """
+
+    import re as _re
+    import httpx as _httpx
+
+
+    def register_github_tools(mcp, ensure_kernel_url):
+        """GitHub 系ツールを mcp に登録する。
+
+        Args:
+            mcp: FastMCP インスタンス
+            ensure_kernel_url: () -> str。 KERNEL_URL を検証して返す関数
+                               (未設定なら例外を投げる)。 mcp_server.py の
+                               _ensure_kernel_url をそのまま渡す。
+        """
+
+        async def _gh_get_file(kernel, owner, repo, path, branch, user_id):
+            """kernel 経由でファイル全文を取得。 (ok, content_or_errmsg) を返す。"""
+            async with _httpx.AsyncClient(timeout=60.0) as client:
+                r = await client.post(
+                    kernel + "/core/github/get-file",
+                    json={"owner": owner, "repo": repo, "path": path,
+                          "branch": branch if branch else None,
+                          "user_id": user_id},
+                )
+            r.raise_for_status()
+            d = r.json()
+            if not d.get("ok"):
+                return False, "取得失敗: " + str(d.get("error", "unknown"))
+            if not d.get("exists"):
+                return False, "ファイルが存在しません: " + owner + "/" + repo + "/" + path
+            return True, d.get("content") or ""
+
+        async def _gh_put_file(kernel, owner, repo, path, content, message,
+                               branch, user_id):
+            """kernel 経由でファイルを push。 (ok, info_dict_or_errmsg) を返す。"""
+            async with _httpx.AsyncClient(timeout=120.0) as client:
+                r = await client.post(
+                    kernel + "/core/github/put-file",
+                    json={"owner": owner, "repo": repo, "path": path,
+                          "content": content, "message": message,
+                          "branch": branch if branch else None,
+                          "user_id": user_id},
+                )
+            r.raise_for_status()
+            d = r.json()
+            if not d.get("ok"):
+                return False, "push 失敗: " + str(d.get("error", "unknown"))
+            return True, d
+
+        @mcp.tool()
+        async def github_move_block(
+            src_owner: str,
+            src_repo: str,
+            src_path: str,
+            dst_owner: str,
+            dst_repo: str,
+            dst_path: str,
+            message: str,
+            start_line: int = 0,
+            end_line: int = 0,
+            start_pattern: str = "",
+            end_pattern: str = "",
+            dst_anchor_pattern: str = "",
+            dst_insert: str = "end",
+            branch: str = "",
+            user_id: str = "",
+        ) -> str:
+            """大きなファイルの一部 (連続ブロック) を別ファイルへ移動する。
+
+            抽出 → 移動先へ挿入 → 元ファイルから削除 を MCP server 内で
+            完結させる。 コード本文は LLM の応答を一切経由しないため、
+            応答 token 制約を受けずに数百行規模のブロックも移動できる。
+
+            抽出範囲の指定 (どちらか一方を使う):
+              A) 行範囲: start_line / end_line (1-indexed、 両端含む)
+              B) 正規表現アンカー: start_pattern / end_pattern
+                 - start_pattern にマッチする最初の行から、 その行以降で
+                   end_pattern に最初にマッチする行まで (両端の行を含む)
+                 - 関数全体の移動など、 行ずれに強い指定に向く
+              両方与えた場合は行範囲 (A) を優先する。
+
+            移動先への挿入位置:
+              - dst_anchor_pattern 指定あり: その正規表現に最初にマッチする
+                行の直後に挿入
+              - dst_anchor_pattern 未指定: dst_insert="end" で末尾、
+                dst_insert="start" で先頭に挿入
+              - 移動先ファイルが存在しない場合は新規作成し、 ブロックのみを内容とする
+
+            元ファイルからは抽出した行が削除される (前後の改行を保つ)。
+            元ファイルへの削除コミットと移動先への追加コミットは別コミット。
+            同一リポジトリ / 別リポジトリ、 同一パス不可 (src と dst が
+            完全一致する場合はエラー)。
+
+            Args:
+              src_owner/src_repo/src_path: 抽出元
+              dst_owner/dst_repo/dst_path: 移動先
+              message: commit message (必須)。 元削除側は "(remove block) " を
+                       前置し、 追加側は "(add block) " を前置して使用する
+              start_line/end_line: 行範囲指定 (1-indexed、 両端含む)
+              start_pattern/end_pattern: 正規表現アンカー指定 (re.MULTILINE)
+              dst_anchor_pattern: 移動先の挿入位置アンカー (正規表現)
+              dst_insert: "end" (既定) または "start"。 dst_anchor 未指定時のみ有効
+              branch: ブランチ名 (省略時は default branch)。 src/dst 共通
+              user_id: the assistant system利用者 ID (任意)。 登録済み PAT を使う
+            """
+            kernel = ensure_kernel_url()
+            if not src_owner or not src_repo or not src_path:
+                return "エラー: src_owner / src_repo / src_path は必須です。"
+            if not dst_owner or not dst_repo or not dst_path:
+                return "エラー: dst_owner / dst_repo / dst_path は必須です。"
+            if not message:
+                return "エラー: message (commit message) が必須です。"
+            if (src_owner, src_repo, src_path) == (dst_owner, dst_repo, dst_path):
+                return "エラー: 移動元と移動先が同一ファイルです。別パスを指定してください。"
+
+            use_line_range = bool(start_line and end_line)
+            use_pattern = bool(start_pattern and end_pattern)
+            if not use_line_range and not use_pattern:
+                return ("エラー: 抽出範囲を指定してください。"
+                        "start_line+end_line か start_pattern+end_pattern のどちらか。")
+
+            # 1. 元ファイル取得
+            try:
+                ok, src_content = await _gh_get_file(
+                    kernel, src_owner, src_repo, src_path, branch, user_id)
+            except Exception as e:
+                return "元ファイル取得失敗: " + type(e).__name__ + ": " + str(e)[:200]
+            if not ok:
+                return src_content  # エラーメッセージ
+
+            src_lines = src_content.split("\n")
+            n = len(src_lines)
+
+            # 2. 抽出範囲の決定 (0-indexed の [bi, ei] 両端含む)
+            if use_line_range:
+                if start_line < 1 or end_line < 1 or start_line > end_line:
+                    return ("エラー: 行範囲が不正です "
+                            "(1<=start_line<=end_line)。"
+                            " start_line=" + str(start_line)
+                            + " end_line=" + str(end_line))
+                if end_line > n:
+                    return ("エラー: end_line がファイル行数を超えています "
+                            "(end_line=" + str(end_line)
+                            + ", ファイル行数=" + str(n) + ")。")
+                bi = start_line - 1
+                ei = end_line - 1
+            else:
+                try:
+                    sp = _re.compile(start_pattern)
+                    ep = _re.compile(end_pattern)
+                except _re.error as e:
+                    return "エラー: 正規表現が不正です: " + str(e)
+                bi = -1
+                for i in range(n):
+                    if sp.search(src_lines[i]):
+                        bi = i
+                        break
+                if bi < 0:
+                    return ("エラー: start_pattern にマッチする行がありません: "
+                            + start_pattern)
+                ei = -1
+                for i in range(bi, n):
+                    if ep.search(src_lines[i]):
+                        ei = i
+                        break
+                if ei < 0:
+                    return ("エラー: start_pattern 以降に end_pattern が"
+                            "見つかりません: " + end_pattern)
+
+            block_lines = src_lines[bi:ei + 1]
+            block_text = "\n".join(block_lines)
+            if not block_text.strip():
+                return "エラー: 抽出範囲が空白のみです。範囲指定を見直してください。"
+
+            # 3. 移動先ファイル取得 (無ければ新規作成扱い)
+            try:
+                dst_ok, dst_content = await _gh_get_file(
+                    kernel, dst_owner, dst_repo, dst_path, branch, user_id)
+            except Exception as e:
+                return "移動先取得失敗: " + type(e).__name__ + ": " + str(e)[:200]
+            dst_is_new = False
+            if not dst_ok:
+                if dst_content.startswith("ファイルが存在しません"):
+                    dst_is_new = True
+                    dst_content = ""
+                else:
+                    return dst_content  # 取得エラー
+
+            # 4. 移動先へ挿入した新内容を構築
+            if dst_is_new or dst_content == "":
+                new_dst = block_text + "\n"
+            else:
+                dst_lines = dst_content.split("\n")
+                if dst_anchor_pattern:
+                    try:
+                        ap = _re.compile(dst_anchor_pattern)
+                    except _re.error as e:
+                        return "エラー: dst_anchor_pattern が不正です: " + str(e)
+                    ai = -1
+                    for i in range(len(dst_lines)):
+                        if ap.search(dst_lines[i]):
+                            ai = i
+                            break
+                    if ai < 0:
+                        return ("エラー: dst_anchor_pattern にマッチする行が"
+                                "移動先にありません: " + dst_anchor_pattern)
+                    new_dst_lines = (dst_lines[:ai + 1] + block_lines
+                                     + dst_lines[ai + 1:])
+                elif dst_insert == "start":
+                    new_dst_lines = block_lines + dst_lines
+                else:
+                    # end: 末尾に挿入 (末尾の空行を1つに整える)
+                    while dst_lines and dst_lines[-1] == "":
+                        dst_lines.pop()
+                    new_dst_lines = dst_lines + [""] + block_lines
+                new_dst = "\n".join(new_dst_lines)
+                if not new_dst.endswith("\n"):
+                    new_dst = new_dst + "\n"
+
+            # 5. 元ファイルから抽出ブロックを削除した新内容を構築
+            new_src_lines = src_lines[:bi] + src_lines[ei + 1:]
+            new_src = "\n".join(new_src_lines)
+
+            # 6. 移動先へ push (先に追加、 失敗時は元を壊さない)
+            try:
+                p_ok, p_info = await _gh_put_file(
+                    kernel, dst_owner, dst_repo, dst_path, new_dst,
+                    "(add block) " + message, branch, user_id)
+            except Exception as e:
+                return "移動先 push 失敗: " + type(e).__name__ + ": " + str(e)[:200]
+            if not p_ok:
+                return p_info  # エラーメッセージ
+            dst_commit = (p_info.get("commit_sha") or "")[:7]
+            dst_url = p_info.get("html_url") or ""
+
+            # 7. 元ファイルを push (削除反映)
+            try:
+                s_ok, s_info = await _gh_put_file(
+                    kernel, src_owner, src_repo, src_path, new_src,
+                    "(remove block) " + message, branch, user_id)
+            except Exception as e:
+                return ("移動先には追加済みですが、元ファイルの更新に失敗しました"
+                        " (要手動確認): " + type(e).__name__ + ": " + str(e)[:200]
+                        + "\n移動先 commit=" + dst_commit)
+            if not s_ok:
+                return ("移動先には追加済みですが、元ファイルの更新に失敗しました"
+                        " (要手動確認): " + s_info
+                        + "\n移動先 commit=" + dst_commit)
+            src_commit = (s_info.get("commit_sha") or "")[:7]
+            src_url = s_info.get("html_url") or ""
+
+            moved = len(block_lines)
+            return (
+                "ブロック移動を完了しました。\n"
+                "- 移動行数: " + str(moved) + " 行\n"
+                "- 移動元: " + src_owner + "/" + src_repo + "/" + src_path
+                + " (commit " + src_commit + ")\n"
+                "- 移動先: " + dst_owner + "/" + dst_repo + "/" + dst_path
+                + (" [新規作成]" if dst_is_new else "")
+                + " (commit " + dst_commit + ")\n"
+                "- 移動元 URL: " + src_url + "\n"
+                "- 移動先 URL: " + dst_url
+            )
+
+        @mcp.tool()
+        async def github_list_workflows(
+            owner: str,
+            repo: str,
+            per_page: int = 50,
+            page: int = 1,
+            user_id: str = "",
+        ) -> str:
+            """GitHub Actions のワークフロー定義一覧を取得する。
+
+            .github/workflows/ 配下に置かれているワークフロー YAML ごとに
+            id / name / path / state (active|disabled_manually|disabled_inactivity)
+            などを返す。
+
+            Args:
+                owner:    リポジトリオーナー
+                repo:     リポジトリ名
+                per_page: 1 ページ件数 (1-100、 default 50)
+                page:     ページ番号 (default 1)
+                user_id:  the assistant system利用者 ID (任意)。 登録済み PAT を使う
+            """
+            kernel = ensure_kernel_url()
+            if not owner or not repo:
+                return "エラー: owner と repo は必須です。"
+            try:
+                async with _httpx.AsyncClient(timeout=60.0) as client:
+                    r = await client.post(
+                        kernel + "/core/github/list-workflows",
+                        json={"owner": owner, "repo": repo,
+                              "per_page": per_page, "page": page,
+                              "user_id": user_id},
+                    )
+                r.raise_for_status()
+                d = r.json()
+            except Exception as e:
+                return "ワークフロー一覧取得失敗: " + type(e).__name__ + ": " + str(e)[:200]
+            if not d.get("ok"):
+                return "取得失敗: " + str(d.get("error", "unknown"))
+            wfs = d.get("workflows") or []
+            if not wfs:
+                return ("ワークフローはありません: " + owner + "/" + repo
+                        + " (total=" + str(d.get("total_count", 0)) + ")")
+            lines = ["## " + owner + "/" + repo + " のワークフロー ("
+                     + str(d.get("total_count", 0)) + " 件)"]
+            for w in wfs:
+                lines.append(
+                    "- [" + str(w.get("id")) + "] "
+                    + str(w.get("name") or "")
+                    + " (" + str(w.get("path") or "") + ")"
+                    + " state=" + str(w.get("state") or "")
+                )
+            return "\n".join(lines)
+
+        @mcp.tool()
+        async def github_list_workflow_runs(
+            owner: str,
+            repo: str,
+            workflow: str = "",
+            branch: str = "",
+            event: str = "",
+            status: str = "",
+            actor: str = "",
+            per_page: int = 20,
+            page: int = 1,
+            user_id: str = "",
+        ) -> str:
+            """GitHub Actions の実行 (run) 一覧を取得する。
+
+            workflow を指定しない場合はリポジトリ全体の実行一覧。
+            workflow を指定する場合はそのワークフローの実行のみ。
+            workflow はファイル名 (例: "build.yml") でも id でも可。
+
+            status はビルド状態の絞り込み:
+              queued / in_progress / completed / waiting / pending /
+              success / failure / cancelled / skipped / timed_out /
+              action_required / neutral / stale / requested
+            event は workflow_dispatch / push / pull_request / schedule など。
+
+            戻り値は run の主要メタデータ (id / status / conclusion /
+            head_branch / head_sha / actor / created_at / html_url 等)。
+
+            Args:
+                owner:    リポジトリオーナー
+                repo:     リポジトリ名
+                workflow: ワークフローファイル名 or id (省略時はリポジトリ全体)
+                branch:   ブランチ名で絞り込み (任意)
+                event:    イベント種別で絞り込み (任意)
+                status:   ステータスで絞り込み (任意)
+                actor:    実行者 GitHub ログイン名で絞り込み (任意)
+                per_page: 1 ページ件数 (1-100、 default 20)
+                page:     ページ番号 (default 1)
+                user_id:  the assistant system利用者 ID (任意)
+            """
+            kernel = ensure_kernel_url()
+            if not owner or not repo:
+                return "エラー: owner と repo は必須です。"
+            payload: dict = {"owner": owner, "repo": repo,
+                             "per_page": per_page, "page": page,
+                             "user_id": user_id}
+            if workflow:
+                payload["workflow"] = workflow
+            if branch:
+                payload["branch"] = branch
+            if event:
+                payload["event"] = event
+            if status:
+                payload["status"] = status
+            if actor:
+                payload["actor"] = actor
+            try:
+                async with _httpx.AsyncClient(timeout=60.0) as client:
+                    r = await client.post(
+                        kernel + "/core/github/list-workflow-runs",
+                        json=payload,
+                    )
+                r.raise_for_status()
+                d = r.json()
+            except Exception as e:
+                return "実行一覧取得失敗: " + type(e).__name__ + ": " + str(e)[:200]
+            if not d.get("ok"):
+                return "取得失敗: " + str(d.get("error", "unknown"))
+            runs = d.get("workflow_runs") or []
+            total = d.get("total_count", 0)
+            header = ("## " + owner + "/" + repo + " のワークフロー実行 "
+                      + "(total=" + str(total) + ", 取得=" + str(len(runs)) + " 件"
+                      + (", workflow=" + workflow if workflow else "")
+                      + (", branch=" + branch if branch else "")
+                      + (", status=" + status if status else "")
+                      + ")")
+            if not runs:
+                return header + "\n\n該当する実行はありません。"
+            lines = [header, ""]
+            for run in runs:
+                lines.append(
+                    "- run_id=" + str(run.get("id"))
+                    + " #" + str(run.get("run_number"))
+                    + "." + str(run.get("run_attempt"))
+                    + " [" + str(run.get("status") or "")
+                    + (" / " + str(run.get("conclusion")) if run.get("conclusion") else "")
+                    + "] "
+                    + str(run.get("name") or "")
+                    + " (" + str(run.get("event") or "") + ", "
+                    + str(run.get("head_branch") or "") + "@"
+                    + str(run.get("head_sha") or "")
+                    + ", by " + str(run.get("actor") or "") + ")"
+                )
+                if run.get("display_title"):
+                    lines.append("    title: " + str(run.get("display_title")))
+                lines.append("    started: " + str(run.get("run_started_at") or "")
+                             + " updated: " + str(run.get("updated_at") or ""))
+                if run.get("html_url"):
+                    lines.append("    url: " + str(run.get("html_url")))
+            return "\n".join(lines)
+
+        @mcp.tool()
+        async def github_get_workflow_run(
+            owner: str,
+            repo: str,
+            run_id: int,
+            user_id: str = "",
+        ) -> str:
+            """ワークフロー実行 1 件の詳細を取得する。
+
+            run_id は github_list_workflow_runs の結果の id を渡す。
+
+            Args:
+                owner:   リポジトリオーナー
+                repo:    リポジトリ名
+                run_id:  実行 ID
+                user_id: the assistant system利用者 ID (任意)
+            """
+            kernel = ensure_kernel_url()
+            if not owner or not repo:
+                return "エラー: owner と repo は必須です。"
+            if not run_id:
+                return "エラー: run_id は必須です。"
+            try:
+                async with _httpx.AsyncClient(timeout=60.0) as client:
+                    r = await client.post(
+                        kernel + "/core/github/get-workflow-run",
+                        json={"owner": owner, "repo": repo,
+                              "run_id": int(run_id), "user_id": user_id},
+                    )
+                r.raise_for_status()
+                d = r.json()
+            except Exception as e:
+                return "実行取得失敗: " + type(e).__name__ + ": " + str(e)[:200]
+            if not d.get("ok"):
+                return "取得失敗: " + str(d.get("error", "unknown"))
+            run = d.get("run") or {}
+            lines = [
+                "## ワークフロー実行 " + owner + "/" + repo
+                + " run_id=" + str(run.get("id")),
+                "- name: " + str(run.get("name") or ""),
+                "- display_title: " + str(run.get("display_title") or ""),
+                "- status: " + str(run.get("status") or "")
+                + " / conclusion: " + str(run.get("conclusion") or ""),
+                "- event: " + str(run.get("event") or "")
+                + " / actor: " + str(run.get("actor") or "")
+                + " / triggering_actor: " + str(run.get("triggering_actor") or ""),
+                "- head: " + str(run.get("head_branch") or "")
+                + "@" + str(run.get("head_sha") or ""),
+                "- run_number: " + str(run.get("run_number"))
+                + "." + str(run.get("run_attempt")),
+                "- created_at: " + str(run.get("created_at") or ""),
+                "- run_started_at: " + str(run.get("run_started_at") or ""),
+                "- updated_at: " + str(run.get("updated_at") or ""),
+                "- workflow_id: " + str(run.get("workflow_id") or ""),
+                "- html_url: " + str(run.get("html_url") or ""),
+                "- jobs_url: " + str(run.get("jobs_url") or ""),
+                "- logs_url: " + str(run.get("logs_url") or ""),
+            ]
+            return "\n".join(lines)
+
+        @mcp.tool()
+        async def github_list_workflow_run_jobs(
+            owner: str,
+            repo: str,
+            run_id: int,
+            filter: str = "latest",
+            per_page: int = 30,
+            page: int = 1,
+            user_id: str = "",
+        ) -> str:
+            """ワークフロー実行内の job 一覧を取得する (各 step の状態を含む)。
+
+            ビルドが失敗したときどのステップで落ちたかを確認するのに使う。
+
+            Args:
+                owner:    リポジトリオーナー
+                repo:     リポジトリ名
+                run_id:   実行 ID
+                filter:   "latest" (default) なら最新試行のみ、 "all" は全試行
+                per_page: 1 ページ件数 (1-100、 default 30)
+                page:     ページ番号 (default 1)
+                user_id:  the assistant system利用者 ID (任意)
+            """
+            kernel = ensure_kernel_url()
+            if not owner or not repo:
+                return "エラー: owner と repo は必須です。"
+            if not run_id:
+                return "エラー: run_id は必須です。"
+            try:
+                async with _httpx.AsyncClient(timeout=60.0) as client:
+                    r = await client.post(
+                        kernel + "/core/github/list-workflow-run-jobs",
+                        json={"owner": owner, "repo": repo,
+                              "run_id": int(run_id), "filter": filter,
+                              "per_page": per_page, "page": page,
+                              "user_id": user_id},
+                    )
+                r.raise_for_status()
+                d = r.json()
+            except Exception as e:
+                return "job 一覧取得失敗: " + type(e).__name__ + ": " + str(e)[:200]
+            if not d.get("ok"):
+                return "取得失敗: " + str(d.get("error", "unknown"))
+            jobs = d.get("jobs") or []
+            total = d.get("total_count", 0)
+            header = ("## run_id=" + str(run_id) + " の job 一覧 "
+                      + "(total=" + str(total) + ", filter=" + filter + ")")
+            if not jobs:
+                return header + "\n\njob はありません。"
+            lines = [header]
+            for j in jobs:
+                lines.append("")
+                lines.append(
+                    "### job " + str(j.get("id"))
+                    + ": " + str(j.get("name") or "")
+                    + " [" + str(j.get("status") or "")
+                    + (" / " + str(j.get("conclusion")) if j.get("conclusion") else "")
+                    + "]"
+                )
+                lines.append("- started: " + str(j.get("started_at") or "")
+                             + " completed: " + str(j.get("completed_at") or ""))
+                lines.append("- runner: " + str(j.get("runner_name") or "")
+                             + " labels=" + str(j.get("labels") or []))
+                if j.get("html_url"):
+                    lines.append("- url: " + str(j.get("html_url")))
+                steps = j.get("steps") or []
+                if steps:
+                    lines.append("- steps:")
+                    for s in steps:
+                        lines.append(
+                            "  " + str(s.get("number") or "?") + ". "
+                            + str(s.get("name") or "")
+                            + " [" + str(s.get("status") or "")
+                            + (" / " + str(s.get("conclusion")) if s.get("conclusion") else "")
+                            + "]"
+                        )
+            return "\n".join(lines)
+
+        @mcp.tool()
+        async def github_dispatch_workflow(
+            owner: str,
+            repo: str,
+            workflow: str,
+            ref: str,
+            inputs: dict | None = None,
+            user_id: str = "",
+        ) -> str:
+            """GitHub Actions ワークフローを手動トリガーする (workflow_dispatch)。
+
+            コンテナビルド & レジストリ push 等を kick するのが代表的用途。
+            対象ワークフローには `on: workflow_dispatch:` トリガーが
+            定義されている必要がある (定義されていないと 422 が返る)。
+
+            GitHub 仕様により 204 No Content の応答に run_id は含まれない。
+            トリガー直後 1-2 秒後に github_list_workflow_runs で
+            workflow + branch を絞って最新 run を特定すること。
+
+            Args:
+                owner:    リポジトリオーナー
+                repo:     リポジトリ名
+                workflow: ワークフローファイル名 (例: "build.yml") または id
+                ref:      branch 名 / tag 名 / commit SHA
+                inputs:   workflow_dispatch.inputs に渡す引数 (任意)。
+                          値は文字列化されて送られる
+                user_id:  the assistant system利用者 ID (任意)
+            """
+            kernel = ensure_kernel_url()
+            if not owner or not repo:
+                return "エラー: owner と repo は必須です。"
+            if not workflow:
+                return "エラー: workflow は必須です。"
+            if not ref:
+                return "エラー: ref は必須です。"
+            payload: dict = {"owner": owner, "repo": repo,
+                             "workflow": workflow, "ref": ref,
+                             "user_id": user_id}
+            if inputs:
+                payload["inputs"] = dict(inputs)
+            try:
+                async with _httpx.AsyncClient(timeout=60.0) as client:
+                    r = await client.post(
+                        kernel + "/core/github/dispatch-workflow",
+                        json=payload,
+                    )
+                r.raise_for_status()
+                d = r.json()
+            except Exception as e:
+                return "dispatch 失敗: " + type(e).__name__ + ": " + str(e)[:200]
+            if not d.get("ok"):
+                return "dispatch 失敗: " + str(d.get("error", "unknown"))
+            return (
+                "ワークフローを起動しました。\n"
+                "- workflow: " + str(d.get("workflow") or "") + "\n"
+                "- ref: " + str(d.get("ref") or "") + "\n"
+                "- inputs: " + str(d.get("inputs") or {}) + "\n"
+                "- 注: " + str(d.get("note") or "")
+            )
+
+        @mcp.tool()
+        async def github_rerun_workflow_run(
+            owner: str,
+            repo: str,
+            run_id: int,
+            failed_only: bool = False,
+            user_id: str = "",
+        ) -> str:
+            """ワークフロー実行を再実行する。
+
+            failed_only=True なら失敗 job のみを再実行 (CI の偶発的失敗の
+            リトライに便利)。 False なら全 job を頭から再実行。
+
+            Args:
+                owner:       リポジトリオーナー
+                repo:        リポジトリ名
+                run_id:      対象実行 ID
+                failed_only: True なら失敗 job のみ再実行 (default False)
+                user_id:     the assistant system利用者 ID (任意)
+            """
+            kernel = ensure_kernel_url()
+            if not owner or not repo:
+                return "エラー: owner と repo は必須です。"
+            if not run_id:
+                return "エラー: run_id は必須です。"
+            try:
+                async with _httpx.AsyncClient(timeout=60.0) as client:
+                    r = await client.post(
+                        kernel + "/core/github/rerun-workflow-run",
+                        json={"owner": owner, "repo": repo,
+                              "run_id": int(run_id),
+                              "failed_only": bool(failed_only),
+                              "user_id": user_id},
+                    )
+                r.raise_for_status()
+                d = r.json()
+            except Exception as e:
+                return "再実行リクエスト失敗: " + type(e).__name__ + ": " + str(e)[:200]
+            if not d.get("ok"):
+                return "再実行失敗: " + str(d.get("error", "unknown"))
+            return (
+                "再実行を受け付けました。\n"
+                "- run_id: " + str(d.get("run_id")) + "\n"
+                "- failed_only: " + str(d.get("failed_only"))
+            )
+
+        @mcp.tool()
+        async def github_cancel_workflow_run(
+            owner: str,
+            repo: str,
+            run_id: int,
+            user_id: str = "",
+        ) -> str:
+            """実行中のワークフローをキャンセルする。
+
+            Args:
+                owner:   リポジトリオーナー
+                repo:    リポジトリ名
+                run_id:  対象実行 ID
+                user_id: the assistant system利用者 ID (任意)
+            """
+            kernel = ensure_kernel_url()
+            if not owner or not repo:
+                return "エラー: owner と repo は必須です。"
+            if not run_id:
+                return "エラー: run_id は必須です。"
+            try:
+                async with _httpx.AsyncClient(timeout=60.0) as client:
+                    r = await client.post(
+                        kernel + "/core/github/cancel-workflow-run",
+                        json={"owner": owner, "repo": repo,
+                              "run_id": int(run_id),
+                              "user_id": user_id},
+                    )
+                r.raise_for_status()
+                d = r.json()
+            except Exception as e:
+                return "キャンセルリクエスト失敗: " + type(e).__name__ + ": " + str(e)[:200]
+            if not d.get("ok"):
+                return "キャンセル失敗: " + str(d.get("error", "unknown"))
+            return "キャンセルを受け付けました (run_id=" + str(d.get("run_id")) + ")。"
+
+        @mcp.tool()
+        async def github_list_issue_comments(
+            owner: str,
+            repo: str,
+            number: int,
+            per_page: int = 30,
+            page: int = 1,
+            user_id: str = "",
+        ) -> str:
+            """Issue 1 件に付いたコメント一覧を取得する。
+
+            github_get_issue は Issue 本文のみ返すので、 議論の流れを追う
+            ときはこのツールを使う。 PR のレビューコメントは別 API のため
+            含まれない (将来 github_list_pr_review_comments で対応)。
+
+            Args:
+                owner:    リポジトリオーナー
+                repo:     リポジトリ名
+                number:   Issue 番号
+                per_page: 1 ページ件数 (1-100、 default 30)
+                page:     ページ番号 (default 1)
+                user_id:  the assistant system利用者 ID (任意)
+            """
+            kernel = ensure_kernel_url()
+            if not owner or not repo:
+                return "エラー: owner と repo は必須です。"
+            if not number:
+                return "エラー: number は必須です。"
+            try:
+                async with _httpx.AsyncClient(timeout=60.0) as client:
+                    r = await client.post(
+                        kernel + "/core/github/list-issue-comments",
+                        json={"owner": owner, "repo": repo,
+                              "number": int(number),
+                              "per_page": per_page, "page": page,
+                              "user_id": user_id},
+                    )
+                r.raise_for_status()
+                d = r.json()
+            except Exception as e:
+                return ("コメント取得失敗: " + type(e).__name__ + ": "
+                        + str(e)[:200])
+            if not d.get("ok"):
+                return "取得失敗: " + str(d.get("error", "unknown"))
+            comments = d.get("comments") or []
+            header = ("## " + owner + "/" + repo + "#" + str(number)
+                      + " のコメント (" + str(len(comments)) + " 件)")
+            if not comments:
+                return header + "\n\nコメントはありません。"
+            lines = [header]
+            for c in comments:
+                lines.append("")
+                lines.append("### @" + str(c.get("user") or "")
+                             + " (" + str(c.get("created_at") or "") + ")")
+                if c.get("updated_at") and c.get("updated_at") != c.get("created_at"):
+                    lines.append("_updated: " + str(c.get("updated_at")) + "_")
+                lines.append(str(c.get("body") or ""))
+                if c.get("html_url"):
+                    lines.append("url: " + str(c.get("html_url")))
+            return "\n".join(lines)
+
+        @mcp.tool()
+        async def github_list_issue_events(
+            owner: str,
+            repo: str,
+            number: int,
+            per_page: int = 30,
+            page: int = 1,
+            user_id: str = "",
+        ) -> str:
+            """Issue の event 履歴 (状態遷移) を取得する。
+
+            誰がいつ assign / unassign / labeled / unlabeled / milestoned /
+            demilestoned / closed / reopened / renamed / referenced /
+            mentioned / merged 等の操作をしたか。 コメント本文は含まない。
+
+            Args:
+                owner:    リポジトリオーナー
+                repo:     リポジトリ名
+                number:   Issue 番号
+                per_page: 1 ページ件数 (1-100、 default 30)
+                page:     ページ番号 (default 1)
+                user_id:  the assistant system利用者 ID (任意)
+            """
+            kernel = ensure_kernel_url()
+            if not owner or not repo:
+                return "エラー: owner と repo は必須です。"
+            if not number:
+                return "エラー: number は必須です。"
+            try:
+                async with _httpx.AsyncClient(timeout=60.0) as client:
+                    r = await client.post(
+                        kernel + "/core/github/list-issue-events",
+                        json={"owner": owner, "repo": repo,
+                              "number": int(number),
+                              "per_page": per_page, "page": page,
+                              "user_id": user_id},
+                    )
+                r.raise_for_status()
+                d = r.json()
+            except Exception as e:
+                return ("event 取得失敗: " + type(e).__name__ + ": "
+                        + str(e)[:200])
+            if not d.get("ok"):
+                return "取得失敗: " + str(d.get("error", "unknown"))
+            events = d.get("events") or []
+            header = ("## " + owner + "/" + repo + "#" + str(number)
+                      + " の event 履歴 (" + str(len(events)) + " 件)")
+            if not events:
+                return header + "\n\nevent はありません。"
+            lines = [header]
+            for e in events:
+                detail = ""
+                if e.get("label"):
+                    detail = " label=" + str(e.get("label"))
+                elif e.get("assignee"):
+                    detail = " assignee=" + str(e.get("assignee"))
+                elif e.get("milestone"):
+                    detail = " milestone=" + str(e.get("milestone"))
+                elif e.get("rename"):
+                    rn = e.get("rename") or {}
+                    detail = (" rename: "
+                              + str(rn.get("from") or "") + " -> "
+                              + str(rn.get("to") or ""))
+                elif e.get("state_reason"):
+                    detail = " state_reason=" + str(e.get("state_reason"))
+                lines.append(
+                    "- " + str(e.get("created_at") or "") + " "
+                    + "[" + str(e.get("event") or "") + "] "
+                    + "@" + str(e.get("actor") or "")
+                    + detail
+                    + (" commit=" + str(e.get("commit_id"))[:7]
+                       if e.get("commit_id") else "")
+                )
+            return "\n".join(lines)
+
+        @mcp.tool()
+        async def github_search_issues(
+            q: str,
+            sort: str = "",
+            order: str = "desc",
+            per_page: int = 30,
+            page: int = 1,
+            user_id: str = "",
+        ) -> str:
+            """GitHub の検索 API で Issue / PR を横断検索する。
+
+            q には GitHub の検索構文をそのまま渡す (kernel 側で解釈しない
+            透過プロキシ)。 構文の代表例:
+
+              - リポジトリ指定: "repo:your-org/your-repo"
+              - 種別: "is:issue" / "is:pr" / "is:open" / "is:closed" /
+                      "is:merged" / "is:draft"
+              - 担当: "author:your-user" / "assignee:your-user" /
+                      "mentions:your-user" / "involves:your-user" /
+                      "review-requested:your-user"
+              - ラベル: "label:bug" / 'label:"good first issue"' /
+                       "-label:wontfix" (除外)
+              - 日付: "created:>=2026-01-01" / "updated:>=2026-01-01" /
+                      "closed:<2025-12-31"
+              - ソート: "sort:updated-desc" (q 内に書くか sort 引数で)
+
+            複合例:
+              "repo:your-org/your-repo is:open is:issue label:bug"
+              "is:pr review-requested:your-user is:open"
+              "author:your-user is:closed closed:>=2026-05-01"
+
+            並び替え:
+              sort: comments / reactions / reactions-+1 / interactions /
+                    created / updated。 空文字なら best match (関連度順)。
+              order: asc / desc (default desc)。
+
+            注意: GitHub の検索 API は 1 リクエストあたり 1000 件まで
+            (per_page * page <= 1000)。 古いデータが必要なら絞り込みを
+            厳しくする。 認証ありで毎分 30 リクエストのレート制限あり。
+
+            Args:
+                q:        GitHub 検索構文 (必須)
+                sort:     並び替え軸 (任意、 空文字で best match)
+                order:    asc / desc (default desc)
+                per_page: 1 ページ件数 (1-100、 default 30)
+                page:     ページ番号 (default 1)
+                user_id:  the assistant system利用者 ID (任意)
+            """
+            kernel = ensure_kernel_url()
+            if not q or not q.strip():
+                return "エラー: q (検索クエリ) は必須です。"
+            payload: dict = {"q": q, "order": order,
+                             "per_page": per_page, "page": page,
+                             "user_id": user_id}
+            if sort:
+                payload["sort"] = sort
+            try:
+                async with _httpx.AsyncClient(timeout=60.0) as client:
+                    r = await client.post(
+                        kernel + "/core/github/search-issues",
+                        json=payload,
+                    )
+                r.raise_for_status()
+                d = r.json()
+            except Exception as e:
+                return ("検索失敗: " + type(e).__name__ + ": "
+                        + str(e)[:200])
+            if not d.get("ok"):
+                return "検索失敗: " + str(d.get("error", "unknown"))
+            items = d.get("items") or []
+            total = d.get("total_count", 0)
+            incomplete = d.get("incomplete_results")
+            header = ("## 検索結果 q=`" + q + "` "
+                      + "(total=" + str(total)
+                      + ", 取得=" + str(len(items)) + " 件"
+                      + (", incomplete" if incomplete else "")
+                      + ")")
+            if not items:
+                return header + "\n\n該当なし。"
+            lines = [header, ""]
+            for it in items:
+                kind = "PR" if it.get("is_pr") else "Issue"
+                if it.get("draft"):
+                    kind = "PR(draft)"
+                lines.append(
+                    "- [" + kind + "] "
+                    + str(it.get("repository_url") or "").replace(
+                        "https://api.github.com/repos/", "")
+                    + "#" + str(it.get("number"))
+                    + " [" + str(it.get("state") or "")
+                    + (" / " + str(it.get("state_reason"))
+                       if it.get("state_reason") else "")
+                    + "] " + str(it.get("title") or "")
+                )
+                meta = []
+                if it.get("user"):
+                    meta.append("by @" + str(it.get("user")))
+                if it.get("assignees"):
+                    meta.append("assignees=" + ",".join(it.get("assignees")))
+                if it.get("labels"):
+                    meta.append("labels=" + ",".join(it.get("labels")))
+                if it.get("comments") is not None:
+                    meta.append("comments=" + str(it.get("comments")))
+                if meta:
+                    lines.append("    " + " | ".join(meta))
+                lines.append("    created=" + str(it.get("created_at") or "")
+                             + " updated=" + str(it.get("updated_at") or ""))
+                if it.get("html_url"):
+                    lines.append("    url: " + str(it.get("html_url")))
+            return "\n".join(lines)
+
+        @mcp.tool()
+        async def github_list_labels(
+            owner: str,
+            repo: str,
+            per_page: int = 100,
+            page: int = 1,
+            user_id: str = "",
+        ) -> str:
+            """リポジトリで定義されているラベル一覧を取得する。
+
+            github_search_issues や github_update_issue で label を指定
+            するときの確認に使う。
+
+            Args:
+                owner:    リポジトリオーナー
+                repo:     リポジトリ名
+                per_page: 1 ページ件数 (1-100、 default 100)
+                page:     ページ番号 (default 1)
+                user_id:  the assistant system利用者 ID (任意)
+            """
+            kernel = ensure_kernel_url()
+            if not owner or not repo:
+                return "エラー: owner と repo は必須です。"
+            try:
+                async with _httpx.AsyncClient(timeout=60.0) as client:
+                    r = await client.post(
+                        kernel + "/core/github/list-labels",
+                        json={"owner": owner, "repo": repo,
+                              "per_page": per_page, "page": page,
+                              "user_id": user_id},
+                    )
+                r.raise_for_status()
+                d = r.json()
+            except Exception as e:
+                return ("ラベル取得失敗: " + type(e).__name__ + ": "
+                        + str(e)[:200])
+            if not d.get("ok"):
+                return "取得失敗: " + str(d.get("error", "unknown"))
+            labels = d.get("labels") or []
+            header = ("## " + owner + "/" + repo + " のラベル ("
+                      + str(len(labels)) + " 件)")
+            if not labels:
+                return header + "\n\nラベル定義はありません。"
+            lines = [header]
+            for la in labels:
+                desc = la.get("description") or ""
+                lines.append(
+                    "- " + str(la.get("name") or "")
+                    + " (#" + str(la.get("color") or "") + ")"
+                    + (" — " + desc if desc else "")
+                    + (" [default]" if la.get("default") else "")
+                )
+            return "\n".join(lines)
+
+        @mcp.tool()
+        async def github_list_milestones(
+            owner: str,
+            repo: str,
+            state: str = "open",
+            sort: str = "due_on",
+            direction: str = "asc",
+            per_page: int = 50,
+            page: int = 1,
+            user_id: str = "",
+        ) -> str:
+            """リポジトリのマイルストーン一覧を取得する。
+
+            Args:
+                owner:     リポジトリオーナー
+                repo:      リポジトリ名
+                state:     open / closed / all (default open)
+                sort:      due_on / completeness (default due_on)
+                direction: asc / desc (default asc)
+                per_page:  1 ページ件数 (1-100、 default 50)
+                page:      ページ番号 (default 1)
+                user_id:   the assistant system利用者 ID (任意)
+            """
+            kernel = ensure_kernel_url()
+            if not owner or not repo:
+                return "エラー: owner と repo は必須です。"
+            try:
+                async with _httpx.AsyncClient(timeout=60.0) as client:
+                    r = await client.post(
+                        kernel + "/core/github/list-milestones",
+                        json={"owner": owner, "repo": repo,
+                              "state": state, "sort": sort,
+                              "direction": direction,
+                              "per_page": per_page, "page": page,
+                              "user_id": user_id},
+                    )
+                r.raise_for_status()
+                d = r.json()
+            except Exception as e:
+                return ("マイルストーン取得失敗: " + type(e).__name__ + ": "
+                        + str(e)[:200])
+            if not d.get("ok"):
+                return "取得失敗: " + str(d.get("error", "unknown"))
+            ms = d.get("milestones") or []
+            header = ("## " + owner + "/" + repo + " のマイルストーン "
+                      + "(" + str(len(ms)) + " 件, state=" + state + ")")
+            if not ms:
+                return header + "\n\nマイルストーンはありません。"
+            lines = [header]
+            for m in ms:
+                lines.append("")
+                total_issues = (int(m.get("open_issues") or 0)
+                                + int(m.get("closed_issues") or 0))
+                progress = ""
+                if total_issues > 0:
+                    progress = (" ["
+                                + str(m.get("closed_issues") or 0) + "/"
+                                + str(total_issues) + " closed]")
+                lines.append(
+                    "### #" + str(m.get("number"))
+                    + " " + str(m.get("title") or "")
+                    + " [" + str(m.get("state") or "") + "]"
+                    + progress
+                )
+                if m.get("description"):
+                    lines.append(str(m.get("description")))
+                lines.append("- creator: @" + str(m.get("creator") or "")
+                             + " / created: " + str(m.get("created_at") or ""))
+                lines.append("- due_on: " + str(m.get("due_on") or "(なし)")
+                             + " / closed_at: " + str(m.get("closed_at") or "(未)"))
+                if m.get("html_url"):
+                    lines.append("- url: " + str(m.get("html_url")))
+            return "\n".join(lines)
+
+        # ================================================================
+        # ProjectsV2 (kanban board) tools — backed by kernel GraphQL relay
+        # ================================================================
+
+        @mcp.tool()
+        async def github_project_get(
+            org: str,
+            number: int,
+            user_id: str = "",
+        ) -> str:
+            """ProjectV2 (org-scoped カンバン) の基本情報を取得する。
+
+            Args:
+                org: organization 名 (例: "example-org")
+                number: project 番号 (例: 11 → /orgs/<org>/projects/11)
+                user_id: the assistant system利用者 ID (任意)
+            """
+            kernel = ensure_kernel_url()
+            try:
+                async with _httpx.AsyncClient(timeout=30.0) as client:
+                    r = await client.post(
+                        kernel + "/core/github/project/get",
+                        json={"org": org, "number": int(number),
+                              "user_id": user_id},
+                    )
+                r.raise_for_status()
+                d = r.json()
+            except Exception as e:
+                return ("project 取得失敗: " + type(e).__name__ + ": "
+                        + str(e)[:200])
+            if not d.get("ok"):
+                return "取得失敗: " + str(d.get("error", "unknown"))
+            p = d.get("project") or {}
+            lines = []
+            lines.append("## ProjectV2: " + org + "/projects/" + str(number))
+            lines.append("- id: " + str(p.get("id") or ""))
+            lines.append("- title: " + str(p.get("title") or ""))
+            lines.append("- url: " + str(p.get("url") or ""))
+            lines.append("- closed: " + str(bool(p.get("closed"))))
+            return "\n".join(lines)
+
+
+        @mcp.tool()
+        async def github_project_get_fields(
+            org: str,
+            number: int,
+            user_id: str = "",
+        ) -> str:
+            """ProjectV2 のフィールド定義一覧を取得する。
+
+            Status のような SingleSelect field は options (= カンバンの
+            カラム名) も併せて返す。 update-item-field でカラム移動する
+            ときに必要な field_id / option_id をここで確認する。
+            """
+            kernel = ensure_kernel_url()
+            try:
+                async with _httpx.AsyncClient(timeout=30.0) as client:
+                    r = await client.post(
+                        kernel + "/core/github/project/get-fields",
+                        json={"org": org, "number": int(number),
+                              "user_id": user_id},
+                    )
+                r.raise_for_status()
+                d = r.json()
+            except Exception as e:
+                return ("project fields 取得失敗: " + type(e).__name__ + ": "
+                        + str(e)[:200])
+            if not d.get("ok"):
+                return "取得失敗: " + str(d.get("error", "unknown"))
+            fields = d.get("fields") or []
+            header = ("## ProjectV2: " + org + "/projects/" + str(number)
+                      + ' "' + str(d.get("project_title") or "") + '"'
+                      + " (id=" + str(d.get("project_id") or "") + ")")
+            lines = [header, "fields=" + str(len(fields)), ""]
+            for f in fields:
+                lines.append("- [" + str(f.get("id") or "") + '] "'
+                             + str(f.get("name") or "") + '" ('
+                             + str(f.get("data_type") or "") + ", "
+                             + str(f.get("typename") or "") + ")")
+                opts = f.get("options") or []
+                if opts:
+                    lines.append("    options:")
+                    for o in opts:
+                        lines.append('      - [' + str(o.get("id") or "")
+                                     + '] "' + str(o.get("name") or "") + '"')
+                its = f.get("iterations") or []
+                if its:
+                    lines.append("    iterations:")
+                    for it in its:
+                        lines.append('      - [' + str(it.get("id") or "")
+                                     + '] "' + str(it.get("title") or "")
+                                     + '" (' + str(it.get("startDate") or "")
+                                     + ", " + str(it.get("duration") or "")
+                                     + "d)")
+                cits = f.get("completed_iterations") or []
+                if cits:
+                    lines.append("    completed_iterations: "
+                                 + str(len(cits)) + " 件")
+            return "\n".join(lines)
+
+
+        @mcp.tool()
+        async def github_project_list_items(
+            org: str,
+            number: int,
+            first: int = 50,
+            after: str = "",
+            user_id: str = "",
+        ) -> str:
+            """ProjectV2 の Item 一覧 (Issue/PR + フィールド値) を取得する。
+
+            ページングは has_next=True が返ってきたら次回呼び出しで
+            after=<前回の next_cursor> を渡す。 first は 1-100。
+
+            Args:
+                org: organization 名
+                number: project 番号
+                first: 1 ページ件数 (1-100、 default 50)
+                after: ページング cursor
+                user_id: the assistant system利用者 ID (任意)
+            """
+            kernel = ensure_kernel_url()
+            try:
+                async with _httpx.AsyncClient(timeout=60.0) as client:
+                    r = await client.post(
+                        kernel + "/core/github/project/list-items",
+                        json={"org": org, "number": int(number),
+                              "first": int(first), "after": after,
+                              "user_id": user_id},
+                    )
+                r.raise_for_status()
+                d = r.json()
+            except Exception as e:
+                return ("project items 取得失敗: " + type(e).__name__ + ": "
+                        + str(e)[:200])
+            if not d.get("ok"):
+                return "取得失敗: " + str(d.get("error", "unknown"))
+            items = d.get("items") or []
+
+            # Status 集計
+            status_counts = {}
+            for it in items:
+                fmap = it.get("fields") or {}
+                s = fmap.get("Status")
+                key = str(s) if s is not None else "(none)"
+                status_counts[key] = status_counts.get(key, 0) + 1
+
+            lines = []
+            lines.append("## ProjectV2: " + org + "/projects/" + str(number)
+                         + " (id=" + str(d.get("project_id") or "") + ")")
+            lines.append("items=" + str(len(items))
+                         + ", has_next=" + str(bool(d.get("has_next")))
+                         + ", next_cursor="
+                         + str(d.get("next_cursor") or "null"))
+            if status_counts:
+                lines.append("")
+                lines.append("### Status breakdown")
+                for k in sorted(status_counts.keys()):
+                    lines.append("- " + k + ": " + str(status_counts[k]))
+            lines.append("")
+            lines.append("### Items")
+            for it in items:
+                c = it.get("content") or {}
+                fmap = it.get("fields") or {}
+                repo_full = c.get("repository") or ""
+                num = c.get("number")
+                ref = ""
+                if repo_full and num:
+                    ref = repo_full + "#" + str(num)
+                elif c.get("title"):
+                    ref = "(draft)"
+                type_str = str(it.get("type") or "?")
+                state_str = str(c.get("state") or "")
+                head = ("- [" + str(it.get("item_id") or "") + "] "
+                        + ref + " [" + type_str
+                        + (("," + state_str) if state_str else "") + "]")
+                fv_parts = []
+                for k in fmap:
+                    v = fmap[k]
+                    if v is None or v == "":
+                        continue
+                    fv_parts.append(str(k) + '="' + str(v) + '"')
+                if fv_parts:
+                    head += " | " + " | ".join(fv_parts)
+                lines.append(head)
+                title = c.get("title") or ""
+                if title:
+                    lines.append("    " + title)
+            return "\n".join(lines)
+
+
+        @mcp.tool()
+        async def github_project_update_item_field(
+            item_id: str,
+            org: str = "",
+            number: int = 0,
+            field_name: str = "",
+            option_name: str = "",
+            project_id: str = "",
+            field_id: str = "",
+            value_type: str = "",
+            value: str = "",
+            user_id: str = "",
+        ) -> str:
+            """ProjectV2 Item のフィールド値を更新する (カラム移動など)。
+
+            2 通りの呼び方:
+
+            A) 名前ベース (おすすめ、 SingleSelect 用):
+               item_id, org, number, field_name, option_name を指定。
+               例: org="example-org", number=11, field_name="Status",
+                   option_name="画面機能"
+
+            B) ID 全指定 (text/number/date/iteration 用):
+               item_id, project_id, field_id, value_type, value を指定。
+               value_type: "single_select" | "text" | "number" | "date"
+                           | "iteration"
+
+            field のクリア (値を空にする) は未サポート。
+
+            Args:
+                item_id: 対象 Item の Node ID (PVTI_xxx)
+                org, number: 名前ベース呼び出し時の project 識別子
+                field_name, option_name: 名前ベース呼び出し時
+                project_id, field_id, value_type, value: ID ベース呼び出し時
+                user_id: the assistant system利用者 ID (任意)
+            """
+            kernel = ensure_kernel_url()
+            body = {
+                "item_id": item_id,
+                "org": org,
+                "number": int(number),
+                "field_name": field_name,
+                "option_name": option_name,
+                "project_id": project_id,
+                "field_id": field_id,
+                "value_type": value_type,
+                "value": value,
+                "user_id": user_id,
+            }
+            try:
+                async with _httpx.AsyncClient(timeout=30.0) as client:
+                    r = await client.post(
+                        kernel + "/core/github/project/update-item-field",
+                        json=body,
+                    )
+                r.raise_for_status()
+                d = r.json()
+            except Exception as e:
+                return ("update-item-field 失敗: " + type(e).__name__ + ": "
+                        + str(e)[:200])
+            if not d.get("ok"):
+                return "更新失敗: " + str(d.get("error", "unknown"))
+            return ("OK: item_id=" + str(d.get("item_id") or item_id)
+                    + " を更新しました")
+
+
+        @mcp.tool()
+        async def github_project_add_item(
+            org: str = "",
+            number: int = 0,
+            issue_owner: str = "",
+            issue_repo: str = "",
+            issue_number: int = 0,
+            project_id: str = "",
+            content_id: str = "",
+            user_id: str = "",
+        ) -> str:
+            """Issue / PR を ProjectV2 (カンバン) に追加する。
+
+            2 通りの呼び方:
+
+            A) Issue 番号で指定 (おすすめ):
+               org="example-org", number=11,
+               issue_owner="example-org", issue_repo="example-repo",
+               issue_number=107
+
+            B) Node ID で指定:
+               project_id, content_id を直接指定。
+
+            Args:
+                org, number: project 識別子 (名前ベース時)
+                issue_owner, issue_repo, issue_number: 追加対象 Issue/PR
+                project_id, content_id: ID ベース呼び出し時
+                user_id: the assistant system利用者 ID (任意)
+            """
+            kernel = ensure_kernel_url()
+            body = {
+                "org": org,
+                "number": int(number),
+                "issue_owner": issue_owner,
+                "issue_repo": issue_repo,
+                "issue_number": int(issue_number),
+                "project_id": project_id,
+                "content_id": content_id,
+                "user_id": user_id,
+            }
+            try:
+                async with _httpx.AsyncClient(timeout=30.0) as client:
+                    r = await client.post(
+                        kernel + "/core/github/project/add-item",
+                        json=body,
+                    )
+                r.raise_for_status()
+                d = r.json()
+            except Exception as e:
+                return ("add-item 失敗: " + type(e).__name__ + ": "
+                        + str(e)[:200])
+            if not d.get("ok"):
+                return "追加失敗: " + str(d.get("error", "unknown"))
+            return ("OK: item_id=" + str(d.get("item_id") or "")
+                    + " として追加しました")
+
+
+        @mcp.tool()
+        async def github_project_delete_item(
+            item_id: str,
+            org: str = "",
+            number: int = 0,
+            project_id: str = "",
+            user_id: str = "",
+        ) -> str:
+            """Item を ProjectV2 から取り除く (Issue/PR 本体は残る)。
+
+            Args:
+                item_id: 削除する Item の Node ID (PVTI_xxx)
+                org, number: project 識別子 (project_id が未指定の場合)
+                project_id: 直接指定する場合
+                user_id: the assistant system利用者 ID (任意)
+            """
+            kernel = ensure_kernel_url()
+            body = {
+                "item_id": item_id,
+                "org": org,
+                "number": int(number),
+                "project_id": project_id,
+                "user_id": user_id,
+            }
+            try:
+                async with _httpx.AsyncClient(timeout=30.0) as client:
+                    r = await client.post(
+                        kernel + "/core/github/project/delete-item",
+                        json=body,
+                    )
+                r.raise_for_status()
+                d = r.json()
+            except Exception as e:
+                return ("delete-item 失敗: " + type(e).__name__ + ": "
+                        + str(e)[:200])
+            if not d.get("ok"):
+                return "削除失敗: " + str(d.get("error", "unknown"))
+            return ("OK: deleted_item_id="
+                    + str(d.get("deleted_item_id") or item_id))
+
+        return mcp

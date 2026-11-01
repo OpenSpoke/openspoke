@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tunnel-client-config
+  namespace: rag-spoke
+data:
+  # Values that are identical across every spoke live in this ConfigMap.
+  # Per-spoke values (spoke_id + pre-shared token) live in the
+  # tunnel-client-secret Secret so this ConfigMap can be Fleet-fanned-out
+  # to every spoke unchanged.
+  hub_url: "hub.example.com:443"
+  target: "mcp-company1.rag-spoke.svc.cluster.local:8000"
+  # insecure=false: TLS is on. The hub's Ingress terminates TLS at
+  # your edge (e.g. Cloudflare or your own ingress controller).
+  # Set to "true" only when you are developing against a plaintext
+  # tunnel-server on localhost.
+  insecure: "false"

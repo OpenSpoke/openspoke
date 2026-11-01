@@ -1,0 +1,111 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: milvus-backup-config
+  namespace: milvus
+data:
+  backup.yaml: |
+    log:
+      level: info
+      console: true
+    milvus:
+      address: milvus-proxy.milvus.svc.cluster.local
+      port: 19530
+      user: "root"
+      password: "Milvus"
+      tlsMode: 0
+      rpcChannelName: "by-dev-replicate-msg"
+    etcd:
+      endpoints: etcd.milvus.svc.cluster.local:2379
+      rootPath: "by-dev"
+    minio:
+      storageType: "minio"
+      address: minio.milvus.svc.cluster.local
+      port: 9000
+      accessKeyID: minioadmin
+      secretAccessKey: minioadminpassword
+      useSSL: false
+      useIAM: false
+      bucketName: "milvus-bucket"
+      rootPath: "file"
+      backupStorageType: "minio"
+      backupAddress: minio.milvus.svc.cluster.local
+      backupPort: 9000
+      backupAccessKeyID: minioadmin
+      backupSecretAccessKey: minioadminpassword
+      backupBucketName: "milvus-bucket"
+      backupRootPath: "backup"
+      backupUseSSL: false
+      crossStorage: false
+    backup:
+      parallelism:
+        copydata: 32
+        backupCollection: 2
+        backupSegment: 128
+        restoreCollection: 2
+        importJob: 128
+      keepTempFiles: false
+      gcPause:
+        enable: true
+        address: http://milvus-proxy.milvus.svc.cluster.local:9091
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: milvus-backup
+  namespace: milvus
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+  selector:
+    app: milvus-backup
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: milvus-backup
+  namespace: milvus
+  labels:
+    app: milvus-backup
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: milvus-backup
+  template:
+    metadata:
+      labels:
+        app: milvus-backup
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: milvus-backup
+          image: milvusdb/milvus-backup:v0.5.12
+          imagePullPolicy: IfNotPresent
+          command:
+            - /app/milvus-backup
+          args:
+            - server
+            - -p
+            - "8080"
+          workingDir: /app
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          volumeMounts:
+            - name: config
+              mountPath: /app/configs
+              readOnly: true
+          resources: {}
+      volumes:
+        - name: config
+          configMap:
+            name: milvus-backup-config
+            items:
+              - key: backup.yaml
+                path: backup.yaml

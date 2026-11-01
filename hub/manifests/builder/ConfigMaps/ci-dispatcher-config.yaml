@@ -1,0 +1,823 @@
+---
+#  OpenSpoke CI — ディスパッチャーとランナー
+#
+#  仕組み:
+#    1. CronJob ci-dispatcher がディスパッチャー (dispatch.sh) を定期的に起こす
+#    2. ディスパッチャーは targets.json の各対象について GitHub / GitLab の
+#       先頭コミットを調べ、そのコミットの .openspoke/build.json を読み、
+#       jobs[] ごとにランナーの Job を Kubernetes API で作る
+#    3. ランナー (run.sh / build_image.sh) は build.json の image で起動し、
+#       clone して steps を順に実行し、artifacts を確かめる
+#
+#  この ConfigMap はビルドのたびに書き換えない。
+#  ビルドの中身は対象リポジトリー側の .openspoke/build.json にある。
+#  対象が増えたときだけ targets.json に 1 行足す。
+#
+#  手動のビルド要求は ConfigMap ci-requests を経由する。
+#  ci-requests は望ましい状態ではなく受け皿なので GitOps には置かない
+#  (ディスパッチャーが無ければ自分で作る)。
+#
+#  === targets.json のサンプル ===
+#    targets[]: 対象の配列。各要素:
+#      name:    対象の識別子 (Job 名に使う。a-z0-9- で揃える)
+#      repo:    対象リポジトリー (https の clone URL)。github.com と
+#               内部 GitLab (gitlab.<host>) の双方に対応
+#      branch:  追従する枝 (省略すると "main")
+#      path:    リポジトリーのその場所だけを見る (省略すると全体)。
+#               大きなリポジトリーの一部をビルド対象にするときに使う
+#      spec:    build.json の置き場 (省略すると ".openspoke/build.json")
+#      provider: "github" or "gitlab" (省略すると repo のホストで自動判定)
+#      enabled: false にすると飛ばす
+#
+#  トークンは kernel の /core/git_credentials/<provider>/org/<scope>/token
+#  から取得する。scope は github では owner、GitLab では "<host>:<owner>"。
+#
+#  === insecure-registry ===
+#    dind の --insecure-registry は環境変数 CI_INSECURE_REGISTRIES
+#    (空白区切り) から dispatch.sh が組み立てる。CronJob の env か
+#    secret に移すことを推奨 (平文 HTTP のレジストリーがあるときのみ)。
+#
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ci-dispatcher-config
+  namespace: builder
+data:
+  targets.json: |
+    {
+      "targets": []
+    }
+
+  dispatch.sh: |
+    #!/bin/sh
+    #  OpenSpoke CI ディスパッチャー
+    set -eu
+
+    apk add --no-cache curl jq ca-certificates >/dev/null 2>&1 || true
+
+    NS="${CI_NAMESPACE:-builder}"
+    KERNEL_URL="${KERNEL_URL:-http://rag-backend-kernel.rag-company1.svc.cluster.local:8000}"
+    API="https://kubernetes.default.svc"
+    SA="/var/run/secrets/kubernetes.io/serviceaccount"
+    KTOKEN="$(cat "${SA}/token")"
+    CA="${SA}/ca.crt"
+    TTL="${CI_JOB_TTL:-604800}"
+    INSECURE_REGISTRIES="${CI_INSECURE_REGISTRIES:-}"
+
+    log() { echo "[司令] $*"; }
+
+    k_get() {
+      curl -sS --cacert "${CA}" -H "Authorization: Bearer ${KTOKEN}" "${API}$1"
+    }
+
+    k_code() {
+      curl -sS -o /dev/null -w '%{http_code}' --cacert "${CA}" \
+        -H "Authorization: Bearer ${KTOKEN}" "${API}$1"
+    }
+
+    k_post_file() {
+      curl -sS -o /tmp/k_post.out -w '%{http_code}' --cacert "${CA}" \
+        -H "Authorization: Bearer ${KTOKEN}" -H 'Content-Type: application/json' \
+        -X POST "${API}$1" --data-binary @"$2"
+    }
+
+    k_merge_patch() {
+      curl -sS -o /dev/null -w '%{http_code}' --cacert "${CA}" \
+        -H "Authorization: Bearer ${KTOKEN}" \
+        -H 'Content-Type: application/merge-patch+json' \
+        -X PATCH "${API}$1" -d "$2"
+    }
+
+    #  ---- 提供元 (GitHub / GitLab) の見分けと共通の取り出し ----
+    #  対象の repo URL のホストで決める。github.com なら github、
+    #  それ以外は内部 GitLab とみなす。targets.json の provider で
+    #  明示することもできる。
+
+    host_of() {
+      echo "$1" | sed -e 's|^https://||' -e 's|/.*$||'
+    }
+
+    provider_of() {
+      if [ "$(host_of "$1")" = "github.com" ]; then
+        echo github
+      else
+        echo gitlab
+      fi
+    }
+
+    strip_url() {
+      echo "$1" | sed -e 's|^https://[^/]*/||' -e 's|\.git$||'
+    }
+
+    git_token() {
+      if [ "$1" = "github" ]; then
+        scope="$3"
+      else
+        scope="$2:$3"
+      fi
+      curl -sf -X POST "${KERNEL_URL}/core/git_credentials/$1/org/${scope}/token" \
+        | jq -r '.token // empty'
+    }
+
+    #  ---- GitLab API の補助 ----
+
+    gl_project_id() {
+      gl_target="$(echo "$3/$4" | tr 'A-Z' 'a-z')"
+      gl_page=1
+      while [ "${gl_page}" -le 20 ]; do
+        gl_body="$(curl -sf -H "PRIVATE-TOKEN: $2" \
+          "https://$1/api/v4/projects?search=$4&simple=true&per_page=100&page=${gl_page}")" \
+          || return 1
+        gl_pid="$(echo "${gl_body}" \
+          | jq -r --arg t "${gl_target}" \
+              '.[] | select((.path_with_namespace|ascii_downcase) == $t) | .id' \
+          | head -n 1)"
+        if [ -n "${gl_pid}" ]; then
+          echo "${gl_pid}"
+          return 0
+        fi
+        gl_got="$(echo "${gl_body}" | jq 'length')"
+        if [ "${gl_got}" -lt 100 ]; then
+          return 1
+        fi
+        gl_page=$((gl_page + 1))
+      done
+      return 1
+    }
+
+    gl_head_sha() {
+      if [ -n "$5" ]; then
+        gl_q="ref_name=$4&path=$5&per_page=1"
+      else
+        gl_q="ref_name=$4&per_page=1"
+      fi
+      curl -sf -H "PRIVATE-TOKEN: $2" \
+        "https://$1/api/v4/projects/$3/repository/commits?${gl_q}" \
+        | jq -r '.[0].id // empty'
+    }
+
+    gl_file_raw() {
+      gl_parent="$(dirname "$4")"
+      if [ "${gl_parent}" = "." ]; then
+        gl_parent=""
+      fi
+      gl_name="$(basename "$4")"
+      gl_blob="$(curl -sf -H "PRIVATE-TOKEN: $2" \
+        "https://$1/api/v4/projects/$3/repository/tree?path=${gl_parent}&ref=$5&per_page=100" \
+        | jq -r --arg n "${gl_name}" \
+            '.[] | select(.name == $n and .type == "blob") | .id' \
+        | head -n 1)"
+      if [ -z "${gl_blob}" ]; then
+        return 1
+      fi
+      curl -sf -H "PRIVATE-TOKEN: $2" \
+        "https://$1/api/v4/projects/$3/repository/blobs/${gl_blob}/raw"
+    }
+
+    #  ci-requests が無ければ作る (手動要求の受け皿)
+    ensure_requests_cm() {
+      code="$(k_code "/api/v1/namespaces/${NS}/configmaps/ci-requests")"
+      if [ "${code}" = "404" ]; then
+        jq -n --arg ns "${NS}" \
+          '{apiVersion:"v1",kind:"ConfigMap",metadata:{name:"ci-requests",namespace:$ns},data:{}}' \
+          > /tmp/ci-requests.json
+        code="$(k_post_file "/api/v1/namespaces/${NS}/configmaps" /tmp/ci-requests.json)"
+        log "ci-requests を作った (${code})"
+      fi
+    }
+
+    #  dind の insecure-registry 引数を JSON 配列として組み立てる
+    build_dind_args() {
+      args='["--host=unix:///var/run/docker.sock","--storage-driver=overlay2"'
+      for r in ${INSECURE_REGISTRIES}; do
+        args="${args},\"--insecure-registry=${r}\""
+      done
+      args="${args}]"
+      echo "${args}"
+    }
+
+    #  ランナーの Job を 1 本作る
+    create_job() {
+      tname="$1"; repo="$2"; branch="$3"; sha="$4"; jdef="$5"; trig="$6"
+
+      jname="$(echo "${jdef}" | jq -r '.name // "build"')"
+      image="$(echo "${jdef}" | jq -r '.image // "rust:1-alpine"')"
+      workdir="$(echo "${jdef}" | jq -r '.workdir // "."')"
+      pkgs="$(echo "${jdef}" | jq -r '(.packages // []) | join(" ")')"
+      steps="$(echo "${jdef}" | jq -r '(.steps // []) | join("\n")')"
+      arts="$(echo "${jdef}" | jq -r '(.artifacts // []) | join("\n")')"
+      cpu="$(echo "${jdef}" | jq -r '.cpu // "2"')"
+      mem="$(echo "${jdef}" | jq -r '.memory // "4Gi"')"
+      push="$(echo "${jdef}" | jq -r '.image_push // ""')"
+      dfile="$(echo "${jdef}" | jq -r '.dockerfile // "Dockerfile"')"
+      mbump="$(echo "${jdef}" | jq -c '.manifest_bump // {}')"
+      sha7="$(echo "${sha}" | cut -c1-7)"
+
+      base="$(echo "ci-${tname}-${jname}-${sha7}" | tr '[:upper:]' '[:lower:]' | cut -c1-48)"
+      if [ "${trig}" = "manual" ]; then
+        jobname="${base}-m$(date -u +%H%M%S)"
+      else
+        jobname="${base}"
+      fi
+
+      code="$(k_code "/apis/batch/v1/namespaces/${NS}/jobs/${jobname}")"
+      if [ "${code}" = "200" ]; then
+        log "${jobname}: 既にある。飛ばす"
+        return 0
+      fi
+
+      if [ -n "${push}" ]; then
+        tag="$(date -u +%Y%m%d-%H%M%S)-${sha7}"
+        ref="${push}:${tag}"
+        dind_args_json="$(build_dind_args)"
+        log "${jobname}: イメージをビルド → ${ref}"
+        jq -n \
+          --arg ns "${NS}" --arg jobname "${jobname}" --arg tname "${tname}" \
+          --arg jname "${jname}" --arg sha "${sha}" --arg sha7 "${sha7}" \
+          --arg repo "${repo}" --arg branch "${branch}" --arg trig "${trig}" \
+          --arg workdir "${workdir}" --arg dfile "${dfile}" --arg ref "${ref}" \
+          --arg steps "${steps}" --arg mbump "${mbump}" --arg kernel "${KERNEL_URL}" \
+          --arg cpu "${cpu}" --arg mem "${mem}" --argjson ttl "${TTL}" \
+          --argjson dind_args "${dind_args_json}" \
+          '{
+            apiVersion: "batch/v1",
+            kind: "Job",
+            metadata: {
+              name: $jobname,
+              namespace: $ns,
+              labels: {
+                "openspoke.io/ci": "true",
+                "openspoke.io/ci-target": $tname,
+                "openspoke.io/ci-job": $jname,
+                "openspoke.io/ci-sha": $sha7,
+                "openspoke.io/ci-trigger": $trig,
+                "openspoke.io/ci-kind": "image"
+              },
+              annotations: {
+                "openspoke.io/ci-repo": $repo,
+                "openspoke.io/ci-branch": $branch,
+                "openspoke.io/ci-sha": $sha,
+                "openspoke.io/ci-image": $ref
+              }
+            },
+            spec: {
+              backoffLimit: 0,
+              ttlSecondsAfterFinished: $ttl,
+              template: {
+                metadata: {
+                  labels: {
+                    "openspoke.io/ci": "true",
+                    "openspoke.io/ci-target": $tname
+                  }
+                },
+                spec: {
+                  restartPolicy: "Never",
+                  initContainers: [
+                    {
+                      name: "dind",
+                      image: "docker:27-dind",
+                      restartPolicy: "Always",
+                      args: $dind_args,
+                      env: [{name: "DOCKER_TLS_CERTDIR", value: ""}],
+                      securityContext: {privileged: true},
+                      resources: {
+                        requests: {cpu: "500m", memory: "1Gi"},
+                        limits:   {cpu: $cpu,   memory: $mem}
+                      },
+                      volumeMounts: [
+                        {name: "docker-graph", mountPath: "/var/lib/docker"},
+                        {name: "docker-sock",  mountPath: "/var/run"}
+                      ]
+                    }
+                  ],
+                  containers: [
+                    {
+                      name: "runner",
+                      image: "docker:27-cli",
+                      command: ["/bin/sh", "-c", "exec sh /config/build_image.sh"],
+                      env: [
+                        {name: "CI_TARGET",     value: $tname},
+                        {name: "CI_JOB",        value: $jname},
+                        {name: "CI_REPO",       value: $repo},
+                        {name: "CI_BRANCH",     value: $branch},
+                        {name: "CI_SHA",        value: $sha},
+                        {name: "CI_WORKDIR",    value: $workdir},
+                        {name: "CI_DOCKERFILE", value: $dfile},
+                        {name: "CI_IMAGE_REF",  value: $ref},
+                        {name: "CI_STEPS",      value: $steps},
+                        {name: "CI_MANIFEST_BUMP", value: $mbump},
+                        {name: "KERNEL_URL",    value: $kernel},
+                        {name: "DOCKER_HOST",   value: "unix:///var/run/docker.sock"}
+                      ],
+                      resources: {
+                        requests: {cpu: "200m", memory: "512Mi"},
+                        limits:   {cpu: "2",    memory: "4Gi"}
+                      },
+                      volumeMounts: [
+                        {name: "config",      mountPath: "/config"},
+                        {name: "workspace",   mountPath: "/workspace"},
+                        {name: "docker-sock", mountPath: "/var/run"}
+                      ]
+                    }
+                  ],
+                  volumes: [
+                    {name: "config", configMap: {name: "ci-dispatcher-config", defaultMode: 493}},
+                    {name: "workspace", emptyDir: {}},
+                    {name: "docker-graph", emptyDir: {}},
+                    {name: "docker-sock", emptyDir: {}}
+                  ]
+                }
+              }
+            }
+          }' > /tmp/ci-job.json
+      else
+        jq -n \
+          --arg ns "${NS}" --arg jobname "${jobname}" --arg tname "${tname}" \
+          --arg jname "${jname}" --arg sha "${sha}" --arg sha7 "${sha7}" \
+          --arg repo "${repo}" --arg branch "${branch}" --arg trig "${trig}" \
+          --arg image "${image}" --arg workdir "${workdir}" --arg pkgs "${pkgs}" \
+          --arg steps "${steps}" --arg arts "${arts}" --arg kernel "${KERNEL_URL}" \
+          --arg cpu "${cpu}" --arg mem "${mem}" --argjson ttl "${TTL}" \
+          '{
+            apiVersion: "batch/v1",
+            kind: "Job",
+            metadata: {
+              name: $jobname,
+              namespace: $ns,
+              labels: {
+                "openspoke.io/ci": "true",
+                "openspoke.io/ci-target": $tname,
+                "openspoke.io/ci-job": $jname,
+                "openspoke.io/ci-sha": $sha7,
+                "openspoke.io/ci-trigger": $trig,
+                "openspoke.io/ci-kind": "plain"
+              },
+              annotations: {
+                "openspoke.io/ci-repo": $repo,
+                "openspoke.io/ci-branch": $branch,
+                "openspoke.io/ci-sha": $sha,
+                "openspoke.io/ci-image": $image
+              }
+            },
+            spec: {
+              backoffLimit: 0,
+              ttlSecondsAfterFinished: $ttl,
+              template: {
+                metadata: {
+                  labels: {
+                    "openspoke.io/ci": "true",
+                    "openspoke.io/ci-target": $tname
+                  }
+                },
+                spec: {
+                  restartPolicy: "Never",
+                  containers: [{
+                    name: "runner",
+                    image: $image,
+                    command: ["/bin/sh", "-c", "exec sh /config/run.sh"],
+                    env: [
+                      {name: "CI_TARGET",    value: $tname},
+                      {name: "CI_JOB",       value: $jname},
+                      {name: "CI_REPO",      value: $repo},
+                      {name: "CI_BRANCH",    value: $branch},
+                      {name: "CI_SHA",       value: $sha},
+                      {name: "CI_WORKDIR",   value: $workdir},
+                      {name: "CI_PACKAGES",  value: $pkgs},
+                      {name: "CI_STEPS",     value: $steps},
+                      {name: "CI_ARTIFACTS", value: $arts},
+                      {name: "KERNEL_URL",   value: $kernel}
+                    ],
+                    resources: {
+                      requests: {cpu: "200m", memory: "512Mi"},
+                      limits:   {cpu: $cpu,   memory: $mem}
+                    },
+                    volumeMounts: [
+                      {name: "config",    mountPath: "/config"},
+                      {name: "workspace", mountPath: "/workspace"}
+                    ]
+                  }],
+                  volumes: [
+                    {name: "config", configMap: {name: "ci-dispatcher-config", defaultMode: 493}},
+                    {name: "workspace", emptyDir: {}}
+                  ]
+                }
+              }
+            }
+          }' > /tmp/ci-job.json
+      fi
+
+      code="$(k_post_file "/apis/batch/v1/namespaces/${NS}/jobs" /tmp/ci-job.json)"
+      if [ "${code}" = "201" ]; then
+        if [ -n "${push}" ]; then
+          log "${jobname}: 開始した (イメージ → ${ref})"
+        else
+          log "${jobname}: 開始した (${image})"
+        fi
+      else
+        log "ERROR ${jobname}: 作れない (${code}) $(head -c 300 /tmp/k_post.out)"
+      fi
+    }
+
+    #  対象 1 件を捌く
+    dispatch_target() {
+      t="$1"; trig="$2"
+      tname="$(echo "${t}" | jq -r '.name')"
+      repo="$(echo "${t}" | jq -r '.repo')"
+      branch="$(echo "${t}" | jq -r '.branch // "main"')"
+      tpath="$(echo "${t}" | jq -r '.path // ""')"
+      tspec="$(echo "${t}" | jq -r '.spec // ".openspoke/build.json"')"
+
+      slug="$(strip_url "${repo}")"
+      owner="$(echo "${slug}" | cut -d/ -f1)"
+      rname="$(echo "${slug}" | cut -d/ -f2)"
+      thost="$(host_of "${repo}")"
+      tprov="$(echo "${t}" | jq -r '.provider // ""')"
+      if [ -z "${tprov}" ]; then
+        tprov="$(provider_of "${repo}")"
+      fi
+
+      tok="$(git_token "${tprov}" "${thost}" "${owner}")"
+      if [ -z "${tok}" ]; then
+        log "ERROR ${tname}: トークンを取得できない (${tprov} ${thost} owner=${owner})"
+        return 1
+      fi
+
+      if [ "${tprov}" = "gitlab" ]; then
+        pid="$(gl_project_id "${thost}" "${tok}" "${owner}" "${rname}")" || pid=""
+        if [ -z "${pid}" ]; then
+          log "ERROR ${tname}: GitLab のプロジェクト ID を引けない (${owner}/${rname})"
+          return 1
+        fi
+        sha="$(gl_head_sha "${thost}" "${tok}" "${pid}" "${branch}" "${tpath}")"
+      elif [ -n "${tpath}" ]; then
+        sha="$(curl -sf -H "Authorization: Bearer ${tok}" \
+                -H 'Accept: application/vnd.github+json' \
+                "https://api.github.com/repos/${owner}/${rname}/commits?sha=${branch}&path=${tpath}&per_page=1" \
+                | jq -r '.[0].sha // empty')"
+      else
+        sha="$(curl -sf -H "Authorization: Bearer ${tok}" \
+                -H 'Accept: application/vnd.github+json' \
+                "https://api.github.com/repos/${owner}/${rname}/commits/${branch}" \
+                | jq -r '.sha // empty')"
+      fi
+      if [ -z "${sha}" ]; then
+        log "ERROR ${tname}: 先頭コミットを取れない"
+        return 1
+      fi
+
+      if [ "${trig}" != "manual" ]; then
+        if [ "${tprov}" = "gitlab" ]; then
+          cmsg="$(curl -sf -H "PRIVATE-TOKEN: ${tok}" \
+                   "https://${thost}/api/v4/projects/${pid}/repository/commits/${sha}" \
+                   | jq -r '.message // ""')"
+        else
+          cmsg="$(curl -sf -H "Authorization: Bearer ${tok}" \
+                   -H 'Accept: application/vnd.github+json' \
+                   "https://api.github.com/repos/${owner}/${rname}/commits/${sha}" \
+                   | jq -r '.commit.message // ""')"
+        fi
+        if echo "${cmsg}" | grep -q -E '\[(skip ci|ci skip)\]'; then
+          log "${tname}: ${sha} に [skip ci] 指定あり。飛ばす"
+          return 0
+        fi
+      fi
+
+      if [ "${tprov}" = "gitlab" ]; then
+        spec="$(gl_file_raw "${thost}" "${tok}" "${pid}" "${tspec}" "${sha}" \
+                 || true)"
+      else
+        spec="$(curl -sf -H "Authorization: Bearer ${tok}" \
+                 -H 'Accept: application/vnd.github.raw' \
+                 "https://api.github.com/repos/${owner}/${rname}/contents/${tspec}?ref=${sha}" \
+                 || true)"
+      fi
+      if [ -z "${spec}" ]; then
+        log "${tname}: ${tspec} が無い。飛ばす"
+        return 0
+      fi
+      if ! echo "${spec}" | jq -e . >/dev/null 2>&1; then
+        log "ERROR ${tname}: build.json を読めない"
+        return 1
+      fi
+
+      n="$(echo "${spec}" | jq '(.jobs // []) | length')"
+      log "${tname}: ${sha} / ${n} 本"
+      ji=0
+      while [ "${ji}" -lt "${n}" ]; do
+        jdef="$(echo "${spec}" | jq -c ".jobs[${ji}]")"
+        create_job "${tname}" "${repo}" "${branch}" "${sha}" "${jdef}" "${trig}" || true
+        ji=$((ji + 1))
+      done
+    }
+
+    #  手動要求を捌く
+    process_requests() {
+      cm="$(k_get "/api/v1/namespaces/${NS}/configmaps/ci-requests")"
+      keys="$(echo "${cm}" | jq -r '(.data // {}) | keys[]' 2>/dev/null || true)"
+      if [ -z "${keys}" ]; then
+        log "手動要求は無い"
+        return 0
+      fi
+      for k in ${keys}; do
+        want="$(echo "${cm}" | jq -r --arg k "${k}" '.data[$k]')"
+        t="$(jq -c --arg n "${want}" '.targets[] | select(.name == $n)' /config/targets.json | head -n 1)"
+        if [ -n "${t}" ]; then
+          log "手動要求: ${want}"
+          dispatch_target "${t}" manual || true
+        else
+          log "手動要求: ${want} は一覧に無い"
+        fi
+        k_merge_patch "/api/v1/namespaces/${NS}/configmaps/ci-requests" \
+          "$(jq -n --arg k "${k}" '{data:{($k):null}}')" >/dev/null
+      done
+    }
+
+    #  ここから本体
+    log "開始 $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    log "取得元: GitHub / GitLab 両対応"
+    ensure_requests_cm
+    process_requests
+
+    cnt="$(jq '(.targets // []) | length' /config/targets.json)"
+    log "対象 ${cnt} 件を点検する"
+    ti=0
+    while [ "${ti}" -lt "${cnt}" ]; do
+      t="$(jq -c ".targets[${ti}]" /config/targets.json)"
+      en="$(echo "${t}" | jq -r '.enabled // true')"
+      if [ "${en}" = "true" ]; then
+        dispatch_target "${t}" auto || true
+      else
+        log "$(echo "${t}" | jq -r '.name'): 止めてある"
+      fi
+      ti=$((ti + 1))
+    done
+    log "終わり"
+
+  build_image.sh: |
+    #!/bin/sh
+    #  OpenSpoke CI ランナー (イメージをビルドする版)
+    #
+    #  build.json に image_push があるときに使う。ディスパッチャーが渡すもの:
+    #    CI_TARGET / CI_JOB / CI_REPO / CI_BRANCH / CI_SHA
+    #    CI_WORKDIR / CI_DOCKERFILE / CI_IMAGE_REF / CI_STEPS / KERNEL_URL
+    #
+    #  タグはディスパッチャーが日時とコミットから作って CI_IMAGE_REF に入れてある。
+    set -eu
+
+    echo "=== OpenSpoke CI (イメージビルド) ==="
+    echo "対象         : ${CI_TARGET} / ${CI_JOB}"
+    echo "リポジトリー : ${CI_REPO}"
+    echo "枝           : ${CI_BRANCH}"
+    echo "コミット     : ${CI_SHA}"
+    echo "作業場所     : ${CI_WORKDIR}"
+    echo "Dockerfile   : ${CI_DOCKERFILE}"
+    echo "イメージ     : ${CI_IMAGE_REF}"
+    echo "開始         : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo
+
+    echo "=== 下ごしらえ ==="
+    apk add --no-cache git curl ca-certificates jq >/dev/null
+    echo "git $(git --version | awk '{print $3}') / docker $(docker --version | awk '{print $3}' | tr -d ,) / jq $(jq --version)"
+    echo
+
+    echo "=== 取得 ==="
+    HOST="$(echo "${CI_REPO}" | sed -e 's|^https://||' -e 's|/.*$||')"
+    OWNER="$(echo "${CI_REPO}" | sed -e 's|^https://[^/]*/||' -e 's|\.git$||' | cut -d/ -f1)"
+    if [ "${HOST}" = "github.com" ]; then
+      PROV=github
+      SCOPE="${OWNER}"
+      CRED_USER=x-access-token
+    else
+      PROV=gitlab
+      SCOPE="${HOST}:${OWNER}"
+      CRED_USER=oauth2
+    fi
+    TOKEN="$(curl -sf -X POST "${KERNEL_URL}/core/git_credentials/${PROV}/org/${SCOPE}/token" \
+             | sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+    if [ -z "${TOKEN}" ]; then
+      echo "ERROR: トークンを取得できない (${PROV} ${HOST} owner=${OWNER})" >&2
+      exit 1
+    fi
+    git config --global url."https://${CRED_USER}:${TOKEN}@${HOST}/".insteadOf "https://${HOST}/"
+    git config --global advice.detachedHead false
+
+    rm -rf /workspace/src
+    mkdir -p /workspace/src
+    cd /workspace/src
+    git init -q
+    git remote add origin "${CI_REPO}"
+    git fetch -q --depth 1 origin "${CI_SHA}"
+    git checkout -q FETCH_HEAD
+    echo "取得した: ${CI_SHA}"
+    echo
+
+    echo "=== docker の待ち合わせ ==="
+    i=0
+    while [ "${i}" -lt 60 ]; do
+      if docker info >/dev/null 2>&1; then
+        echo "docker が応じた"
+        break
+      fi
+      i=$((i + 1))
+      sleep 1
+    done
+    docker info >/dev/null
+    echo
+
+    cd "/workspace/src/${CI_WORKDIR}"
+
+    if [ -n "${CI_STEPS:-}" ]; then
+      echo "=== 前の手順 ==="
+      printf '%s\n' "${CI_STEPS}" > /tmp/ci-steps.sh
+      sh -e -x /tmp/ci-steps.sh
+      echo
+    fi
+
+    echo "=== docker build ==="
+    docker build --pull -t "${CI_IMAGE_REF}" -f "${CI_DOCKERFILE}" .
+    echo
+
+    echo "=== 押し出す ==="
+    docker push "${CI_IMAGE_REF}"
+    echo
+
+    echo "=== ビルド結果 ==="
+    docker image inspect "${CI_IMAGE_REF}" --format '  イメージ       : {{index .RepoTags 0}}'
+    docker image inspect "${CI_IMAGE_REF}" --format '  ダイジェスト   : {{.Id}}'
+    docker image inspect "${CI_IMAGE_REF}" --format '  レジストリーのダイジェスト : {{if .RepoDigests}}{{index .RepoDigests 0}}{{else}}(無し){{end}}'
+    docker image inspect "${CI_IMAGE_REF}" --format '  サイズ         : {{.Size}} バイト'
+    docker image inspect "${CI_IMAGE_REF}" --format '  プラットフォーム : {{.Os}}/{{.Architecture}}'
+    echo
+    echo "終了         : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "判定         : 合格"
+    echo "できたイメージ : ${CI_IMAGE_REF}"
+
+    #  === manifest_bump (オプトイン) ===
+    MB_PATHS=""
+    if [ -n "${CI_MANIFEST_BUMP:-}" ]; then
+      MB_PATHS="$(printf '%s' "${CI_MANIFEST_BUMP}" | jq -r '(.paths // []) | .[]' 2>/dev/null || true)"
+    fi
+    if [ -n "${MB_PATHS}" ]; then
+      echo
+      echo "=== manifest bump ==="
+      MB_REPO="$(echo "${CI_IMAGE_REF}" | sed 's|:[^:]*$||')"
+      MB_TAG="$(echo "${CI_IMAGE_REF}" | sed 's|^.*:||')"
+      cd /workspace/src
+      git config user.email "ci@openspoke.local"
+      git config user.name  "OpenSpoke CI"
+      mb_bump() {
+      changed=0
+      for p in ${MB_PATHS}; do
+        if [ ! -f "${p}" ]; then
+          echo "  ${p}: 無い (飛ばす)"
+          continue
+        fi
+        tmp="$(mktemp)"
+        awk -v prefix="image: ${MB_REPO}:" -v newref="image: ${MB_REPO}:${MB_TAG}" '
+          {
+            i = index($0, prefix)
+            if (i > 0) {
+              lead = substr($0, 1, i - 1)
+              rest = substr($0, i + length(prefix))
+              j = 1
+              while (j <= length(rest)) {
+                c = substr(rest, j, 1)
+                if (c == " " || c == "\t" || c == "#") break
+                j++
+              }
+              tail = substr(rest, j)
+              print lead newref tail
+            } else {
+              print
+            }
+          }
+        ' "${p}" > "${tmp}" && mv "${tmp}" "${p}"
+        if ! git diff --quiet -- "${p}"; then
+          echo "  ${p}: 書き換えた"
+          git add "${p}"
+          changed=$((changed + 1))
+        else
+          echo "  ${p}: 変化なし"
+        fi
+      done
+      }
+      mb_ok=0
+      for mb_try in 1 2 3; do
+        if ! timeout 180 git fetch -q --depth=1 origin "${CI_BRANCH}"; then
+          echo "  fetch に失敗 (${mb_try} 回目)"
+          continue
+        fi
+        git checkout -q --detach FETCH_HEAD
+        mb_bump
+        if [ "${changed}" -eq 0 ]; then
+          echo "書き換え対象なし"
+          mb_ok=1
+          break
+        fi
+        git commit -q -m "CI: ${CI_TARGET}/${CI_JOB} の image を ${MB_TAG} に [skip ci]"
+        if timeout 180 git push origin "HEAD:${CI_BRANCH}"; then
+          echo "${changed} 件を書き戻した"
+          mb_ok=1
+          break
+        fi
+        echo "  push が通らない (${mb_try} 回目)。取り直す"
+      done
+      if [ "${mb_ok}" -ne 1 ]; then
+        echo "ERROR: 書き戻しに失敗"
+        exit 1
+      fi
+    fi
+
+  run.sh: |
+    #!/bin/sh
+    #  OpenSpoke CI ランナー
+    #
+    #  ディスパッチャーが build.json から組み立てた環境変数を受けて走る。
+    #    CI_TARGET / CI_JOB / CI_REPO / CI_BRANCH / CI_SHA
+    #    CI_WORKDIR / CI_PACKAGES / CI_STEPS / CI_ARTIFACTS / KERNEL_URL
+    set -eu
+
+    echo "=== OpenSpoke CI ==="
+    echo "対象         : ${CI_TARGET} / ${CI_JOB}"
+    echo "リポジトリー : ${CI_REPO}"
+    echo "枝           : ${CI_BRANCH}"
+    echo "コミット     : ${CI_SHA}"
+    echo "作業場所     : ${CI_WORKDIR}"
+    echo "開始         : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo
+
+    echo "=== 下ごしらえ ==="
+    PKGS="git curl ca-certificates ${CI_PACKAGES:-}"
+    if command -v apk >/dev/null 2>&1; then
+      echo "導入 (apk): ${PKGS}"
+      apk add --no-cache ${PKGS} >/dev/null
+    elif command -v apt-get >/dev/null 2>&1; then
+      echo "導入 (apt): ${PKGS}"
+      apt-get update -qq >/dev/null
+      apt-get install -y -qq ${PKGS} >/dev/null
+    else
+      echo "注意: 導入の手段が無い。既にある道具だけで進む"
+    fi
+    echo
+
+    echo "=== 取得 ==="
+    HOST="$(echo "${CI_REPO}" | sed -e 's|^https://||' -e 's|/.*$||')"
+    OWNER="$(echo "${CI_REPO}" | sed -e 's|^https://[^/]*/||' -e 's|\.git$||' | cut -d/ -f1)"
+    if [ "${HOST}" = "github.com" ]; then
+      PROV=github
+      SCOPE="${OWNER}"
+      CRED_USER=x-access-token
+    else
+      PROV=gitlab
+      SCOPE="${HOST}:${OWNER}"
+      CRED_USER=oauth2
+    fi
+    TOKEN="$(curl -sf -X POST "${KERNEL_URL}/core/git_credentials/${PROV}/org/${SCOPE}/token" \
+             | sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+    if [ -z "${TOKEN}" ]; then
+      echo "ERROR: トークンを取得できない (${PROV} ${HOST} owner=${OWNER})" >&2
+      exit 1
+    fi
+    git config --global url."https://${CRED_USER}:${TOKEN}@${HOST}/".insteadOf "https://${HOST}/"
+    git config --global advice.detachedHead false
+
+    rm -rf /workspace/src
+    mkdir -p /workspace/src
+    cd /workspace/src
+    git init -q
+    git remote add origin "${CI_REPO}"
+    git fetch -q --depth 1 origin "${CI_SHA}"
+    git checkout -q FETCH_HEAD
+    echo "取得した: ${CI_SHA}"
+    echo
+
+    cd "/workspace/src/${CI_WORKDIR}"
+    printf '%s\n' "${CI_STEPS}" > /tmp/ci-steps.sh
+
+    echo "=== 手順 ==="
+    rc=0
+    sh -e -x /tmp/ci-steps.sh || rc=$?
+    echo
+
+    echo "=== 成果物 ==="
+    if [ -n "${CI_ARTIFACTS:-}" ]; then
+      for a in ${CI_ARTIFACTS}; do
+        if [ -f "${a}" ]; then
+          echo "  ${a}  $(wc -c < "${a}" | tr -d ' ') バイト"
+        else
+          echo "  ${a}  見つからない"
+          rc=1
+        fi
+      done
+    else
+      echo "  (指定なし)"
+    fi
+    echo
+
+    echo "終了         : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    if [ "${rc}" -eq 0 ]; then
+      echo "判定         : 合格"
+    else
+      echo "判定         : 不合格 (終了コード ${rc})"
+    fi
+    exit "${rc}"

@@ -1,0 +1,12 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: security-mobile
+  labels:
+    # Purpose: isolate mobile app (iOS/Android) static-analysis resources.
+    # Scan execution lives on a native spoke (nsmt) machine that has the
+    # relevant Xcode / Android SDK toolchains. The hub cluster hosts the
+    # scheduling CronJobs and the result aggregation kernel endpoint.
+    purpose: mobile-vulnerability-scanning
+    phase: "4"

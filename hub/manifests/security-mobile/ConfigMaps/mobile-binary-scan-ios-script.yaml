@@ -1,0 +1,305 @@
+---
+# Phase 4 段階 4: iOS バイナリスキャナー
+# 対象: Xcode でビルドされた .app バンドル (または解凍された .ipa)
+# 実行: nsmt (spoke-example Mac) 上で、 macOS 固有ツール
+# (otool / codesign / plutil / strings) を使う
+# 出力: kernel `/core/security/events` の VulnEventMobileDetectedPayload
+# 準拠の JSON
+# 段階 3 のソーススキャナー (mobile_scan.py) と異なり、 Mac 側の
+# ~/nsm-work/mobile_binary_scan_ios.py として配置し nsm_sh_exec で
+# 起動する (K8s コンテナ内では macOS ツールが動かない)。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mobile-binary-scan-ios-script
+  namespace: security-mobile
+  labels:
+    purpose: mobile-vulnerability-binary-scanner-ios
+data:
+  mobile_binary_scan_ios.py: |
+    #!/usr/bin/env python3
+    """iOS .app / .ipa バイナリスキャナー (Phase 4 段階 4)。
+
+    対象: Xcode でビルドされた .app バンドル (または解凍された .ipa)。
+    検出項目 (finding_type):
+      - hardcoded_secret_in_binary: strings で拾える AWS/Google/Firebase/Sentry の平文リテラル
+      - weak_signature: codesign -dvvv で "adhoc" 署名か Development 証明書のみ (release 想定なら high)
+      - dangerous_linked_library: otool -L の linked frameworks に既知の非推奨/危険が含まれる
+      - ats_config_weak: Info.plist の NSAppTransportSecurity.NSAllowsArbitraryLoads=true
+      - binary_no_hardening: otool -hv で PIE 無し、 otool -Iv でスタック保護の記号無し
+      - debuggable_build: 署名の entitlements に get-task-allow=true
+      - ats_config_weak: 上記に加え、 WebContent / 例外ドメインでの平文 HTTP 許可
+      - deep_link_custom_scheme: Info.plist の CFBundleURLSchemes
+
+    出力: mobile_scan.py と同じ VulnEventMobileDetectedPayload 準拠の JSON を stdout。
+    実行: python3 mobile_binary_scan_ios.py --app <path/to/App.app> --bundle-id X --app-version Y
+    """
+    import argparse
+    import json
+    import plistlib
+    import re
+    import subprocess
+    import sys
+    import time
+    import uuid
+    from collections import Counter
+    from pathlib import Path
+
+
+    def _run(cmd: list, cwd=None) -> tuple:
+        r = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
+        return r.returncode, r.stdout, r.stderr
+
+
+    CLOUD_CRED_PATTERNS = [
+        (r'AKIA[0-9A-Z]{16}', 'AWS Access Key ID'),
+        (r'AIza[0-9A-Za-z_\-]{35}', 'Google API Key'),
+        (r'https://[a-zA-Z0-9]+@[a-zA-Z0-9\-]+\.ingest\.sentry\.io/[0-9]+', 'Sentry DSN'),
+    ]
+
+
+    def scan_strings(app_binary: Path, app_bundle: Path) -> list:
+        """strings で AWS/Google/Sentry の平文リテラルを検出。"""
+        findings = []
+        _, out, _ = _run(['strings', '-a', str(app_binary)])
+        for line in out.split('\n'):
+            for pat, desc in CLOUD_CRED_PATTERNS:
+                if re.search(pat, line):
+                    findings.append({
+                        'finding_type': 'hardcoded_secret_in_binary',
+                        'severity': 'critical',
+                        'file': app_binary.relative_to(app_bundle.parent).as_posix(),
+                        'line': 0,
+                        'snippet': line.strip()[:200],
+                        'description': f'{desc} がバイナリ内に埋め込まれている',
+                    })
+        return findings
+
+
+    def scan_codesign(app_bundle: Path) -> list:
+        """codesign -dvvv で署名情報を取得。 adhoc 署名や Development 証明書を検出。"""
+        findings = []
+        rc, _, err = _run(['codesign', '-dvvv', str(app_bundle)])
+        if rc != 0:
+            findings.append({
+                'finding_type': 'weak_signature',
+                'severity': 'medium',
+                'file': app_bundle.name,
+                'line': 0,
+                'snippet': (err or '').strip()[:200],
+                'description': 'codesign 実行失敗 (署名情報取得不能)',
+            })
+            return findings
+        # codesign -dvvv の出力は stderr に来る
+        text = err
+        if 'adhoc' in text.lower() or 'Signature=adhoc' in text:
+            findings.append({
+                'finding_type': 'weak_signature',
+                'severity': 'medium',
+                'file': app_bundle.name,
+                'line': 0,
+                'snippet': 'Signature=adhoc',
+                'description': 'アドホック署名 (自己署名相当)、 配布可能な証明書ではない',
+            })
+        if 'Authority=Apple Development' in text or 'Authority=iPhone Developer' in text:
+            findings.append({
+                'finding_type': 'weak_signature',
+                'severity': 'low',
+                'file': app_bundle.name,
+                'line': 0,
+                'snippet': 'Authority=Apple Development / iPhone Developer',
+                'description': 'Debug ビルドの署名 (Development 証明書、 App Store 配布不可)',
+            })
+        return findings
+
+
+    def scan_otool_linked_libs(app_binary: Path, app_bundle: Path) -> list:
+        """otool -L で linked frameworks を列挙、 危険な組み合わせを検出。"""
+        findings = []
+        rc, out, _ = _run(['otool', '-L', str(app_binary)])
+        if rc != 0:
+            return findings
+        # 例: WebKit と SafariServices の同時使用は WebView 経由の外部 JS 実行リスク
+        has_webkit = 'WebKit.framework' in out
+        has_safari_services = 'SafariServices.framework' in out
+        if has_webkit and has_safari_services:
+            findings.append({
+                'finding_type': 'dangerous_linked_library',
+                'severity': 'low',
+                'file': app_bundle.name,
+                'line': 0,
+                'snippet': 'WebKit + SafariServices',
+                'description': 'WebKit と SafariServices の両方に link (WebView 経由の外部 JS 実行に注意)',
+            })
+        return findings
+
+
+    def scan_info_plist(info_plist: Path, app_bundle: Path) -> list:
+        """Info.plist の ATS / permission 設定をチェック。"""
+        findings = []
+        try:
+            with open(info_plist, 'rb') as f:
+                plist = plistlib.load(f)
+        except Exception as e:
+            return [{
+                'finding_type': 'ats_config_weak',
+                'severity': 'low',
+                'file': info_plist.name,
+                'line': 0,
+                'snippet': str(e)[:200],
+                'description': 'Info.plist の parse 失敗',
+            }]
+        ats = plist.get('NSAppTransportSecurity', {})
+        if ats.get('NSAllowsArbitraryLoads') is True:
+            findings.append({
+                'finding_type': 'ats_config_weak',
+                'severity': 'high',
+                'file': info_plist.name,
+                'line': 0,
+                'snippet': 'NSAllowsArbitraryLoads = true',
+                'description': 'ATS 無効化で平文 HTTP 通信を許可',
+            })
+        for key in ('NSAllowsArbitraryLoadsInWebContent', 'NSAllowsArbitraryLoadsForMedia'):
+            if ats.get(key) is True:
+                findings.append({
+                    'finding_type': 'ats_config_weak',
+                    'severity': 'medium',
+                    'file': info_plist.name,
+                    'line': 0,
+                    'snippet': f'{key} = true',
+                    'description': f'ATS の {key} で一部の平文 HTTP 通信を許可',
+                })
+        for dom, cfg in (ats.get('NSExceptionDomains') or {}).items():
+            if isinstance(cfg, dict) and cfg.get('NSExceptionAllowsInsecureHTTPLoads') is True:
+                findings.append({
+                    'finding_type': 'ats_config_weak',
+                    'severity': 'medium',
+                    'file': info_plist.name,
+                    'line': 0,
+                    'snippet': f'NSExceptionDomains.{dom}.NSExceptionAllowsInsecureHTTPLoads = true',
+                    'description': f'{dom} への平文 HTTP 通信を許可',
+                })
+        # 独自 URL スキーム (他アプリが同じスキームを登録すると横取りされうる)
+        for url_type in plist.get('CFBundleURLTypes') or []:
+            for scheme in (url_type or {}).get('CFBundleURLSchemes') or []:
+                findings.append({
+                    'finding_type': 'deep_link_custom_scheme',
+                    'severity': 'medium',
+                    'file': info_plist.name,
+                    'line': 0,
+                    'snippet': f'CFBundleURLSchemes: {scheme}',
+                    'description': ('独自スキームの深いリンク。 他アプリが同じスキームを登録すると横取りされうる。 '
+                                    '認可応答の受け口なら PKCE と state 検証が必須、 受け取る値は検証する'),
+                })
+        return findings
+
+
+    def scan_binary_hardening(app_binary: Path, app_bundle: Path) -> list:
+        """バイナリの堅牢化 (PIE / スタック保護) とデバッグ許可を検査する (MASVS-RESILIENCE)。"""
+        findings = []
+        rc, out, _ = _run(['otool', '-hv', str(app_binary)])
+        if rc == 0 and 'EXECUTE' in out and 'PIE' not in out:
+            findings.append({
+                'finding_type': 'binary_no_hardening',
+                'severity': 'medium',
+                'file': app_binary.name,
+                'line': 0,
+                'snippet': 'MH_PIE flag なし',
+                'description': 'PIE (位置独立実行) が無効で ASLR が効かない',
+            })
+        rc, out, _ = _run(['otool', '-Iv', str(app_binary)])
+        if rc == 0 and '___stack_chk_guard' not in out and '___stack_chk_fail' not in out:
+            findings.append({
+                'finding_type': 'binary_no_hardening',
+                'severity': 'low',
+                'file': app_binary.name,
+                'line': 0,
+                'snippet': '___stack_chk_guard / ___stack_chk_fail なし',
+                'description': 'スタック保護 (stack canary) の記号が無い。 Swift だけのコードでは出ないこともあるので参考扱い',
+            })
+        rc, out, err = _run(['codesign', '-d', '--entitlements', ':-', str(app_bundle)])
+        if re.search(r'<key>get-task-allow</key>\s*<true\s*/>', out + err):
+            findings.append({
+                'finding_type': 'debuggable_build',
+                'severity': 'low',
+                'file': app_bundle.name,
+                'line': 0,
+                'snippet': 'get-task-allow = true',
+                'description': 'デバッガを接続できるビルド (開発用署名)。 配布ビルドでは false になる',
+            })
+        return findings
+
+
+    def main():
+        ap = argparse.ArgumentParser()
+        ap.add_argument('--app', required=True, help='.app バンドルの path')
+        ap.add_argument('--bundle-id', default=None)
+        ap.add_argument('--app-version', default=None)
+        ap.add_argument('--scan-id', default=None)
+        args = ap.parse_args()
+
+        app = Path(args.app).resolve()
+        if not app.is_dir() or not app.name.endswith('.app'):
+            print(f'error: not a .app bundle: {app}', file=sys.stderr)
+            sys.exit(2)
+
+        # メインバイナリ名は Info.plist の CFBundleExecutable
+        info_plist = app / 'Info.plist'
+        exe_name = app.stem  # デフォルトは .app 名
+        bundle_id = args.bundle_id
+        app_version = args.app_version
+        if info_plist.is_file():
+            try:
+                with open(info_plist, 'rb') as f:
+                    plist = plistlib.load(f)
+                    exe_name = plist.get('CFBundleExecutable') or exe_name
+                    bundle_id = args.bundle_id or plist.get('CFBundleIdentifier')
+                    app_version = args.app_version or plist.get('CFBundleShortVersionString')
+            except Exception:
+                pass
+
+        app_binary = app / exe_name
+        if not app_binary.is_file():
+            print(f'error: main binary not found: {app_binary}', file=sys.stderr)
+            sys.exit(2)
+
+        scan_id = args.scan_id or f'mobile-binary-ios-{int(time.time())}-{uuid.uuid4().hex[:8]}'
+
+        all_findings = []
+        all_findings.extend(scan_strings(app_binary, app))
+        all_findings.extend(scan_codesign(app))
+        all_findings.extend(scan_otool_linked_libs(app_binary, app))
+        all_findings.extend(scan_binary_hardening(app_binary, app))
+        if info_plist.is_file():
+            all_findings.extend(scan_info_plist(info_plist, app))
+
+        severity_counts = Counter()
+        type_severity_counts = Counter()
+        for f in all_findings:
+            severity_counts[f['severity']] += 1
+            type_severity_counts[(f['finding_type'], f['severity'])] += 1
+        finding_summaries = [
+            {'finding_type': ft, 'severity': sev, 'count': cnt}
+            for (ft, sev), cnt in sorted(type_severity_counts.items())
+        ]
+
+        output = {
+            'mobile_detected': {
+                'scan_id': scan_id,
+                'platform': 'ios',
+                'bundle_id': bundle_id,
+                'package_name': None,
+                'app_version': app_version,
+                'app_version_code': None,
+                'artifact_path': str(app),
+                'severity_counts': dict(severity_counts),
+                'finding_summaries': finding_summaries,
+            },
+            'detail_findings': all_findings,
+            'total_findings': len(all_findings),
+        }
+        print(json.dumps(output, indent=2, ensure_ascii=False))
+
+
+    if __name__ == '__main__':
+        main()

@@ -1,0 +1,20 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vuln-scanner-config
+  namespace: security-builder
+data:
+  image_ref: "your-registry.example.com/openspoke-vuln-scanner:latest"
+  Dockerfile: |
+    # syntax=docker/dockerfile:1
+
+    FROM your-registry.example.com/openspoke-trivy:v0.72.0 AS trivy-src
+
+    FROM python:3.13-slim
+    RUN pip install --no-cache-dir \
+          kubernetes==31.0.0 \
+          minio==7.2.11 \
+          requests==2.32.3
+    COPY --from=trivy-src /usr/local/bin/trivy /usr/local/bin/trivy
+    ENTRYPOINT ["/usr/bin/python3"]

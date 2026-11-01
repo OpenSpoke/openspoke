@@ -1,0 +1,94 @@
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: trivy-builder
+  namespace: security-builder
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: trivy-builder
+    spec:
+      restartPolicy: Never
+      initContainers:
+        - name: resolve-sha
+          image: alpine/git:2.45.2
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              TRIVY_REPO=$(cat /config/trivy_repo)
+              TRIVY_TAG=$(cat /config/trivy_tag)
+              SHA=$(git ls-remote --tags "${TRIVY_REPO}" "refs/tags/${TRIVY_TAG}^{}" \
+                    | awk '{print $1}')
+              if [ -z "${SHA}" ]; then
+                SHA=$(git ls-remote --tags "${TRIVY_REPO}" "refs/tags/${TRIVY_TAG}" \
+                      | awk '{print $1}')
+              fi
+              if [ -z "${SHA}" ]; then
+                echo "[init] ERROR: could not resolve sha for tag ${TRIVY_TAG}" >&2
+                exit 1
+              fi
+              echo "${SHA}" > /shared/trivy_sha
+              echo "[init] resolved sha: ${SHA}"
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+            - name: shared
+              mountPath: /shared
+        - name: prepare-context
+          image: alpine:3.20
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              cp /config/Dockerfile /workspace/Dockerfile
+              echo "[init] Dockerfile placed in workspace"
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+            - name: workspace
+              mountPath: /workspace
+      containers:
+        - name: kaniko
+          image: gcr.io/kaniko-project/executor:v1.24.0-debug
+          command: ["/busybox/sh"]
+          args:
+            - -c
+            - |
+              set -eu
+              IMAGE_REF=$(cat /config/image_ref)
+              TRIVY_REPO=$(cat /config/trivy_repo)
+              TRIVY_SHA=$(cat /shared/trivy_sha)
+              echo "[kaniko] target image: ${IMAGE_REF}"
+              echo "[kaniko] TRIVY_REPO: ${TRIVY_REPO}"
+              echo "[kaniko] TRIVY_SHA:  ${TRIVY_SHA}"
+              /kaniko/executor \
+                --dockerfile=/workspace/Dockerfile \
+                --context=/workspace \
+                --destination="${IMAGE_REF}" \
+                --build-arg=TRIVY_REPO="${TRIVY_REPO}" \
+                --build-arg=TRIVY_SHA="${TRIVY_SHA}"
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+            - name: workspace
+              mountPath: /workspace
+            - name: shared
+              mountPath: /shared
+      volumes:
+        - name: config
+          configMap:
+            name: trivy-builder-config
+        - name: workspace
+          emptyDir: {}
+        - name: shared
+          emptyDir: {}

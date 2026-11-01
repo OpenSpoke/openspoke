@@ -1,0 +1,142 @@
+---
+#  正本の検査 (汎用)
+#
+#  your-org/reference の POLICY.md で定める「区分 A — 写す正本」を
+#  検査する。clone して走行器を構築し、検証例を当て、否定的対照までかける。
+#
+#  他の *-builder-config との違い:
+#    - 容器を焼かない。よって dind も registry も privileged も要らない
+#    - 対象リポジトリーを Job の環境変数で受ける。
+#      正本は次々に増える前提なので、この ConfigMap は正本ごとに増やさない
+#
+#  Job の例 (使い捨てなので kubectl apply で直接入れる):
+#
+#    apiVersion: batch/v1
+#    kind: Job
+#    metadata:
+#      name: reference-check-email-address-simple
+#      namespace: builder
+#    spec:
+#      backoffLimit: 0
+#      ttlSecondsAfterFinished: 86400
+#      template:
+#        spec:
+#          restartPolicy: Never
+#          containers:
+#            - name: check
+#              image: rust:1-alpine
+#              command: ["/bin/sh", "-c"]
+#              args: ["set -eu\nexec sh /config/check.sh\n"]
+#              env:
+#                - name: REPO_URL
+#                  value: "https://github.com/your-org/your-rust-crate.git"
+#                - name: REPO_BRANCH
+#                  value: "main"
+#                - name: KERNEL_URL
+#                  value: "http://rag-backend-kernel.rag-company1.svc.cluster.local:8000"
+#              resources:
+#                requests: { cpu: "200m", memory: "512Mi" }
+#                limits:   { cpu: "2",    memory: "2Gi" }
+#              volumeMounts:
+#                - { name: config,    mountPath: /config }
+#                - { name: workspace, mountPath: /workspace }
+#          volumes:
+#            - name: config
+#              configMap:
+#                name: reference-check-config
+#                defaultMode: 493
+#            - name: workspace
+#              emptyDir: {}
+#
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: reference-check-config
+  namespace: builder
+data:
+  check.sh: |
+    #!/bin/sh
+    #  正本の検査。
+    #  対象は REPO_URL / REPO_BRANCH (環境変数) で受ける。
+    set -eu
+
+    REPO_URL="${REPO_URL:-}"
+    REPO_BRANCH="${REPO_BRANCH:-main}"
+
+    if [ -z "${REPO_URL}" ]; then
+      echo "[検査] ERROR: REPO_URL が未設定" >&2
+      exit 1
+    fi
+
+    echo "[検査] 対象   : ${REPO_URL}@${REPO_BRANCH}"
+    echo "[検査] 処理系 : $(rustc --version)"
+
+    #  musl-dev は走行器 (標準ライブラリーを使う) の連結に要る。
+    #  正本そのものは core だけで成立するが、走行器は std を使う。
+    apk add --no-cache git curl jq python3 musl-dev >/dev/null
+
+    case "${REPO_URL}" in
+      https://github.com/*)
+        OWNER="$(echo "${REPO_URL}" | sed 's|https://github.com/||' | cut -d/ -f1)"
+        ;;
+      *)
+        echo "[検査] ERROR: 対応していない REPO_URL: ${REPO_URL}" >&2
+        exit 1
+        ;;
+    esac
+
+    echo "[検査] トークンを取得 ..."
+    TOKEN="$(curl -sf -X POST "${KERNEL_URL}/core/git_credentials/github/org/${OWNER}/token" | jq -r '.token')"
+    if [ -z "${TOKEN}" ] || [ "${TOKEN}" = "null" ]; then
+      echo "[検査] ERROR: トークンを取得できない" >&2
+      exit 1
+    fi
+    git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
+
+    echo "[検査] clone ..."
+    cd /workspace
+    rm -rf src
+    git clone --depth 1 --branch "${REPO_BRANCH}" "${REPO_URL}" src
+    cd src
+
+    fail=0
+
+    echo
+    echo "=== 構築と検証例 ==="
+    mkdir -p build
+    if rustc --edition 2021 -g -o build/check harness/main.rs; then
+      if ./build/check cases/cases.tsv; then
+        echo "[検査] 検証例 合格"
+      else
+        echo "[検査] 検証例 不合格"
+        fail=1
+      fi
+    else
+      echo "[検査] 構築できない"
+      fail=1
+    fi
+
+    echo
+    echo "=== 否定的対照 ==="
+    #  「全環境で合格した」だけでは意味がない。
+    #  検証例が本当に差を捕まえるかを別に測る。POLICY.md を参照。
+    if [ -f harness/negative_control.py ]; then
+      if python3 harness/negative_control.py; then
+        echo "[検査] 否定的対照 合格"
+      else
+        echo "[検査] 否定的対照 不合格 (素通りがある)"
+        fail=1
+      fi
+    else
+      echo "[検査] harness/negative_control.py が無い。"
+      echo "       検証例が素通りしないことの確認が未実施である"
+      fail=1
+    fi
+
+    echo
+    if [ "${fail}" -eq 0 ]; then
+      echo "[検査] 総合 合格"
+    else
+      echo "[検査] 総合 不合格"
+    fi
+    exit "${fail}"

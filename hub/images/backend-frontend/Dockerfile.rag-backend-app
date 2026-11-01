@@ -1,0 +1,60 @@
+# Dockerfile.rag-backend-app
+#
+# アプリケーション backend (rag-backend Pod) 専用の軽量イメージ。
+# 重い依存 (Anthropic SDK, sentence-transformers, torch, OCR, Google API) は
+# rag-backend-kernel Pod に集約済みなので、ここには含めない。
+#
+# rag-backend Pod が直接接続するもの:
+#   - Milvus      (pymilvus)
+#   - Memgraph    (neo4j)
+#   - OpenSearch  (requests で HTTP 直叩き)
+#   - Slack       (requests で HTTP 直叩き)
+#   - pdf-converter Pod (requests、別 namespace の HTTP サービス)
+#   - rag-backend-kernel Pod (kernel_client 経由)
+#
+# 削除した依存 (kernel に集約):
+#   - anthropic
+#   - sentence-transformers, torch, transformers, huggingface-hub, tokenizers
+#   - scikit-learn, scipy, numpy, pillow
+#   - pytesseract, pdf2image, tesseract-ocr (OCR は kernel)
+#   - google-auth*, google-api-python-client (Drive 取得は kernel)
+#   - pypdf (rag-backend では未使用)
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# システムパッケージは特に必要なし (HTTP・SSL は base image で揃っている)。
+# 将来 lxml や python-docx で C 拡張ビルドが必要になったら build-essential を追加する。
+
+# アプリケーション依存パッケージ
+RUN pip install --no-cache-dir \
+    fastapi==0.104.1 \
+    uvicorn==0.24.0 \
+    pydantic==2.5.0 \
+    python-multipart==0.0.6 \
+    requests==2.31.0 \
+    python-docx==1.1.0 \
+    openpyxl==3.1.2 \
+    python-pptx==0.6.23 \
+    pymilvus==2.4.0 \
+    marshmallow==3.20.0 \
+    environs==9.5.0 \
+    neo4j==5.15.0 \
+    beautifulsoup4==4.12.2 \
+    lxml==4.9.3
+
+WORKDIR /app
+
+# アプリコードは ConfigMap マウントで /app に置かれる:
+#   /app/main.py
+#   /app/kernel_client.py
+#   /app/web_content_fetcher.py
+#   /app/requirements.txt (参照用)
+
+EXPOSE 8000
+
+# 起動コマンドは Deployment 側で指定
+CMD ["python3"]
+

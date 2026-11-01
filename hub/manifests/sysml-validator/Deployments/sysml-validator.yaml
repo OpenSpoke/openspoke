@@ -1,0 +1,95 @@
+---
+#  sysml-validator: 知識ベースに書く SysML v2 本文を調べるサービス
+#
+#  kernel の知識ベース書き込み (backends.py の MemgraphHandoffStore.topic_upsert) が
+#  書き込みの直前に http://sysml-validator.rag-company1.svc.cluster.local:8080/validate を呼ぶ。
+#  ここが落ちていると、2026-10-30 以降の知見は書き込めない (止まったまま通すことはしない)。
+#  そのため 2 つ立て、入れ替えは 1 つずつ行う。
+#
+#  イメージは OpenSpoke の CI が組み立てる (ソースは hub/images/sysml-validator)。
+#  タグは組み立てた時刻とコミットから付き、CI がこのファイルの image を差し替える。
+#  人が書き換えるものではない。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sysml-validator
+  namespace: rag-company1
+  labels:
+    app: sysml-validator
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  progressDeadlineSeconds: 600
+  selector:
+    matchLabels:
+      app: sysml-validator
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: sysml-validator
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: purpose
+                    operator: In
+                    values:
+                      - general
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: sysml-validator
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+      containers:
+        - name: validator
+          image: your-registry.example.com/sysml-validator:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: LISTEN_ADDR
+              value: "0.0.0.0:8080"
+          ports:
+            - containerPort: 8080
+              name: http
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 10

@@ -1,0 +1,242 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcp-server-code-node-ops
+  namespace: rag-spoke
+data:
+  mcp_server_node_ops.py: |
+    """
+    スポーク MCP の Node Operations ツール群 (特権)。
+
+    自クラスタの各ノードの host OS でコマンドを実行する。 実体は
+    node-shell DaemonSet (namespace=rag-spoke, label=app=node-shell) で、
+    各ノードに 1 つずつ Pod があり、 host PID namespace に入って nsenter で
+    コマンドを走らせる。 本モジュールはその Pod を K8s API で探索し、
+    Pod IP に HTTP POST で要求を委譲する。 kernel は介在しない。
+
+    Tools:
+      - node_list()                          node-shell Pod 一覧 (node ↔ podIP)
+      - node_exec(node, command, timeout)    指定 node でコマンド実行
+
+    認証:
+      X-Node-Shell-Auth ヘッダで API key を送る。 key は env
+      NODE_SHELL_API_KEY (Secret node-shell-auth.api_key) から取得。 Secret
+      は node-shell DaemonSet と spoke MCP で同じものを共有する (同じ
+      rag-spoke namespace 内)。
+
+    依存: kubernetes (mcp_server_k8s と同じ)、 httpx
+    """
+
+    import logging
+    import os
+    import time
+
+    log = logging.getLogger("mcp_server_node_ops")
+
+    from kubernetes import client as _k8sclient, config as _k8sconfig
+    from kubernetes.client.rest import ApiException
+
+    try:
+        import httpx
+    except ImportError:
+        httpx = None
+        log.warning("httpx not available; node_exec will fail")
+
+
+    NODE_SHELL_NAMESPACE = os.environ.get("NODE_SHELL_NAMESPACE", "rag-spoke")
+    NODE_SHELL_LABEL = os.environ.get("NODE_SHELL_LABEL", "app=node-shell")
+    NODE_SHELL_PORT = int(os.environ.get("NODE_SHELL_PORT", "8080"))
+    NODE_SHELL_API_KEY = os.environ.get("NODE_SHELL_API_KEY", "")
+    NODE_EXEC_TIMEOUT_MAX = 300
+    NODE_EXEC_TIMEOUT_DEFAULT = 30
+
+
+    # ── kubernetes client は初回利用時に lazy 初期化 ──
+    # mcp_server_k8s と独立 (両方が走っても問題ない) のグローバルにする。
+    _core_api = None
+
+
+    def _init():
+        global _core_api
+        if _core_api is not None:
+            return
+        try:
+            _k8sconfig.load_incluster_config()
+            log.info("loaded in-cluster kubeconfig")
+        except _k8sconfig.ConfigException:
+            _k8sconfig.load_kube_config()
+            log.info("loaded local kubeconfig (dev mode)")
+        _cfg = _k8sclient.Configuration.get_default_copy()
+        _tok = (_cfg.api_key or {}).get("authorization", "")
+        if _tok.lower().startswith("bearer "):
+            _tok = _tok[len("bearer "):]
+        api_client = _k8sclient.ApiClient(configuration=_cfg)
+        api_client.set_default_header("Authorization", f"Bearer {_tok}")
+        _core_api = _k8sclient.CoreV1Api(api_client=api_client)
+
+
+    def _list_node_shell_pods():
+        _init()
+        try:
+            resp = _core_api.list_namespaced_pod(
+                namespace=NODE_SHELL_NAMESPACE,
+                label_selector=NODE_SHELL_LABEL,
+            )
+        except ApiException as e:
+            raise RuntimeError(
+                f"failed to list node-shell pods: {e.status} {e.reason}"
+            )
+        out = []
+        for p in (resp.items or []):
+            phase = (p.status.phase or "") if p.status else ""
+            node = (p.spec.node_name or "") if p.spec else ""
+            pod_ip = (p.status.pod_ip or "") if p.status else ""
+            ready = False
+            if p.status and p.status.container_statuses:
+                ready = all(c.ready for c in p.status.container_statuses)
+            out.append({
+                "name": p.metadata.name if p.metadata else "",
+                "node": node,
+                "pod_ip": pod_ip,
+                "phase": phase,
+                "ready": ready,
+            })
+        return out
+
+
+    def _find_pod_ip_for_node(node_name):
+        pods = _list_node_shell_pods()
+        for p in pods:
+            if (p["node"] == node_name and p["phase"] == "Running"
+                    and p["ready"] and p["pod_ip"]):
+                return p["pod_ip"]
+        available = ", ".join(
+            f"{p['node']}({p['phase']},ready={p['ready']})" for p in pods
+        ) or "(none)"
+        raise RuntimeError(
+            f"no ready node-shell pod on node '{node_name}'. "
+            f"available: {available}"
+        )
+
+
+    def register_tools(mcp):
+        """mcp_server.py の末尾でこの関数を呼ぶことでツールが登録される。"""
+
+        @mcp.tool()
+        async def node_list() -> str:
+            """node-shell DaemonSet の Pod 一覧 (node ↔ podIP マップ) を返す。
+
+            自クラスタのみ。 ハブの cluster_node_list は各スポークでこれを
+            呼んで結果を集約する。
+            """
+            try:
+                pods = _list_node_shell_pods()
+            except Exception as e:
+                return f"取得失敗: {type(e).__name__}: {str(e)[:200]}"
+            if not pods:
+                return "node-shell pod がありません (DaemonSet 未デプロイ?)。"
+            lines = [f"## node-shell pods ({len(pods)} 件)\n"]
+            for p in pods:
+                lines.append(
+                    f"- node={p.get('node', '?')}  "
+                    f"podIP={p.get('pod_ip', '?')}  "
+                    f"phase={p.get('phase', '?')}  "
+                    f"ready={p.get('ready', False)}"
+                )
+            return "\n".join(lines)
+
+        @mcp.tool()
+        async def node_exec(
+            node: str,
+            command: str,
+            timeout: int = 30,
+        ) -> str:
+            """指定ノードの host OS で bash コマンドを実行する (特権操作)。
+
+            node-shell DaemonSet (ns=rag-spoke) を経由して nsenter で host の
+            名前空間に入って実行する。 自クラスタのみ対象。 他クラスタは
+            ハブの cluster_node_exec を使う。
+
+            Args:
+                node:    対象ノード名。 node_list で確認可能
+                command: bash -c で評価される 1 行コマンド文字列。 パイプ可
+                timeout: 秒 (default 30、 最大 300)
+
+            Returns:
+                複数行の整形済テキスト (exit_code / stdout / stderr / duration)。
+
+            セキュリティ:
+                読み取り目的でも危険操作 (rm 等) でも同じくらい権限がある。
+                認証は MCP の JWT / API key で守られている。
+            """
+            if not NODE_SHELL_API_KEY:
+                return ("実行失敗: NODE_SHELL_API_KEY が未設定です "
+                        "(Secret node-shell-auth が rag-spoke にあるか確認)")
+            if httpx is None:
+                return "実行失敗: httpx ライブラリが利用できません"
+            if not node or not isinstance(node, str):
+                return "エラー: node が指定されていません。"
+            if not command or not isinstance(command, str):
+                return "エラー: command が指定されていません。"
+            try:
+                timeout_int = int(timeout)
+            except Exception:
+                timeout_int = NODE_EXEC_TIMEOUT_DEFAULT
+            timeout_int = max(1, min(NODE_EXEC_TIMEOUT_MAX, timeout_int))
+
+            try:
+                pod_ip = _find_pod_ip_for_node(node)
+            except Exception as e:
+                return f"対象 Pod 検索失敗: {type(e).__name__}: {str(e)[:300]}"
+
+            url = f"http://{pod_ip}:{NODE_SHELL_PORT}/exec"
+            headers = {
+                "Content-Type": "application/json",
+                "X-Node-Shell-Auth": NODE_SHELL_API_KEY,
+            }
+            body = {"command": command, "timeout": timeout_int}
+
+            log.info("exec node=%s podIP=%s cmd=%r timeout=%ds",
+                     node, pod_ip, command[:200], timeout_int)
+            t0 = time.time()
+            try:
+                async with httpx.AsyncClient(timeout=timeout_int + 10) as client:
+                    resp = await client.post(url, headers=headers, json=body)
+            except httpx.TimeoutException:
+                duration_ms = int((time.time() - t0) * 1000)
+                return (f"実行失敗: node-shell timeout after {timeout_int}s "
+                        f"(duration={duration_ms}ms)")
+            except Exception as e:
+                return f"実行失敗: {type(e).__name__}: {str(e)[:200]}"
+
+            if resp.status_code != 200:
+                return (f"実行失敗: HTTP {resp.status_code}: "
+                        f"{resp.text[:500]}")
+            try:
+                data = resp.json()
+            except Exception:
+                return f"実行失敗: non-json response: {resp.text[:200]}"
+
+            exit_code = data.get("exit_code", "?")
+            duration_ms = data.get("duration_ms", 0)
+            spoke_duration_ms = int((time.time() - t0) * 1000)
+            timed_out = data.get("timeout", False)
+            truncated = data.get("truncated", False)
+            stdout = data.get("stdout", "") or ""
+            stderr = data.get("stderr", "") or ""
+
+            lines = [
+                f"## node_exec node={node}  exit_code={exit_code}  "
+                f"duration={duration_ms}ms  spoke={spoke_duration_ms}ms"
+                + ("  TIMEOUT" if timed_out else "")
+                + ("  TRUNCATED" if truncated else "")
+            ]
+            if stdout:
+                lines.append("\n[stdout]")
+                lines.append(stdout.rstrip())
+            else:
+                lines.append("\n[stdout] (empty)")
+            if stderr:
+                lines.append("\n[stderr]")
+                lines.append(stderr.rstrip())
+            return "\n".join(lines)

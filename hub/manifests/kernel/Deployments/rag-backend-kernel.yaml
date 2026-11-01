@@ -1,0 +1,403 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-backend-kernel
+  namespace: rag-company1
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 3
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: rag-backend-kernel
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: rag-backend-kernel
+        phase-2-5: "20260822-170000"
+      namespace: rag-company1
+      annotations:
+        restarted-at: "2026-10-24T12:30:00Z"
+        kubectl.kubernetes.io/restartedAt: "2026-10-20T07:10:00Z"
+    spec:
+      serviceAccountName: rag-backend-kernel
+      imagePullSecrets:
+        - name: regcred
+      # HA: 3 レプリカを別ノードに分散
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: rag-backend-kernel
+      containers:
+        - command:
+            - bash
+            - '-c'
+            - >
+              echo "Starting rag-backend-kernel (CPU-only, HA)"
+
+              python3 -c "import pymilvus; print(f'pymilvus version: {pymilvus.__version__}')"
+
+              export PYTHONPATH=/app
+
+              export HF_HOME=/model-cache
+
+              export TRANSFORMERS_CACHE=/model-cache
+
+              cd /app
+
+              python3 -c "import main; import uvicorn;
+              uvicorn.run(main.app, host='0.0.0.0', port=8000, workers=1)"
+          env:
+            - name: GOOGLE_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  key: client_id
+                  name: google-oauth-credentials
+            - name: GOOGLE_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  key: client_secret
+                  name: google-oauth-credentials
+            - name: CREDENTIALS_BOOTSTRAP_MODE
+              value: strict
+            - name: RESTART_TOKEN
+              value: "2026-10-30T09:05:00Z"
+            #  知識ベースの書き方の強制 (2026-10-30 以降の知見は SysML v2)。
+            #  backends.py の enforce_sysml_policy が読む。off は緊急時の逃げ道で、普段は触らない。
+            - name: SYSML_KB_ENFORCE
+              value: strict
+            - name: SYSML_KB_CUTOFF
+              value: "2026-10-30T08:15:00+00:00"
+            - name: SYSML_VALIDATOR_URL
+              value: "http://sysml-validator.rag-company1.svc.cluster.local:8080"
+            - name: MCP_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: api-key
+                  name: mcp-api-key
+            - name: MCP_SERVER_URL
+              value: 'http://mcp-company1.mcp.svc.cluster.local:8000/sse'
+            - name: PYTHONPATH
+              value: /app
+            - name: HF_HOME
+              value: /model-cache
+            - name: TRANSFORMERS_CACHE
+              value: /model-cache
+            - name: HF_HUB_OFFLINE
+              value: '1'
+            - name: TRANSFORMERS_OFFLINE
+              value: '1'
+            - name: RERANKER_FORCE_CPU
+              value: '1'
+            - name: EMBEDDING_FORCE_CPU
+              value: '1'
+            - name: OPENSEARCH_URL
+              value: 'http://opensearch.opensearch.svc.cluster.local:9200'
+            - name: PDF_CONVERTER_URL
+              value: 'http://pdf-converter.pdf-converter.svc.cluster.local:8000'
+            - name: KV_VALKEY_HOST
+              value: 'valkey.valkey.svc.cluster.local'
+            - name: KV_VALKEY_PORT
+              value: '6379'
+            - name: KNOWLEDGE_MIGRATE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: knowledge-migrate-token
+                  key: token
+                  optional: true
+
+
+
+
+
+          image: your-registry.example.com/rag-backend-cpu-offline:latest
+          imagePullPolicy: IfNotPresent
+          name: backend
+          ports:
+            - containerPort: 8000
+              name: 8000tcp
+              protocol: TCP
+          resources:
+            limits:
+              cpu: '4'
+              memory: 8Gi
+            requests:
+              cpu: 500m
+              memory: 2Gi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+            - mountPath: /app/main.py
+              name: backend-kernel
+              subPath: main.py
+              readOnly: true
+            - mountPath: /app/requirements.txt
+              name: backend-kernel
+              subPath: requirements.txt
+              readOnly: true
+            - mountPath: /app/web_content_fetcher.py
+              name: backend-kernel
+              subPath: web_content_fetcher.py
+              readOnly: true
+            - mountPath: /app/k8s_observer.py
+              name: backend-kernel-k8s-observer
+              subPath: k8s_observer.py
+              readOnly: true
+            - mountPath: /app/github_account.py
+              name: backend-kernel-github-account
+              subPath: github_account.py
+              readOnly: true
+            - mountPath: /app/git_credentials.py
+              name: backend-kernel-git-credentials
+              subPath: git_credentials.py
+              readOnly: true
+            - mountPath: /app/git_mirror.py
+              name: backend-kernel-git-mirror
+              subPath: git_mirror.py
+              readOnly: true
+            - mountPath: /app/git_path_sync.py
+              name: backend-kernel-git-path-sync
+              subPath: git_path_sync.py
+              readOnly: true
+            - mountPath: /app/github_ops.py
+              name: backend-kernel-github-ops
+              subPath: github_ops.py
+              readOnly: true
+            - mountPath: /app/gitlab_account.py
+              name: backend-kernel-gitlab-account
+              subPath: gitlab_account.py
+              readOnly: true
+            - mountPath: /app/gitlab_ops.py
+              name: backend-kernel-gitlab-ops
+              subPath: gitlab_ops.py
+              readOnly: true
+            - mountPath: /app/cloudflare_account.py
+              name: backend-kernel-cloudflare-account
+              subPath: cloudflare_account.py
+              readOnly: true
+            - mountPath: /app/cloudflare_ops.py
+              name: backend-kernel-cloudflare-ops
+              subPath: cloudflare_ops.py
+              readOnly: true
+            - mountPath: /app/spoke_archive.py
+              name: backend-kernel-spoke-archive
+              subPath: spoke_archive.py
+              readOnly: true
+            - mountPath: /app/pubsub.py
+              name: backend-kernel-pubsub
+              subPath: pubsub.py
+              readOnly: true
+            - mountPath: /app/knowledge_migrate.py
+              name: backend-kernel-knowledge-migrate
+              subPath: knowledge_migrate.py
+              readOnly: true
+            - mountPath: /app/opensearch_migrate.py
+              name: backend-kernel-opensearch-migrate
+              subPath: opensearch_migrate.py
+              readOnly: true
+            - mountPath: /app/memgraph_migrate.py
+              name: backend-kernel-memgraph-migrate
+              subPath: memgraph_migrate.py
+              readOnly: true
+            - mountPath: /app/spoke_history_proxy.py
+              name: backend-kernel-spoke-history-proxy
+              subPath: spoke_history_proxy.py
+              readOnly: true
+            - mountPath: /app/native_spoke_mac.py
+              name: backend-kernel-native-spoke-mac
+              subPath: native_spoke_mac.py
+              readOnly: true
+            - mountPath: /app/backends.py
+              name: backend-kernel-backends
+              subPath: backends.py
+              readOnly: true
+            - mountPath: /app/chat_endpoints.py
+              name: backend-kernel-chat
+              subPath: chat_endpoints.py
+              readOnly: true
+            - mountPath: /app/kubectl_endpoints.py
+              name: backend-kernel-kubectl
+              subPath: kubectl_endpoints.py
+              readOnly: true
+            - mountPath: /app/security_endpoints.py
+              name: backend-kernel-security
+              subPath: security_endpoints.py
+              readOnly: true
+            - mountPath: /app/fleet_credentials.py
+              name: backend-kernel-fleet-credentials
+              subPath: fleet_credentials.py
+              readOnly: true
+            #  kubectl バイナリーの置き場。kubectl_endpoints.py と
+            #  fleet_credentials.py の両方がここを使う。
+            - mountPath: /opt/kubectl-cache
+              name: kubectl-cache
+      dnsPolicy: ClusterFirst
+      initContainers:
+        - command:
+            - bash
+            - '-c'
+            - |
+              MILVUS_HOST="milvus-proxy.milvus.svc.cluster.local"
+              MAX_WAIT=300
+              ELAPSED=0
+
+              check_milvus() {
+                python3 - << PYEOF
+              import urllib.request, socket, sys
+              host = "milvus-proxy.milvus.svc.cluster.local"
+              try:
+                  res = urllib.request.urlopen("http://{}:9091/healthz".format(host), timeout=5)
+                  body = res.read().decode()
+                  if "OK" not in body:
+                      sys.exit(1)
+              except Exception as e:
+                  print("healthz failed:", e, file=sys.stderr)
+                  sys.exit(1)
+              try:
+                  s = socket.create_connection((host, 19530), timeout=5)
+                  s.close()
+              except Exception as e:
+                  print("gRPC port not ready:", e, file=sys.stderr)
+                  sys.exit(1)
+              sys.exit(0)
+              PYEOF
+              }
+
+              echo "Waiting for Milvus..."
+              until check_milvus; do
+                if [ "${ELAPSED}" -ge "${MAX_WAIT}" ]; then
+                  echo "Timeout: Milvus did not become ready within ${MAX_WAIT}s"
+                  exit 1
+                fi
+                echo "  Milvus not ready (${ELAPSED}s elapsed), retrying in 5s..."
+                sleep 5
+                ELAPSED=$((ELAPSED + 5))
+              done
+              echo "Milvus is ready after ${ELAPSED}s."
+          image: your-registry.example.com/rag-backend-cpu-offline:latest
+          imagePullPolicy: IfNotPresent
+          name: wait-for-milvus
+          resources:
+            limits:
+              cpu: 200m
+              memory: 128Mi
+            requests:
+              cpu: 100m
+              memory: 64Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      terminationGracePeriodSeconds: 30
+      volumes:
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel
+          name: backend-kernel
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-k8s-observer
+          name: backend-kernel-k8s-observer
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-github-account
+          name: backend-kernel-github-account
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-git-credentials
+          name: backend-kernel-git-credentials
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-git-mirror
+          name: backend-kernel-git-mirror
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-git-path-sync
+          name: backend-kernel-git-path-sync
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-github-ops
+          name: backend-kernel-github-ops
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-gitlab-account
+          name: backend-kernel-gitlab-account
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-gitlab-ops
+          name: backend-kernel-gitlab-ops
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-cloudflare-account
+          name: backend-kernel-cloudflare-account
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-cloudflare-ops
+          name: backend-kernel-cloudflare-ops
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-spoke-archive
+          name: backend-kernel-spoke-archive
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-pubsub
+          name: backend-kernel-pubsub
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-knowledge-migrate
+          name: backend-kernel-knowledge-migrate
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-opensearch-migrate
+          name: backend-kernel-opensearch-migrate
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-memgraph-migrate
+          name: backend-kernel-memgraph-migrate
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-spoke-history-proxy
+          name: backend-kernel-spoke-history-proxy
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-native-spoke-mac
+          name: backend-kernel-native-spoke-mac
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-backends
+          name: backend-kernel-backends
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-chat
+          name: backend-kernel-chat
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-kubectl
+          name: backend-kernel-kubectl
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-security
+          name: backend-kernel-security
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-kernel-fleet-credentials
+          name: backend-kernel-fleet-credentials
+        - emptyDir:
+            sizeLimit: 2Gi
+          name: kubectl-cache

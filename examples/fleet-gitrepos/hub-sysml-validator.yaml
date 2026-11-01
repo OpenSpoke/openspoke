@@ -1,0 +1,40 @@
+# Example Fleet GitRepo for deploying the SysML v2 validator service
+# to a hub cluster.
+#
+# sysml-validator is a Rust HTTP service called by the hub kernel from
+# the knowledge-base write path (backends.py,
+# MemgraphHandoffStore.topic_upsert). It gates every topic body
+# through sysml2 (syntax) and mercurio-sysml (semantic). Required
+# whenever SYSML_KB_ENFORCE=strict (the default on v3.0 and later);
+# without it, topic upserts dated 2026-10-30 or later are refused.
+#
+# Build the container image from hub/images/sysml-validator and push
+# it to your registry, then update
+# hub/manifests/sysml-validator/Deployments/sysml-validator.yaml
+# with the resulting tag before syncing this GitRepo.
+#
+# Adjust:
+#   - spec.repo:    your fork URL or the upstream OpenSpoke repo
+#   - spec.branch:  branch to track
+#   - spec.paths:   subdirectory to watch
+#   - spec.targets: cluster selector labels
+apiVersion: fleet.cattle.io/v1alpha1
+kind: GitRepo
+metadata:
+  name: hub-sysml-validator
+  namespace: fleet-default
+spec:
+  repo: https://github.com/OpenSpoke/openspoke.git
+  branch: main
+  # For private forks, create a Secret in the fleet-default namespace and
+  # uncomment the line below:
+  # clientSecretName: fleet-git-credentials
+  paths:
+    - hub/manifests/sysml-validator
+  pollingInterval: 5m0s
+  keepResources: true
+  targets:
+    - name: hub
+      clusterSelector:
+        matchLabels:
+          role: hub

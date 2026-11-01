@@ -1,0 +1,2289 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-backend-kernel-gitlab-ops
+  namespace: rag-company1
+data:
+  gitlab_ops.py: |
+    """
+    gitlab_ops.py
+    ====================================================================
+    GitLab Operations Module (Phase 2: 基本ファイル/リポ操作 8 tool)
+
+    GitHub 版 (github_ops.py) と対称的な構造で、 GitLab API に対応する。
+    既存の github_ops.py は 1 行も触らない。
+
+    実装 tool (Phase 2 分):
+      - get_file
+      - put_file
+      - delete_file
+      - list_directory
+      - apply_str_replace
+      - grep_file
+      - get_file_range
+      - create_repo (project)
+
+    次スレッドで追加予定:
+      - get_outline / get_symbol / replace_symbol / move_block
+      - checkpoint 系
+      - Issue 系
+      - CI Pipeline 系 (GitLab CI)
+      - Board 系 (GitLab Issue Board)
+
+    GitLab API の主要差異:
+      - Project 指定: URL-encoded namespace/repo path
+        (例: your-org%2Fgitlab)
+        or numeric project ID
+      - File path: URL-encoded path
+        (例: OpenSpoke%2FCore%2FREADME.md)
+      - Auth: PRIVATE-TOKEN header (慣習)
+      - API base: https://{host}/api/v4
+      - branch: query parameter `ref` (get 系) or body param `branch` (put 系)
+      - File content: base64 encoded in response ("content" field,
+        "encoding": "base64")
+      - Commit-based operations (put_file, delete_file):
+        commit_message required, branch required in body
+    """
+    from __future__ import annotations
+
+    import base64
+    import fnmatch
+    import logging
+    import os
+    import re
+    from typing import Any, Dict, List, Optional
+    from urllib.parse import quote
+
+    from fastapi import APIRouter, HTTPException
+
+    try:
+        import requests
+        _REQUESTS_AVAILABLE = True
+    except ImportError:
+        _REQUESTS_AVAILABLE = False
+
+    logger = logging.getLogger(__name__)
+
+    router = APIRouter(prefix="/core/gitlab", tags=["gitlab"])
+
+
+    # ==================================================================
+    # 定数
+    # ==================================================================
+    _GITLAB_API_TIMEOUT = 30
+    _MAX_MATCHES_DEFAULT = 50
+    _MAX_MATCHES_LIMIT = 200
+    _CONTEXT_LINES_DEFAULT = 2
+    _CONTEXT_LINES_LIMIT = 20
+
+
+    # ==================================================================
+    # GitLab API Client
+    # ==================================================================
+    class GitLabAPIClient:
+        """GitLab API v4 client (synchronous requests)。
+
+        各 endpoint 実装 (core_gitlab_*) から呼び出す。 endpoint 側は
+        FastAPI の async def なので、 blocking IO を event loop で
+        走らせるアンチパターンだが、 これは github_ops.py と同じ pattern
+        で統一している。
+        """
+
+        def __init__(self, token: str, base_url: str) -> None:
+            """
+            Args:
+                token: Personal Access Token
+                base_url: 例 "https://gitlab.example.com/api/v4"
+            """
+            self.token = token
+            self.base_url = base_url.rstrip("/")
+            self.headers = {
+                "PRIVATE-TOKEN": token,
+                "Accept": "application/json",
+            }
+
+        # -------------------------------------------------------------
+        # プロジェクト解決ヘルパ
+        # -------------------------------------------------------------
+        def encode_project(self, owner: str, repo: str) -> str:
+            """namespace/repo に対応する numeric project ID を文字列で返す。
+
+            Cloudflare edge の baseline normalization が URL パスの %2F を
+            / にデコードして GitLab API の
+            /projects/{namespace%2Frepo}/... のパス構造を壊すため、
+            %2F を含まない numeric ID 経由に切り替える。
+
+            実装: /projects?search=<repo> を呼び (URL に %2F なし)、
+            応答の path_with_namespace で厳密に照合して ID を確定。
+
+            見つからない場合は "0" を返し、 呼び出し側の
+            GitLab API 呼び出しが 404 で自然に失敗する形になる。
+            """
+            target = f"{owner}/{repo}".lower()
+            url = f"{self.base_url}/projects"
+            page = 1
+            while True:
+                try:
+                    resp = requests.get(
+                        url,
+                        headers=self.headers,
+                        params={
+                            "search": repo,
+                            "per_page": 100,
+                            "page": page,
+                            "simple": "true",
+                        },
+                        timeout=_GITLAB_API_TIMEOUT,
+                    )
+                except Exception:
+                    return "0"
+                if resp.status_code != 200:
+                    return "0"
+                projects = resp.json() or []
+                for p in projects:
+                    if (
+                        p.get("path_with_namespace", "").lower()
+                        == target
+                    ):
+                        return str(p.get("id", 0))
+                next_page = resp.headers.get("X-Next-Page", "")
+                if not next_page:
+                    return "0"
+                try:
+                    page = int(next_page)
+                except ValueError:
+                    return "0"
+                if page > 20:
+                    return "0"
+
+        @staticmethod
+        def encode_path(path: str) -> str:
+            """file path を URL エンコード。"""
+            return quote(path, safe="")
+
+        # -------------------------------------------------------------
+        # _find_blob_sha (共通 helper, Tree API 経由)
+        # -------------------------------------------------------------
+        def _find_blob_sha(
+            self, owner: str, repo: str, path: str, branch: str,
+        ) -> Dict[str, Any]:
+            """Tree API でファイルの blob SHA を探す。
+
+            path を親ディレクトリと basename に分割し、 Tree API で
+            親ディレクトリ配下を列挙して basename に一致する blob (file)
+            の SHA を返す。 URL 内に %2F が現れないため、 Cloudflare edge
+            の baseline normalization の影響を受けない。
+
+            Returns:
+                {"ok": True, "sha": str, "path": str} - 見つかった
+                {"ok": True, "sha": None} - 該当 file なし
+                {"ok": False, "error": str} - HTTP エラー等
+            """
+            project = self.encode_project(owner, repo)
+            path = path.strip("/")
+            if "/" in path:
+                parent, name = path.rsplit("/", 1)
+            else:
+                parent, name = "", path
+
+            url = (
+                f"{self.base_url}/projects/{project}/repository/tree"
+            )
+            page = 1
+            while True:
+                try:
+                    resp = requests.get(
+                        url,
+                        headers=self.headers,
+                        params={
+                            "path": parent,
+                            "ref": branch,
+                            "per_page": 100,
+                            "page": page,
+                        },
+                        timeout=_GITLAB_API_TIMEOUT,
+                    )
+                except Exception as e:
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"network error: {type(e).__name__}: {e}"
+                        ),
+                    }
+                if resp.status_code == 404:
+                    return {"ok": True, "sha": None}
+                if resp.status_code >= 400:
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"HTTP {resp.status_code}: {resp.text[:300]}"
+                        ),
+                    }
+                entries = resp.json() or []
+                for entry in entries:
+                    if (
+                        entry.get("name") == name
+                        and entry.get("type") == "blob"
+                    ):
+                        return {
+                            "ok": True,
+                            "sha": entry.get("id", ""),
+                            "path": entry.get("path", path),
+                        }
+                next_page = resp.headers.get("X-Next-Page", "")
+                if not next_page:
+                    return {"ok": True, "sha": None}
+                try:
+                    page = int(next_page)
+                except ValueError:
+                    return {"ok": True, "sha": None}
+                if page > 100:
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"directory too large: {parent} "
+                            f"(>10000 entries)"
+                        ),
+                    }
+
+        # -------------------------------------------------------------
+        # get_file
+        # -------------------------------------------------------------
+        def get_file(
+            self, owner: str, repo: str, path: str,
+            ref: Optional[str] = None,
+        ) -> Dict[str, Any]:
+            """ファイル内容を取得する。
+
+            経路: Tree API で SHA 取得 -> Blob API (raw) で内容取得。
+            URL 内に %2F を含まないため、 Cloudflare edge の baseline
+            normalization の影響を受けない。
+
+            Returns:
+                {"ok": True, "content": str, "sha": str,
+                 "size": int, "encoding": str, "ref": str}
+                {"ok": False, "error": str}
+            """
+            project = self.encode_project(owner, repo)
+            branch = ref or self.resolve_default_branch(owner, repo)
+
+            # Step 1: Tree API で blob SHA を取得
+            found = self._find_blob_sha(owner, repo, path, branch)
+            if not found.get("ok"):
+                return found
+            sha = found.get("sha")
+            if not sha:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"file not found: {owner}/{repo}:{path}@{branch}"
+                    ),
+                }
+
+            # Step 2: Blob API で raw 内容取得
+            url = (
+                f"{self.base_url}/projects/{project}"
+                f"/repository/blobs/{sha}/raw"
+            )
+            try:
+                resp = requests.get(
+                    url,
+                    headers=self.headers,
+                    timeout=_GITLAB_API_TIMEOUT,
+                )
+            except Exception as e:
+                return {
+                    "ok": False,
+                    "error": f"network error: {type(e).__name__}: {e}",
+                }
+            if resp.status_code >= 400:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"HTTP {resp.status_code}: {resp.text[:300]}"
+                    ),
+                }
+
+            try:
+                text = resp.content.decode("utf-8", errors="replace")
+            except Exception as e:
+                return {
+                    "ok": False,
+                    "error": f"decode error: {e}",
+                }
+
+            return {
+                "ok": True,
+                "content": text,
+                "sha": sha,
+                "size": len(resp.content),
+                "encoding": "text",
+                "ref": branch,
+                "file_path": found.get("path", path),
+                "last_commit_id": "",
+            }
+
+        # -------------------------------------------------------------
+        # put_file
+        # -------------------------------------------------------------
+        def put_file(
+            self, owner: str, repo: str, path: str,
+            content: str, message: str,
+            branch: Optional[str] = None,
+        ) -> Dict[str, Any]:
+            """ファイルを作成 or 更新。 冪等: 既存なら update、 無ければ create。
+
+            経路: Tree API で存在確認 -> Commits API で書き込み。
+            URL 内に %2F を含まないため、 Cloudflare edge の baseline
+            normalization の影響を受けない。
+
+            Returns:
+                {"ok": True, "action": "created"|"updated",
+                 "file_path": str, "branch": str, "commit_id": str}
+                {"ok": False, "error": str}
+            """
+            project = self.encode_project(owner, repo)
+            branch = branch or self.resolve_default_branch(owner, repo)
+
+            # Step 1: Tree API で存在確認
+            found = self._find_blob_sha(owner, repo, path, branch)
+            if not found.get("ok"):
+                return found
+            exists = found.get("sha") is not None
+
+            # Step 2: Commits API で書き込み
+            action = "update" if exists else "create"
+            url = (
+                f"{self.base_url}/projects/{project}"
+                f"/repository/commits"
+            )
+            body = {
+                "branch": branch,
+                "commit_message": message,
+                "actions": [
+                    {
+                        "action": action,
+                        "file_path": path,
+                        "content": content,
+                        "encoding": "text",
+                    }
+                ],
+            }
+            try:
+                resp = requests.post(
+                    url,
+                    headers={
+                        **self.headers,
+                        "Content-Type": "application/json",
+                    },
+                    json=body,
+                    timeout=_GITLAB_API_TIMEOUT,
+                )
+            except Exception as e:
+                return {
+                    "ok": False,
+                    "error": f"network error: {type(e).__name__}: {e}",
+                }
+
+            if resp.status_code in (200, 201):
+                data = resp.json() or {}
+                return {
+                    "ok": True,
+                    "action": "updated" if exists else "created",
+                    "file_path": path,
+                    "branch": data.get("branch", branch),
+                    "commit_id": data.get("id", ""),
+                }
+
+            return {
+                "ok": False,
+                "error": f"HTTP {resp.status_code}: {resp.text[:300]}",
+            }
+
+        # -------------------------------------------------------------
+        # delete_file
+        # -------------------------------------------------------------
+        def delete_file(
+            self, owner: str, repo: str, path: str,
+            message: str, branch: Optional[str] = None,
+        ) -> Dict[str, Any]:
+            """ファイルを削除。 存在しない場合も冪等的に成功扱い。
+
+            経路: Tree API で存在確認 -> Commits API で削除。
+            URL 内に %2F を含まないため、 Cloudflare edge の baseline
+            normalization の影響を受けない。
+
+            Returns:
+                {"ok": True, "action": "deleted"|"already_absent",
+                 "file_path": str, "branch": str}
+                {"ok": False, "error": str}
+            """
+            project = self.encode_project(owner, repo)
+            branch = branch or self.resolve_default_branch(owner, repo)
+
+            # Step 1: Tree API で存在確認
+            found = self._find_blob_sha(owner, repo, path, branch)
+            if not found.get("ok"):
+                return found
+            if found.get("sha") is None:
+                return {
+                    "ok": True,
+                    "action": "already_absent",
+                    "file_path": path,
+                    "branch": branch,
+                }
+
+            # Step 2: Commits API で削除
+            url = (
+                f"{self.base_url}/projects/{project}"
+                f"/repository/commits"
+            )
+            body = {
+                "branch": branch,
+                "commit_message": message,
+                "actions": [
+                    {
+                        "action": "delete",
+                        "file_path": path,
+                    }
+                ],
+            }
+            try:
+                resp = requests.post(
+                    url,
+                    headers={
+                        **self.headers,
+                        "Content-Type": "application/json",
+                    },
+                    json=body,
+                    timeout=_GITLAB_API_TIMEOUT,
+                )
+            except Exception as e:
+                return {
+                    "ok": False,
+                    "error": f"network error: {type(e).__name__}: {e}",
+                }
+
+            if resp.status_code in (200, 201):
+                return {
+                    "ok": True,
+                    "action": "deleted",
+                    "file_path": path,
+                    "branch": branch,
+                }
+            return {
+                "ok": False,
+                "error": f"HTTP {resp.status_code}: {resp.text[:300]}",
+            }
+
+        # -------------------------------------------------------------
+        # list_directory
+        # -------------------------------------------------------------
+        def list_directory(
+            self, owner: str, repo: str, path: str = "",
+            ref: Optional[str] = None, per_page: int = 100,
+        ) -> Dict[str, Any]:
+            """ディレクトリ内容を返す。
+
+            Returns:
+                {"ok": True, "entries": [{"name", "type", "path", "id"}]}
+                {"ok": False, "error": str}
+            """
+            project = self.encode_project(owner, repo)
+            branch = ref or self.resolve_default_branch(owner, repo)
+            url = (
+                f"{self.base_url}/projects/{project}/repository/tree"
+            )
+            entries: List[Dict[str, Any]] = []
+            page = 1
+            try:
+                while True:
+                    resp = requests.get(
+                        url,
+                        headers=self.headers,
+                        params={
+                            "path": path,
+                            "ref": branch,
+                            "per_page": per_page,
+                            "page": page,
+                        },
+                        timeout=_GITLAB_API_TIMEOUT,
+                    )
+                    if resp.status_code == 404:
+                        return {
+                            "ok": False,
+                            "error": (
+                                f"path not found: "
+                                f"{owner}/{repo}:{path}@{branch}"
+                            ),
+                        }
+                    if resp.status_code >= 400:
+                        return {
+                            "ok": False,
+                            "error": (
+                                f"HTTP {resp.status_code}: "
+                                f"{resp.text[:300]}"
+                            ),
+                        }
+                    batch = resp.json() or []
+                    if not isinstance(batch, list) or not batch:
+                        break
+                    for e in batch:
+                        entries.append({
+                            "name": e.get("name", ""),
+                            "type": e.get("type", ""),
+                            "path": e.get("path", ""),
+                            "id": e.get("id", ""),
+                        })
+                    if len(batch) < per_page:
+                        break
+                    page += 1
+                    if page > 20:
+                        break
+            except Exception as e:
+                return {
+                    "ok": False,
+                    "error": f"network error: {type(e).__name__}: {e}",
+                }
+            return {"ok": True, "entries": entries, "ref": branch}
+
+        # -------------------------------------------------------------
+        # create_repo (project)
+        # -------------------------------------------------------------
+        def create_repo(
+            self, owner: str, repo: str,
+            is_group: bool = True,
+            visibility: str = "private",
+            description: Optional[str] = None,
+            default_branch: str = "main",
+            initialize_with_readme: bool = True,
+        ) -> Dict[str, Any]:
+            """プロジェクトを新規作成する。 冪等: 既存の場合は既存情報を返す。
+
+            is_group=True (default): グループ配下に作成
+                                     (namespace_id が必要)
+            is_group=False: ユーザー配下に作成 (owner がユーザー名)
+            """
+            base_result = {
+                "ok": False,
+                "web_url": "",
+                "http_url_to_repo": "",
+                "ssh_url_to_repo": "",
+                "default_branch": default_branch,
+                "visibility": visibility,
+                "already_existed": False,
+                "error": None,
+            }
+
+            if not owner or not repo:
+                return {
+                    **base_result,
+                    "error": "owner and repo are required",
+                }
+
+            # 既存チェック (冪等性)
+            project_enc = self.encode_project(owner, repo)
+            get_url = f"{self.base_url}/projects/{project_enc}"
+            try:
+                get_resp = requests.get(
+                    get_url,
+                    headers=self.headers,
+                    timeout=_GITLAB_API_TIMEOUT,
+                )
+                if get_resp.status_code == 200:
+                    d = get_resp.json() or {}
+                    logger.info(
+                        f"[GITLAB] create_repo: "
+                        f"{owner}/{repo} already exists"
+                    )
+                    return {
+                        "ok": True,
+                        "web_url": d.get("web_url", ""),
+                        "http_url_to_repo":
+                            d.get("http_url_to_repo", ""),
+                        "ssh_url_to_repo":
+                            d.get("ssh_url_to_repo", ""),
+                        "default_branch":
+                            d.get("default_branch", default_branch),
+                        "visibility":
+                            d.get("visibility", visibility),
+                        "already_existed": True,
+                        "error": None,
+                    }
+            except Exception:
+                pass
+
+            # namespace_id の取得 (グループの場合)
+            namespace_id: Optional[int] = None
+            if is_group:
+                ns_url = (
+                    f"{self.base_url}/namespaces/"
+                    f"{self.encode_path(owner)}"
+                )
+                try:
+                    ns_resp = requests.get(
+                        ns_url,
+                        headers=self.headers,
+                        timeout=_GITLAB_API_TIMEOUT,
+                    )
+                    if ns_resp.status_code == 200:
+                        ns_data = ns_resp.json() or {}
+                        namespace_id = ns_data.get("id")
+                except Exception:
+                    pass
+                if namespace_id is None:
+                    return {
+                        **base_result,
+                        "error": (
+                            f"namespace not found: {owner} "
+                            f"(create group first, or set is_group=False)"
+                        ),
+                    }
+
+            # 作成
+            payload: Dict[str, Any] = {
+                "name": repo,
+                "path": repo,
+                "visibility": visibility,
+                "initialize_with_readme": bool(initialize_with_readme),
+                "default_branch": default_branch,
+            }
+            if is_group and namespace_id is not None:
+                payload["namespace_id"] = namespace_id
+            if description:
+                payload["description"] = description
+
+            url = f"{self.base_url}/projects"
+            try:
+                resp = requests.post(
+                    url,
+                    headers={
+                        **self.headers,
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                    timeout=_GITLAB_API_TIMEOUT,
+                )
+            except Exception as e:
+                logger.error(
+                    f"[GITLAB] create_repo network error for "
+                    f"{owner}/{repo}: {e}"
+                )
+                return {
+                    **base_result,
+                    "error": f"network error: {type(e).__name__}: {e}",
+                }
+
+            if resp.status_code == 201:
+                data = resp.json() or {}
+                logger.info(
+                    f"[GITLAB] create_repo: {owner}/{repo} created"
+                )
+                return {
+                    "ok": True,
+                    "web_url": data.get("web_url", ""),
+                    "http_url_to_repo":
+                        data.get("http_url_to_repo", ""),
+                    "ssh_url_to_repo":
+                        data.get("ssh_url_to_repo", ""),
+                    "default_branch":
+                        data.get("default_branch", default_branch),
+                    "visibility":
+                        data.get("visibility", visibility),
+                    "already_existed": False,
+                    "error": None,
+                }
+
+            if resp.status_code == 403:
+                return {
+                    **base_result,
+                    "error": (
+                        f"HTTP 403 (permission): PAT lacks "
+                        f"'api' scope or namespace access: "
+                        f"{resp.text[:200]}"
+                    ),
+                }
+
+            return {
+                **base_result,
+                "error": (
+                    f"HTTP {resp.status_code}: {resp.text[:300]}"
+                ),
+            }
+
+        # -------------------------------------------------------------
+        # resolve_default_branch
+        # -------------------------------------------------------------
+        def resolve_default_branch(
+            self, owner: str, repo: str
+        ) -> str:
+            """プロジェクトの default branch を返す。 失敗時は 'main'。"""
+            project_enc = self.encode_project(owner, repo)
+            url = f"{self.base_url}/projects/{project_enc}"
+            try:
+                resp = requests.get(
+                    url,
+                    headers=self.headers,
+                    timeout=_GITLAB_API_TIMEOUT,
+                )
+                if resp.status_code == 200:
+                    d = resp.json() or {}
+                    return d.get("default_branch") or "main"
+            except Exception:
+                pass
+            return "main"
+
+
+    # ==================================================================
+    # 内部ヘルパ: token 解決
+    # ==================================================================
+    def _get_client(request: dict) -> GitLabAPIClient:
+        """request dict から token を解決して GitLabAPIClient を生成。
+
+        request:
+          user_id (任意): 秘書利用者 ID
+          gitlab_host (任意): 特定 host のアカウント使用
+          owner (任意): GitLab 組織 (group) 名。 gitlab_host と併用で
+                       git_credentials 保管庫の org:gitlab:{host}:{owner}
+                       を参照可能
+        """
+        try:
+            from gitlab_account import resolve_gitlab_token
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"gitlab_account module unavailable: {e}",
+            )
+        try:
+            resolved = resolve_gitlab_token(
+                user_id=request.get("user_id"),
+                gitlab_host=request.get("gitlab_host"),
+                owner=request.get("owner"),
+            )
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"gitlab token unavailable: {e}",
+            )
+        return GitLabAPIClient(
+            token=resolved["token"],
+            base_url=resolved["base_url"],
+        )
+
+
+    # ==================================================================
+    # Endpoint: get_file
+    # ==================================================================
+    @router.post("/get-file")
+    async def core_gitlab_get_file(request: dict):
+        """GitLab からファイル内容を取得する。
+
+        Body:
+          owner (必須): 例 "your-org"
+          repo (必須): 例 "gitlab"
+          path (必須): 例 "README.md"
+          ref (任意): ブランチ or コミット (省略時 default branch)
+          user_id (任意)
+          gitlab_host (任意)
+        """
+        owner = (request.get("owner") or "").strip()
+        repo = (request.get("repo") or "").strip()
+        path = (request.get("path") or "").strip()
+        ref = request.get("ref") or None
+
+        if not owner or not repo or not path:
+            return {
+                "ok": False,
+                "error": "owner, repo, path are required",
+            }
+
+        client = _get_client(request)
+        return client.get_file(owner, repo, path, ref=ref)
+
+
+    # ==================================================================
+    # Endpoint: put_file
+    # ==================================================================
+    @router.post("/put-file")
+    async def core_gitlab_put_file(request: dict):
+        """GitLab にファイルを作成 or 更新して push する。
+
+        Body:
+          owner (必須)
+          repo (必須)
+          path (必須)
+          content (必須): ファイル本文 UTF-8
+          message (必須): commit message
+          branch (任意): 省略時 default branch
+          user_id (任意)
+          gitlab_host (任意)
+        """
+        owner = (request.get("owner") or "").strip()
+        repo = (request.get("repo") or "").strip()
+        path = (request.get("path") or "").strip()
+        content = request.get("content", "")
+        message = (request.get("message") or "").strip()
+        branch = request.get("branch") or None
+
+        if not owner or not repo or not path:
+            return {
+                "ok": False,
+                "error": "owner, repo, path are required",
+            }
+        if not message:
+            return {
+                "ok": False,
+                "error": "message is required",
+            }
+
+        client = _get_client(request)
+        return client.put_file(
+            owner, repo, path, content, message, branch=branch
+        )
+
+
+    # ==================================================================
+    # Endpoint: delete_file
+    # ==================================================================
+    @router.post("/delete-file")
+    async def core_gitlab_delete_file(request: dict):
+        """GitLab からファイルを削除して push する。 冪等: 無ければ成功扱い。
+
+        Body:
+          owner (必須)
+          repo (必須)
+          path (必須)
+          message (必須): commit message
+          branch (任意)
+          user_id (任意)
+          gitlab_host (任意)
+        """
+        owner = (request.get("owner") or "").strip()
+        repo = (request.get("repo") or "").strip()
+        path = (request.get("path") or "").strip()
+        message = (request.get("message") or "").strip()
+        branch = request.get("branch") or None
+
+        if not owner or not repo or not path:
+            return {
+                "ok": False,
+                "error": "owner, repo, path are required",
+            }
+        if not message:
+            return {
+                "ok": False,
+                "error": "message is required",
+            }
+
+        client = _get_client(request)
+        return client.delete_file(
+            owner, repo, path, message, branch=branch
+        )
+
+
+    # ==================================================================
+    # Endpoint: list_directory
+    # ==================================================================
+    @router.post("/list-directory")
+    async def core_gitlab_list_directory(request: dict):
+        """GitLab のディレクトリ内容一覧を取得する。
+
+        Body:
+          owner (必須)
+          repo (必須)
+          path (任意): ディレクトリパス (省略時ルート)
+          ref (任意): ブランチ or コミット
+          user_id (任意)
+          gitlab_host (任意)
+        """
+        owner = (request.get("owner") or "").strip()
+        repo = (request.get("repo") or "").strip()
+        path = (request.get("path") or "").strip()
+        ref = request.get("ref") or None
+
+        if not owner or not repo:
+            return {
+                "ok": False,
+                "error": "owner and repo are required",
+            }
+
+        client = _get_client(request)
+        return client.list_directory(owner, repo, path=path, ref=ref)
+
+
+    # ==================================================================
+    # Endpoint: apply_str_replace
+    # ==================================================================
+    @router.post("/apply-str-replace")
+    async def core_gitlab_apply_str_replace(request: dict):
+        """ファイルを取得 → 文字列置換 → push (1 commit)。
+
+        Body:
+          owner, repo, path (必須)
+          old_str, new_str (必須): 置換 (new_str 空文字なら削除)
+          message (必須): commit message
+          count (任意, default=1): 期待する old_str の出現回数
+          branch (任意)
+          user_id, gitlab_host (任意)
+        """
+        owner = (request.get("owner") or "").strip()
+        repo = (request.get("repo") or "").strip()
+        path = (request.get("path") or "").strip()
+        old_str = request.get("old_str", "")
+        new_str = request.get("new_str", "")
+        message = (request.get("message") or "").strip()
+        count = int(request.get("count", 1) or 1)
+        branch = request.get("branch") or None
+
+        if not owner or not repo or not path:
+            return {
+                "ok": False,
+                "error": "owner, repo, path are required",
+            }
+        if not message:
+            return {
+                "ok": False,
+                "error": "message is required",
+            }
+        if not old_str:
+            return {
+                "ok": False,
+                "error": "old_str is required (empty not allowed)",
+            }
+
+        client = _get_client(request)
+        got = client.get_file(owner, repo, path, ref=branch)
+        if not got.get("ok"):
+            return got
+        content = got.get("content", "")
+        actual = content.count(old_str)
+        if actual != count:
+            return {
+                "ok": False,
+                "error": (
+                    f"old_str occurrence mismatch: "
+                    f"expected {count}, actual {actual}"
+                ),
+            }
+        new_content = content.replace(old_str, new_str, count)
+        return client.put_file(
+            owner, repo, path, new_content, message, branch=branch
+        )
+
+
+    # ==================================================================
+    # Endpoint: grep_file
+    # ==================================================================
+    @router.post("/grep-file")
+    async def core_gitlab_grep_file(request: dict):
+        """ファイル内で正規表現 grep を実行し、 マッチ行と context を返す。
+
+        Body:
+          owner, repo, path (必須)
+          pattern (必須): Python 正規表現
+          context (任意, default 2, max 20)
+          max_matches (任意, default 50, max 200)
+          ignore_case (任意, default False)
+          ref (任意)
+          user_id, gitlab_host (任意)
+        """
+        owner = (request.get("owner") or "").strip()
+        repo = (request.get("repo") or "").strip()
+        path = (request.get("path") or "").strip()
+        pattern = request.get("pattern", "")
+        context_lines = int(
+            request.get("context", _CONTEXT_LINES_DEFAULT) or 0
+        )
+        max_matches = int(
+            request.get("max_matches", _MAX_MATCHES_DEFAULT) or 0
+        )
+        ignore_case = bool(request.get("ignore_case", False))
+        ref = request.get("ref") or None
+
+        if not owner or not repo or not path:
+            return {
+                "ok": False,
+                "error": "owner, repo, path are required",
+            }
+        if not pattern:
+            return {
+                "ok": False,
+                "error": "pattern is required",
+            }
+
+        context_lines = max(
+            0, min(context_lines, _CONTEXT_LINES_LIMIT)
+        )
+        max_matches = max(
+            1, min(max_matches, _MAX_MATCHES_LIMIT)
+        )
+
+        try:
+            flags = re.MULTILINE
+            if ignore_case:
+                flags |= re.IGNORECASE
+            regex = re.compile(pattern, flags)
+        except re.error as e:
+            return {
+                "ok": False,
+                "error": f"invalid regex: {e}",
+            }
+
+        client = _get_client(request)
+        got = client.get_file(owner, repo, path, ref=ref)
+        if not got.get("ok"):
+            return got
+        content = got.get("content", "")
+        lines = content.splitlines()
+
+        blocks: List[Dict[str, Any]] = []
+        truncated = False
+        for i, line in enumerate(lines):
+            if not regex.search(line):
+                continue
+            if len(blocks) >= max_matches:
+                truncated = True
+                break
+            start = max(0, i - context_lines)
+            end = min(len(lines), i + context_lines + 1)
+            blocks.append({
+                "line_number": i + 1,
+                "match_line": line,
+                "context": [
+                    {"line_number": j + 1, "text": lines[j]}
+                    for j in range(start, end)
+                ],
+            })
+
+        return {
+            "ok": True,
+            "path": path,
+            "ref": got.get("ref"),
+            "total_matches": len(blocks),
+            "truncated": truncated,
+            "blocks": blocks,
+        }
+
+
+    # ==================================================================
+    # Endpoint: get_file_range
+    # ==================================================================
+    @router.post("/get-file-range")
+    async def core_gitlab_get_file_range(request: dict):
+        """ファイルから指定行範囲だけを取得する (1-indexed、 両端含む)。
+
+        Body:
+          owner, repo, path (必須)
+          start_line, end_line (必須): 1-indexed
+          ref (任意)
+          user_id, gitlab_host (任意)
+        """
+        owner = (request.get("owner") or "").strip()
+        repo = (request.get("repo") or "").strip()
+        path = (request.get("path") or "").strip()
+        start_line = int(request.get("start_line", 0) or 0)
+        end_line = int(request.get("end_line", 0) or 0)
+        ref = request.get("ref") or None
+
+        if not owner or not repo or not path:
+            return {
+                "ok": False,
+                "error": "owner, repo, path are required",
+            }
+        if start_line < 1 or end_line < start_line:
+            return {
+                "ok": False,
+                "error": (
+                    "start_line must be >=1 and "
+                    "end_line must be >=start_line"
+                ),
+            }
+
+        client = _get_client(request)
+        got = client.get_file(owner, repo, path, ref=ref)
+        if not got.get("ok"):
+            return got
+        content = got.get("content", "")
+        lines = content.splitlines()
+        total = len(lines)
+        start = min(start_line, total + 1)
+        end = min(end_line, total)
+
+        selected = []
+        for i in range(start - 1, end):
+            selected.append({"line_number": i + 1, "text": lines[i]})
+
+        return {
+            "ok": True,
+            "path": path,
+            "ref": got.get("ref"),
+            "total_lines": total,
+            "start_line": start,
+            "end_line": end,
+            "lines": selected,
+        }
+
+
+    # ==================================================================
+    # Endpoint: create_repo (project)
+    # ==================================================================
+    @router.post("/create-repo")
+    async def core_gitlab_create_repo(request: dict):
+        """GitLab プロジェクトを新規作成する。 冪等: 既存の場合は既存情報を返す。
+
+        Body:
+          owner (必須): グループ or ユーザー名
+          repo (必須): プロジェクト名
+          is_group (任意, default True): グループ配下に作成
+          visibility (任意, default "private"): private | internal | public
+          description (任意)
+          default_branch (任意, default "main")
+          initialize_with_readme (任意, default True)
+          user_id, gitlab_host (任意)
+        """
+        owner = (request.get("owner") or "").strip()
+        repo = (request.get("repo") or "").strip()
+
+        if not owner or not repo:
+            return {
+                "ok": False,
+                "web_url": "",
+                "http_url_to_repo": "",
+                "ssh_url_to_repo": "",
+                "default_branch": "",
+                "visibility": "private",
+                "already_existed": False,
+                "error": "owner and repo are required",
+            }
+
+        is_group = bool(request.get("is_group", True))
+        visibility = (
+            request.get("visibility") or "private"
+        ).strip().lower()
+        if visibility not in ("private", "internal", "public"):
+            visibility = "private"
+
+        client = _get_client(request)
+        try:
+            return client.create_repo(
+                owner=owner,
+                repo=repo,
+                is_group=is_group,
+                visibility=visibility,
+                description=request.get("description"),
+                default_branch=(
+                    request.get("default_branch") or "main"
+                ),
+                initialize_with_readme=bool(
+                    request.get("initialize_with_readme", True)
+                ),
+            )
+        except Exception as e:
+            logger.error(
+                f"[GITLAB_CREATE_REPO] unexpected error: {e}",
+                exc_info=True,
+            )
+            return {
+                "ok": False,
+                "web_url": "",
+                "http_url_to_repo": "",
+                "ssh_url_to_repo": "",
+                "default_branch": "",
+                "visibility": visibility,
+                "already_existed": False,
+                "error": f"{type(e).__name__}: {str(e)[:200]}",
+            }
+
+
+    # ==================================================================
+    # ここから下は GitHub 側と対称のリポジトリ操作 (2026-10-21 追加)
+    #
+    # 文字列処理の補助関数は github_ops.py の実装をそのまま借りる。
+    # 中身の解析は提供元 (GitHub / GitLab) に依らないので、 二重に
+    # 書くと振る舞いがずれる。 import に失敗したら該当 endpoint だけが
+    # エラーを返し、 他は動き続ける。
+    # ==================================================================
+
+    def _gl_text_helpers():
+        """github_ops.py の文字列処理補助を取り込む。"""
+        from github_ops import (
+            _gh_find_literal_block,
+            _gh_extract_python_from_yaml,
+            _gh_python_outline,
+            _gh_yaml_outline,
+            _gh_unified_diff,
+        )
+        return {
+            "find_literal_block": _gh_find_literal_block,
+            "extract_python_from_yaml": _gh_extract_python_from_yaml,
+            "python_outline": _gh_python_outline,
+            "yaml_outline": _gh_yaml_outline,
+            "unified_diff": _gh_unified_diff,
+        }
+
+
+    # ==================================================================
+    # Endpoint: list_tree
+    # ==================================================================
+    @router.post("/list-tree")
+    async def core_gitlab_list_tree(request: dict):
+        """リポジトリの木構造を一度に返す (再帰)。
+
+        Body:
+          owner / repo (必須)
+          path (任意): この配下だけを返す
+          ref (任意): 省略時 default branch
+          max_entries (任意): 既定 5000、 上限 20000
+          user_id / gitlab_host (任意)
+
+        GitLab の Tree API は blob のバイト数を返さないので size は出ない。
+        """
+        owner = (request.get("owner") or "").strip()
+        repo = (request.get("repo") or "").strip()
+        path = (request.get("path") or "").strip().strip("/")
+        ref = request.get("ref") or None
+        try:
+            max_entries = int(request.get("max_entries") or 5000)
+        except Exception:
+            max_entries = 5000
+        max_entries = max(1, min(max_entries, 20000))
+
+        if not owner or not repo:
+            return {"ok": False, "error": "owner, repo are required"}
+
+        client = _get_client(request)
+        try:
+            project = client.encode_project(owner, repo)
+            branch = ref or client.resolve_default_branch(owner, repo)
+            url = (
+                f"{client.base_url}/projects/{project}/repository/tree"
+            )
+            entries = []
+            page = 1
+            truncated = False
+            while True:
+                resp = requests.get(
+                    url,
+                    headers=client.headers,
+                    params={
+                        "path": path,
+                        "ref": branch,
+                        "recursive": "true",
+                        "per_page": 100,
+                        "page": page,
+                    },
+                    timeout=_GITLAB_API_TIMEOUT,
+                )
+                if resp.status_code == 404:
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"path not found: {owner}/{repo}:"
+                            f"{path or '(root)'}@{branch}"
+                        ),
+                    }
+                if resp.status_code >= 400:
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"HTTP {resp.status_code}: "
+                            f"{resp.text[:300]}"
+                        ),
+                    }
+                for e in (resp.json() or []):
+                    entries.append({
+                        "path": e.get("path", ""),
+                        "name": e.get("name", ""),
+                        "type": (
+                            "file" if e.get("type") == "blob" else "dir"
+                        ),
+                        "sha": e.get("id", ""),
+                    })
+                    if len(entries) >= max_entries:
+                        truncated = True
+                        break
+                if truncated:
+                    break
+                next_page = resp.headers.get("X-Next-Page", "")
+                if not next_page:
+                    break
+                try:
+                    page = int(next_page)
+                except ValueError:
+                    break
+
+            files = [e for e in entries if e["type"] == "file"]
+            return {
+                "ok": True,
+                "ref": branch,
+                "root": path,
+                "total": len(entries),
+                "file_count": len(files),
+                "dir_count": len(entries) - len(files),
+                "truncated": truncated,
+                "entries": entries,
+            }
+        except Exception as e:
+            logger.error(
+                f"[GITLAB_LIST_TREE] unexpected error: {e}",
+                exc_info=True,
+            )
+            return {
+                "ok": False,
+                "error": f"{type(e).__name__}: {str(e)[:200]}",
+            }
+
+
+    # ==================================================================
+    # Endpoint: grep_tree
+    # ==================================================================
+    @router.post("/grep-tree")
+    async def core_gitlab_grep_tree(request: dict):
+        """リポジトリ全体を一度に取って正規表現で横断検索する。
+
+        archive.tar.gz を 1 回だけ取得して展開せずに読むので、
+        ファイルごとに API を叩くより遥かに速い。
+
+        Body:
+          owner / repo / pattern (必須)
+          path (任意): この配下だけを対象にする
+          ref (任意)
+          glob (任意): 対象にするファイル名の形 (例 "*.py")
+          exclude_glob (任意)
+          ignore_case (任意、 既定 False)
+          context (任意、 既定 2、 上限 20)
+          max_matches (任意、 既定 50、 上限 500)
+          max_file_bytes (任意、 既定 1048576)
+          user_id / gitlab_host (任意)
+        """
+        import fnmatch as _fnmatch
+        import io as _io
+        import re as _re
+        import tarfile as _tarfile
+
+        owner = (request.get("owner") or "").strip()
+        repo = (request.get("repo") or "").strip()
+        pattern = request.get("pattern") or ""
+        path = (request.get("path") or "").strip().strip("/")
+        ref = request.get("ref") or None
+        glob = (request.get("glob") or "").strip()
+        exclude_glob = (request.get("exclude_glob") or "").strip()
+        ignore_case = bool(request.get("ignore_case", False))
+        try:
+            context = int(request.get("context") or 2)
+        except Exception:
+            context = 2
+        context = max(0, min(context, 20))
+        try:
+            max_matches = int(request.get("max_matches") or 50)
+        except Exception:
+            max_matches = 50
+        max_matches = max(1, min(max_matches, 500))
+        try:
+            max_file_bytes = int(
+                request.get("max_file_bytes") or 1048576
+            )
+        except Exception:
+            max_file_bytes = 1048576
+
+        if not owner or not repo or not pattern:
+            return {
+                "ok": False,
+                "error": "owner, repo, pattern are required",
+            }
+
+        try:
+            flags = _re.MULTILINE | (_re.IGNORECASE if ignore_case else 0)
+            rx = _re.compile(pattern, flags)
+        except Exception as e:
+            return {"ok": False, "error": f"invalid pattern: {e}"}
+
+        client = _get_client(request)
+        try:
+            project = client.encode_project(owner, repo)
+            branch = ref or client.resolve_default_branch(owner, repo)
+            url = (
+                f"{client.base_url}/projects/{project}"
+                f"/repository/archive.tar.gz"
+            )
+            resp = requests.get(
+                url,
+                headers=client.headers,
+                params={"sha": branch},
+                timeout=300,
+            )
+            if resp.status_code >= 400:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"archive HTTP {resp.status_code}: "
+                        f"{resp.text[:200]}"
+                    ),
+                }
+
+            tar = _tarfile.open(
+                fileobj=_io.BytesIO(resp.content), mode="r:gz",
+            )
+            results = []
+            scanned = 0
+            matched_files = 0
+            truncated = False
+
+            for member in tar:
+                if not member.isfile():
+                    continue
+                # 先頭のディレクトリ名 (repo-branch-sha/) を落とす
+                parts = member.name.split("/", 1)
+                rel = parts[1] if len(parts) == 2 else member.name
+                if not rel:
+                    continue
+                if path and not (
+                    rel == path or rel.startswith(path + "/")
+                ):
+                    continue
+                base = rel.rsplit("/", 1)[-1]
+                if glob and not (
+                    _fnmatch.fnmatch(rel, glob)
+                    or _fnmatch.fnmatch(base, glob)
+                ):
+                    continue
+                if exclude_glob and (
+                    _fnmatch.fnmatch(rel, exclude_glob)
+                    or _fnmatch.fnmatch(base, exclude_glob)
+                ):
+                    continue
+                if member.size > max_file_bytes:
+                    continue
+
+                f = tar.extractfile(member)
+                if f is None:
+                    continue
+                raw = f.read()
+                if b"\x00" in raw[:8000]:
+                    continue  # バイナリは飛ばす
+                scanned += 1
+                text = raw.decode("utf-8", errors="replace")
+                lines = text.split("\n")
+                hits = []
+                for i, line in enumerate(lines):
+                    if not rx.search(line):
+                        continue
+                    lo = max(0, i - context)
+                    hi = min(len(lines), i + context + 1)
+                    hits.append({
+                        "line": i + 1,
+                        "text": line[:500],
+                        "context": "\n".join(lines[lo:hi])[:3000],
+                    })
+                    if len(results) + len(hits) >= max_matches:
+                        truncated = True
+                        break
+                if hits:
+                    matched_files += 1
+                    results.append({"path": rel, "matches": hits})
+                if truncated:
+                    break
+
+            tar.close()
+            total = sum(len(r["matches"]) for r in results)
+            return {
+                "ok": True,
+                "ref": branch,
+                "pattern": pattern,
+                "scanned_files": scanned,
+                "matched_files": matched_files,
+                "total_matches": total,
+                "truncated": truncated,
+                "results": results,
+            }
+        except Exception as e:
+            logger.error(
+                f"[GITLAB_GREP_TREE] unexpected error: {e}",
+                exc_info=True,
+            )
+            return {
+                "ok": False,
+                "error": f"{type(e).__name__}: {str(e)[:200]}",
+            }
+
+
+    # ==================================================================
+    # Endpoint: copy_file
+    # ==================================================================
+    @router.post("/copy-file")
+    async def core_gitlab_copy_file(request: dict):
+        """ファイルを別のパス (別リポジトリも可) に写す。
+
+        Body:
+          owner / repo / path (必須): コピー元
+          dest_path (必須): コピー先のパス
+          dest_owner / dest_repo (任意): 省略時はコピー元と同じ
+          ref (任意): コピー元のブランチ or コミット
+          branch (任意): コピー先のブランチ
+          message (任意): commit message
+          overwrite (任意、 既定 True): False なら既存があれば中止
+          user_id / gitlab_host (任意)
+        """
+        owner = (request.get("owner") or "").strip()
+        repo = (request.get("repo") or "").strip()
+        path = (request.get("path") or "").strip()
+        dest_owner = (request.get("dest_owner") or owner).strip()
+        dest_repo = (request.get("dest_repo") or repo).strip()
+        dest_path = (request.get("dest_path") or "").strip()
+        ref = request.get("ref") or None
+        branch = request.get("branch") or None
+        overwrite = bool(request.get("overwrite", True))
+        message = (
+            request.get("message")
+            or f"copy {owner}/{repo}:{path} -> {dest_path}"
+        )
+
+        if not owner or not repo or not path or not dest_path:
+            return {
+                "ok": False,
+                "error": "owner, repo, path, dest_path are required",
+            }
+
+        client = _get_client(request)
+        try:
+            got = client.get_file(owner, repo, path, ref=ref)
+            if not got.get("ok"):
+                return got
+
+            if not overwrite:
+                dest_branch = (
+                    branch
+                    or client.resolve_default_branch(
+                        dest_owner, dest_repo
+                    )
+                )
+                found = client._find_blob_sha(
+                    dest_owner, dest_repo, dest_path, dest_branch,
+                )
+                if found.get("ok") and found.get("sha"):
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"dest already exists: "
+                            f"{dest_owner}/{dest_repo}:{dest_path} "
+                            f"(overwrite=false)"
+                        ),
+                    }
+
+            put = client.put_file(
+                dest_owner, dest_repo, dest_path,
+                got.get("content", ""), message, branch=branch,
+            )
+            if put.get("ok"):
+                put["source"] = f"{owner}/{repo}:{path}"
+                put["bytes"] = got.get("size", 0)
+            return put
+        except Exception as e:
+            logger.error(
+                f"[GITLAB_COPY_FILE] unexpected error: {e}",
+                exc_info=True,
+            )
+            return {
+                "ok": False,
+                "error": f"{type(e).__name__}: {str(e)[:200]}",
+            }
+
+
+    # ==================================================================
+    # Endpoint: regex_replace
+    # ==================================================================
+    @router.post("/regex-replace")
+    async def core_gitlab_regex_replace(request: dict):
+        """正規表現で置換して push する。
+
+        Body:
+          owner / repo / path / pattern (必須)
+          replacement (必須): \\1 などの後方参照が使える
+          message (必須、 dry_run のときは不要)
+          branch (任意)
+          count (任意、 既定 0 = すべて)
+          expected_count (任意): 置換件数がこの数でなければ中止する安全装置
+          ignore_case / multiline / dotall (任意、 既定 False)
+          dry_run (任意、 既定 False): 置換件数と差分だけ返して push しない
+          user_id / gitlab_host (任意)
+        """
+        import re as _re
+
+        owner = (request.get("owner") or "").strip()
+        repo = (request.get("repo") or "").strip()
+        path = (request.get("path") or "").strip()
+        pattern = request.get("pattern") or ""
+        replacement = request.get("replacement")
+        message = (request.get("message") or "").strip()
+        branch = request.get("branch") or None
+        dry_run = bool(request.get("dry_run", False))
+        try:
+            count = int(request.get("count") or 0)
+        except Exception:
+            count = 0
+        expected_count = request.get("expected_count")
+
+        if not owner or not repo or not path or not pattern:
+            return {
+                "ok": False,
+                "error": "owner, repo, path, pattern are required",
+            }
+        if replacement is None:
+            return {"ok": False, "error": "replacement is required"}
+        if not dry_run and not message:
+            return {"ok": False, "error": "message is required"}
+
+        flags = 0
+        if request.get("ignore_case"):
+            flags |= _re.IGNORECASE
+        if request.get("multiline", True):
+            flags |= _re.MULTILINE
+        if request.get("dotall"):
+            flags |= _re.DOTALL
+
+        try:
+            rx = _re.compile(pattern, flags)
+        except Exception as e:
+            return {"ok": False, "error": f"invalid pattern: {e}"}
+
+        client = _get_client(request)
+        try:
+            got = client.get_file(owner, repo, path, ref=branch)
+            if not got.get("ok"):
+                return got
+            before = got.get("content", "")
+            found = len(rx.findall(before))
+            if found == 0:
+                return {
+                    "ok": False,
+                    "error": "pattern did not match anything",
+                    "matched": 0,
+                }
+            if expected_count is not None:
+                try:
+                    want = int(expected_count)
+                except Exception:
+                    want = -1
+                if want >= 0 and found != want:
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"match count mismatch: "
+                            f"expected {want}, found {found}"
+                        ),
+                        "matched": found,
+                    }
+
+            after = rx.sub(replacement, before, count=count)
+            if after == before:
+                return {
+                    "ok": False,
+                    "error": "replacement produced no change",
+                    "matched": found,
+                }
+
+            replaced = found if count == 0 else min(count, found)
+            if dry_run:
+                helpers = _gl_text_helpers()
+                diff = helpers["unified_diff"](
+                    before.split("\n"), after.split("\n"), path,
+                )
+                return {
+                    "ok": True,
+                    "dry_run": True,
+                    "matched": found,
+                    "replaced": replaced,
+                    "size_before": len(before),
+                    "size_after": len(after),
+                    "diff": diff,
+                }
+
+            put = client.put_file(
+                owner, repo, path, after, message, branch=branch,
+            )
+            if put.get("ok"):
+                put["matched"] = found
+                put["replaced"] = replaced
+                put["size_before"] = len(before)
+                put["size_after"] = len(after)
+            return put
+        except Exception as e:
+            logger.error(
+                f"[GITLAB_REGEX_REPLACE] unexpected error: {e}",
+                exc_info=True,
+            )
+            return {
+                "ok": False,
+                "error": f"{type(e).__name__}: {str(e)[:200]}",
+            }
+
+
+    # ==================================================================
+    # Endpoint: str_replace_dryrun
+    # ==================================================================
+    @router.post("/str-replace-dryrun")
+    async def core_gitlab_str_replace_dryrun(request: dict):
+        """置換を実際には行わず、 件数と差分だけ返す。
+
+        Body:
+          owner / repo / path / old_str (必須)
+          new_str (任意、 既定 "" = 削除)
+          branch (任意)
+          count (任意、 既定 1): 期待される出現回数
+          user_id / gitlab_host (任意)
+        """
+        owner = (request.get("owner") or "").strip()
+        repo = (request.get("repo") or "").strip()
+        path = (request.get("path") or "").strip()
+        old_str = request.get("old_str") or ""
+        new_str = request.get("new_str") or ""
+        branch = request.get("branch") or None
+        try:
+            expect = int(request.get("count") or 1)
+        except Exception:
+            expect = 1
+
+        if not owner or not repo or not path or not old_str:
+            return {
+                "ok": False,
+                "error": "owner, repo, path, old_str are required",
+            }
+
+        client = _get_client(request)
+        try:
+            got = client.get_file(owner, repo, path, ref=branch)
+            if not got.get("ok"):
+                return got
+            before = got.get("content", "")
+            occurrences = before.count(old_str)
+            if occurrences == 0:
+                return {
+                    "ok": False,
+                    "occurrences": 0,
+                    "error": "old_str not found",
+                }
+            if occurrences != expect:
+                return {
+                    "ok": False,
+                    "occurrences": occurrences,
+                    "error": (
+                        f"occurrence mismatch: expected {expect}, "
+                        f"found {occurrences}"
+                    ),
+                }
+            after = before.replace(old_str, new_str, expect)
+            helpers = _gl_text_helpers()
+            diff = helpers["unified_diff"](
+                before.split("\n"), after.split("\n"), path,
+            )
+            return {
+                "ok": True,
+                "dry_run": True,
+                "occurrences": occurrences,
+                "size_before": len(before),
+                "size_after": len(after),
+                "diff": diff,
+            }
+        except Exception as e:
+            logger.error(
+                f"[GITLAB_STR_REPLACE_DRYRUN] unexpected error: {e}",
+                exc_info=True,
+            )
+            return {
+                "ok": False,
+                "error": f"{type(e).__name__}: {str(e)[:200]}",
+            }
+
+
+    # ==================================================================
+    # Endpoint: get_outline / get_symbol
+    # ==================================================================
+    def _gl_outline_of_text(text: str, path: str, treat_as: str):
+        """中身からアウトラインを作る。 github_ops の補助をそのまま使う。
+
+        Returns: (language, symbols, yaml_python_block, error)
+        """
+        helpers = _gl_text_helpers()
+        path_lower = path.lower()
+        if treat_as == "auto":
+            if path_lower.endswith(".py"):
+                lang = "python"
+            elif path_lower.endswith((".yaml", ".yml")):
+                block = helpers["find_literal_block"](text)
+                lang = "python_in_yaml" if block else "yaml"
+            else:
+                lang = "yaml"
+        else:
+            lang = treat_as
+
+        if lang == "python":
+            symbols, err = helpers["python_outline"](text)
+            return lang, symbols or [], None, err
+        if lang == "python_in_yaml":
+            block = helpers["find_literal_block"](text)
+            if not block:
+                return (
+                    lang, [], None,
+                    "no `<name>.py: |` literal block found",
+                )
+            py_source = helpers["extract_python_from_yaml"](text, block)
+            offset = block["content_start_line"] - 1
+            symbols, err = helpers["python_outline"](
+                py_source, line_offset=offset,
+            )
+            return lang, symbols or [], block, err
+        symbols, err = helpers["yaml_outline"](text)
+        return "yaml", symbols or [], None, err
+
+
+    @router.post("/get-outline")
+    async def core_gitlab_get_outline(request: dict):
+        """ファイル構造のアウトライン (シンボル名 + 行範囲) を返す。
+
+        対応:
+          - .py: Python の top-level def/class + クラス内 method
+          - .yaml/.yml: top-level key、 K8s マニフェストなら kind+name
+          - data: <name>.py: | (YAML 内に埋め込まれた Python):
+            treat_as="auto" で自動的に Python として扱う
+
+        Body:
+          owner / repo / path (必須)
+          branch (任意)
+          treat_as (任意): "auto" (既定) / "python" / "yaml" /
+                           "python_in_yaml"
+          user_id / gitlab_host (任意)
+        """
+        owner = (request.get("owner") or "").strip()
+        repo = (request.get("repo") or "").strip()
+        path = (request.get("path") or "").strip()
+        branch = request.get("branch") or None
+        treat_as = (
+            request.get("treat_as") or "auto"
+        ).strip().lower()
+
+        if not owner or not repo or not path:
+            return {
+                "ok": False, "language": "", "total_lines": 0,
+                "symbols": [], "yaml_python_block": None,
+                "error": "owner, repo, path are required",
+            }
+
+        client = _get_client(request)
+        try:
+            got = client.get_file(owner, repo, path, ref=branch)
+            if not got.get("ok"):
+                return {
+                    "ok": False, "language": "", "total_lines": 0,
+                    "symbols": [], "yaml_python_block": None,
+                    "error": got.get("error", "get_file failed"),
+                }
+            text = got.get("content", "")
+            total_lines = text.count("\n") + 1
+            lang, symbols, block, err = _gl_outline_of_text(
+                text, path, treat_as,
+            )
+            return {
+                "ok": err is None,
+                "language": lang,
+                "total_lines": total_lines,
+                "symbols": symbols,
+                "yaml_python_block": block,
+                "error": err,
+            }
+        except Exception as e:
+            logger.error(
+                f"[GITLAB_GET_OUTLINE] unexpected error: {e}",
+                exc_info=True,
+            )
+            return {
+                "ok": False, "language": "", "total_lines": 0,
+                "symbols": [], "yaml_python_block": None,
+                "error": f"{type(e).__name__}: {str(e)[:200]}",
+            }
+
+
+    @router.post("/get-symbol")
+    async def core_gitlab_get_symbol(request: dict):
+        """名前を指定して、 そのシンボルの本文だけを取り出す。
+
+        Body:
+          owner / repo / path / symbol (必須)
+          symbol は "ClassName.method" の形でも指定できる
+          branch (任意)
+          treat_as (任意、 既定 "auto")
+          user_id / gitlab_host (任意)
+        """
+        owner = (request.get("owner") or "").strip()
+        repo = (request.get("repo") or "").strip()
+        path = (request.get("path") or "").strip()
+        symbol = (request.get("symbol") or "").strip()
+        branch = request.get("branch") or None
+        treat_as = (
+            request.get("treat_as") or "auto"
+        ).strip().lower()
+
+        if not owner or not repo or not path or not symbol:
+            return {
+                "ok": False,
+                "error": "owner, repo, path, symbol are required",
+            }
+
+        client = _get_client(request)
+        try:
+            got = client.get_file(owner, repo, path, ref=branch)
+            if not got.get("ok"):
+                return got
+            text = got.get("content", "")
+            lang, symbols, block, err = _gl_outline_of_text(
+                text, path, treat_as,
+            )
+            if err:
+                return {"ok": False, "language": lang, "error": err}
+
+            want = symbol.split(".")
+            node = None
+            for s in symbols:
+                if s.get("name") != want[0]:
+                    continue
+                if len(want) == 1:
+                    node = s
+                    break
+                for c in s.get("children") or []:
+                    if c.get("name") == want[1]:
+                        node = c
+                        break
+                break
+            if node is None:
+                names = []
+                for s in symbols:
+                    names.append(s.get("name", ""))
+                    for c in s.get("children") or []:
+                        names.append(
+                            f"{s.get('name', '')}.{c.get('name', '')}"
+                        )
+                return {
+                    "ok": False,
+                    "language": lang,
+                    "error": f"symbol not found: {symbol}",
+                    "available": names[:200],
+                }
+
+            lines = text.split("\n")
+            start = max(1, int(node.get("start_line", 1)))
+            end = min(len(lines), int(node.get("end_line", start)))
+            body = "\n".join(lines[start - 1:end])
+            return {
+                "ok": True,
+                "language": lang,
+                "symbol": symbol,
+                "kind": node.get("kind", ""),
+                "start_line": start,
+                "end_line": end,
+                "total_lines": len(lines),
+                "content": body,
+                "yaml_python_block": block,
+            }
+        except Exception as e:
+            logger.error(
+                f"[GITLAB_GET_SYMBOL] unexpected error: {e}",
+                exc_info=True,
+            )
+            return {
+                "ok": False,
+                "error": f"{type(e).__name__}: {str(e)[:200]}",
+            }
+
+
+    # ==================================================================
+    # Endpoint: タグ (チェックポイント) 4 本
+    #
+    # GitLab のタグ名はパスの一部に入るので、 Cloudflare の経路では
+    # "/" を含む名前が使えない。 作成時に弾く。
+    # ==================================================================
+
+    def _gl_tag_name_ok(name: str) -> bool:
+        return bool(name) and "/" not in name and " " not in name
+
+
+    @router.post("/create-tag")
+    async def core_gitlab_create_tag(request: dict):
+        """いまの状態にタグを打つ (チェックポイント)。
+
+        Body:
+          owner / repo / tag (必須)
+          ref (任意): 対象のブランチ or コミット (省略時 default branch)
+          message (任意): 注釈タグにする場合の本文
+          user_id / gitlab_host (任意)
+        """
+        owner = (request.get("owner") or "").strip()
+        repo = (request.get("repo") or "").strip()
+        tag = (request.get("tag") or "").strip()
+        ref = request.get("ref") or None
+        message = request.get("message") or ""
+
+        if not owner or not repo or not tag:
+            return {"ok": False, "error": "owner, repo, tag are required"}
+        if not _gl_tag_name_ok(tag):
+            return {
+                "ok": False,
+                "error": (
+                    "タグ名に / と空白は使えません "
+                    "(Cloudflare 経路の制約)"
+                ),
+            }
+
+        client = _get_client(request)
+        try:
+            project = client.encode_project(owner, repo)
+            branch = ref or client.resolve_default_branch(owner, repo)
+            url = (
+                f"{client.base_url}/projects/{project}/repository/tags"
+            )
+            body = {"tag_name": tag, "ref": branch}
+            if message:
+                body["message"] = message
+            resp = requests.post(
+                url,
+                headers={
+                    **client.headers,
+                    "Content-Type": "application/json",
+                },
+                json=body,
+                timeout=_GITLAB_API_TIMEOUT,
+            )
+            if resp.status_code in (200, 201):
+                d = resp.json() or {}
+                commit = d.get("commit") or {}
+                return {
+                    "ok": True,
+                    "tag": d.get("name", tag),
+                    "ref": branch,
+                    "commit_sha": commit.get("id", ""),
+                }
+            return {
+                "ok": False,
+                "error": f"HTTP {resp.status_code}: {resp.text[:300]}",
+            }
+        except Exception as e:
+            logger.error(
+                f"[GITLAB_CREATE_TAG] unexpected error: {e}",
+                exc_info=True,
+            )
+            return {
+                "ok": False,
+                "error": f"{type(e).__name__}: {str(e)[:200]}",
+            }
+
+
+    @router.post("/list-tags")
+    async def core_gitlab_list_tags(request: dict):
+        """タグ (チェックポイント) の一覧を新しい順に返す。
+
+        Body:
+          owner / repo (必須)
+          search (任意): 名前の部分一致で絞る
+          limit (任意、 既定 50、 上限 200)
+          user_id / gitlab_host (任意)
+        """
+        owner = (request.get("owner") or "").strip()
+        repo = (request.get("repo") or "").strip()
+        search = (request.get("search") or "").strip()
+        try:
+            limit = int(request.get("limit") or 50)
+        except Exception:
+            limit = 50
+        limit = max(1, min(limit, 200))
+
+        if not owner or not repo:
+            return {"ok": False, "error": "owner, repo are required"}
+
+        client = _get_client(request)
+        try:
+            project = client.encode_project(owner, repo)
+            url = (
+                f"{client.base_url}/projects/{project}/repository/tags"
+            )
+            params = {
+                "per_page": min(limit, 100),
+                "order_by": "updated",
+                "sort": "desc",
+            }
+            if search:
+                params["search"] = search
+            resp = requests.get(
+                url,
+                headers=client.headers,
+                params=params,
+                timeout=_GITLAB_API_TIMEOUT,
+            )
+            if resp.status_code >= 400:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"HTTP {resp.status_code}: {resp.text[:300]}"
+                    ),
+                }
+            tags = []
+            for t in (resp.json() or [])[:limit]:
+                commit = t.get("commit") or {}
+                tags.append({
+                    "tag": t.get("name", ""),
+                    "commit_sha": commit.get("id", ""),
+                    "created_at": commit.get("created_at", ""),
+                    "title": commit.get("title", ""),
+                    "message": t.get("message") or "",
+                })
+            return {"ok": True, "count": len(tags), "tags": tags}
+        except Exception as e:
+            logger.error(
+                f"[GITLAB_LIST_TAGS] unexpected error: {e}",
+                exc_info=True,
+            )
+            return {
+                "ok": False,
+                "error": f"{type(e).__name__}: {str(e)[:200]}",
+            }
+
+
+    @router.post("/delete-tag")
+    async def core_gitlab_delete_tag(request: dict):
+        """タグ (チェックポイント) を消す。
+
+        Body:
+          owner / repo / tag (必須)
+          user_id / gitlab_host (任意)
+        """
+        owner = (request.get("owner") or "").strip()
+        repo = (request.get("repo") or "").strip()
+        tag = (request.get("tag") or "").strip()
+
+        if not owner or not repo or not tag:
+            return {"ok": False, "error": "owner, repo, tag are required"}
+        if not _gl_tag_name_ok(tag):
+            return {
+                "ok": False,
+                "error": "タグ名に / と空白は使えません",
+            }
+
+        client = _get_client(request)
+        try:
+            project = client.encode_project(owner, repo)
+            url = (
+                f"{client.base_url}/projects/{project}"
+                f"/repository/tags/{quote(tag, safe='')}"
+            )
+            resp = requests.delete(
+                url,
+                headers=client.headers,
+                timeout=_GITLAB_API_TIMEOUT,
+            )
+            if resp.status_code in (200, 204):
+                return {"ok": True, "tag": tag, "deleted": True}
+            if resp.status_code == 404:
+                return {
+                    "ok": True,
+                    "tag": tag,
+                    "deleted": False,
+                    "note": "そのタグはありません",
+                }
+            return {
+                "ok": False,
+                "error": f"HTTP {resp.status_code}: {resp.text[:300]}",
+            }
+        except Exception as e:
+            logger.error(
+                f"[GITLAB_DELETE_TAG] unexpected error: {e}",
+                exc_info=True,
+            )
+            return {
+                "ok": False,
+                "error": f"{type(e).__name__}: {str(e)[:200]}",
+            }
+
+
+    # ==================================================================
+    # Endpoint: restore_from_ref (タグ / コミットから書き戻す)
+    # ==================================================================
+    @router.post("/restore-from-ref")
+    async def core_gitlab_restore_from_ref(request: dict):
+        """過去のタグやコミットの内容でファイルを書き戻す。
+
+        安全のため、 対象は必ずファイル 1 本。 リポジトリ全体の巻き戻しは
+        この口では行わない (git_mirror / git_path_sync を使うこと)。
+
+        Body:
+          owner / repo / path / from_ref (必須)
+            from_ref はタグ名でもコミット SHA でもよい
+          branch (任意): 書き戻し先のブランチ
+          message (任意)
+          dry_run (任意、 既定 False): 差分だけ返して push しない
+          user_id / gitlab_host (任意)
+        """
+        owner = (request.get("owner") or "").strip()
+        repo = (request.get("repo") or "").strip()
+        path = (request.get("path") or "").strip()
+        from_ref = (request.get("from_ref") or "").strip()
+        branch = request.get("branch") or None
+        dry_run = bool(request.get("dry_run", False))
+        message = (
+            request.get("message")
+            or f"restore {path} from {from_ref}"
+        )
+
+        if not owner or not repo or not path or not from_ref:
+            return {
+                "ok": False,
+                "error": "owner, repo, path, from_ref are required",
+            }
+
+        client = _get_client(request)
+        try:
+            old = client.get_file(owner, repo, path, ref=from_ref)
+            if not old.get("ok"):
+                return old
+            old_text = old.get("content", "")
+
+            cur = client.get_file(owner, repo, path, ref=branch)
+            cur_text = cur.get("content", "") if cur.get("ok") else ""
+
+            if cur.get("ok") and cur_text == old_text:
+                return {
+                    "ok": True,
+                    "changed": False,
+                    "note": "いまの内容と同じです",
+                    "from_ref": from_ref,
+                }
+
+            if dry_run:
+                helpers = _gl_text_helpers()
+                diff = helpers["unified_diff"](
+                    cur_text.split("\n"), old_text.split("\n"), path,
+                )
+                return {
+                    "ok": True,
+                    "dry_run": True,
+                    "changed": True,
+                    "from_ref": from_ref,
+                    "size_before": len(cur_text),
+                    "size_after": len(old_text),
+                    "diff": diff,
+                }
+
+            put = client.put_file(
+                owner, repo, path, old_text, message, branch=branch,
+            )
+            if put.get("ok"):
+                put["changed"] = True
+                put["from_ref"] = from_ref
+                put["size_before"] = len(cur_text)
+                put["size_after"] = len(old_text)
+            return put
+        except Exception as e:
+            logger.error(
+                f"[GITLAB_RESTORE_FROM_REF] unexpected error: {e}",
+                exc_info=True,
+            )
+            return {
+                "ok": False,
+                "error": f"{type(e).__name__}: {str(e)[:200]}",
+            }

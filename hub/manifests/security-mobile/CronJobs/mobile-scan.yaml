@@ -1,0 +1,120 @@
+---
+# Weekly mobile-scan CronJob.
+#
+# Runs mobile_scan.py against every enabled entry in the
+# mobile-scan-targets ConfigMap.
+#
+# The runner does NOT read a Kubernetes Secret for GitHub
+# credentials. Instead it asks the kernel at
+# /core/git_credentials/github/org/{owner}/token for a token per
+# owner, so a single run can span multiple GitHub orgs without
+# preloading secrets in this namespace.
+#
+# Defaults to suspend: true so a fresh install does not fire before
+# the operator has swapped in real targets and done a dry run. Flip
+# to false once mobile-scan-targets has been reviewed and a manual
+# test run has looked reasonable.
+#
+# To trigger a manual run:
+#   kubectl -n security-mobile create job mobile-scan-manual-$(date +%s) \
+#     --from=cronjob/mobile-scan
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: mobile-scan
+  namespace: security-mobile
+  labels:
+    purpose: mobile-vulnerability-scan
+spec:
+  # Weekly at 03:00 UTC on Monday.
+  schedule: "0 3 * * 1"
+  suspend: true
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # Each target scan is a few seconds, times N targets, so a whole
+      # run should fit in a few minutes. 30 minutes is the hard cap.
+      activeDeadlineSeconds: 1800
+      # Each scan emits vuln events on the kernel and is not
+      # idempotent, so a retry after a partial success would re-POST
+      # every target that already succeeded. backoffLimit: 0 disables
+      # retries.
+      backoffLimit: 0
+      ttlSecondsAfterFinished: 86400  # deleted 24h after completion
+      template:
+        metadata:
+          labels:
+            purpose: mobile-vulnerability-scan
+        spec:
+          restartPolicy: Never
+          # Clones and scan intermediates live in an emptyDir.
+          containers:
+            - name: runner
+              image: python:3.12-alpine
+              imagePullPolicy: IfNotPresent
+              command:
+                - sh
+                - -c
+                - |
+                  set -e
+                  apk add --no-cache git ca-certificates >/dev/null
+                  pip install --quiet --root-user-action=ignore pyyaml
+                  exec python3 /runner/scan_runner.py
+              env:
+                # No GITHUB_TOKEN here. The runner fetches a PAT per
+                # target from the kernel's Git credentials store at
+                # /core/git_credentials/github/org/{owner}/token.
+                - name: KERNEL_URL
+                  value: "http://rag-backend-kernel.rag-company1.svc.cluster.local:8000"
+                - name: TARGETS_CONFIG_PATH
+                  value: "/config/targets.yaml"
+                - name: SCANNER_SCRIPT_PATH
+                  value: "/scripts/mobile_scan.py"
+                # First rollout should be DRY_RUN=true so no vuln
+                # events are POSTed to the kernel until the operator
+                # has looked at the output.
+                - name: DRY_RUN
+                  value: "true"
+              volumeMounts:
+                - name: runner-script
+                  mountPath: /runner
+                  readOnly: true
+                - name: scanner-script
+                  mountPath: /scripts
+                  readOnly: true
+                - name: targets-config
+                  mountPath: /config
+                  readOnly: true
+                - name: workdir
+                  mountPath: /tmp
+              resources:
+                requests:
+                  cpu: "50m"
+                  memory: "128Mi"
+                limits:
+                  cpu: "500m"
+                  memory: "512Mi"
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
+                readOnlyRootFilesystem: false  # apk / pip write here
+                runAsNonRoot: false  # apk add needs root
+          volumes:
+            - name: runner-script
+              configMap:
+                name: mobile-scan-runner
+                defaultMode: 0555
+            - name: scanner-script
+              configMap:
+                name: mobile-scan-script
+                defaultMode: 0555
+            - name: targets-config
+              configMap:
+                name: mobile-scan-targets
+                defaultMode: 0444
+            - name: workdir
+              emptyDir:
+                sizeLimit: 500Mi

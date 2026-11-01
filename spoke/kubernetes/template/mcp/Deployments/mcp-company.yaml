@@ -1,0 +1,120 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-company1
+  namespace: rag-spoke
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: mcp-company1
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: mcp-company1
+      namespace: rag-spoke
+      annotations:
+        restarted-at: "2026-06-07T04:00:00Z"
+    spec:
+      serviceAccountName: mcp-spoke
+      containers:
+        - env:
+            - name: TENANT_NAME
+              value: company1
+            - name: RAG_BACKEND_URL
+              value: http://rag-backend-kernel.rag-spoke.svc.cluster.local:8000
+            - name: KERNEL_URL
+              value: http://rag-backend-kernel.rag-spoke.svc.cluster.local:8000
+            - name: MCP_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: api-key
+                  name: mcp-api-key
+            - name: MCP_AUTH_ENABLED
+              value: 'true'
+            - name: KEYCLOAK_URL
+              value: https://keycloak.example.com
+            - name: KEYCLOAK_REALM
+              value: rag
+            - name: KEYCLOAK_CLIENT_ID
+              value: mcp-server
+            - name: KEYCLOAK_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  key: client-secret
+                  name: keycloak-client-secret
+            - name: MCP_OAUTH_ENABLED
+              value: 'true'
+            - name: KEYCLOAK_INTERNAL_URL
+              value: https://keycloak.example.com
+            - name: NODE_SHELL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: node-shell-auth
+                  key: api_key
+          image: rag-mcp-server:latest
+          imagePullPolicy: Always
+          name: mcp-server
+          ports:
+            - containerPort: 8000
+              name: 8000tcp
+              protocol: TCP
+          readinessProbe:
+            failureThreshold: 3
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            successThreshold: 1
+            tcpSocket:
+              port: 8000
+            timeoutSeconds: 1
+          resources:
+            limits:
+              cpu: 500m
+              memory: 256Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+            - mountPath: /app/mcp_server.py
+              name: code
+              subPath: mcp_server.py
+            - mountPath: /app/mcp_server_write.py
+              name: code-write
+              subPath: mcp_server_write.py
+            - mountPath: /app/mcp_server_k8s.py
+              name: code-k8s
+              subPath: mcp_server_k8s.py
+            - mountPath: /app/mcp_server_node_ops.py
+              name: code-node-ops
+              subPath: mcp_server_node_ops.py
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
+      volumes:
+        - configMap:
+            defaultMode: 420
+            name: mcp-server-code
+          name: code
+        - configMap:
+            defaultMode: 420
+            name: mcp-server-code-write
+          name: code-write
+        - configMap:
+            defaultMode: 420
+            name: mcp-server-code-k8s
+          name: code-k8s
+        - configMap:
+            defaultMode: 420
+            name: mcp-server-code-node-ops
+          name: code-node-ops

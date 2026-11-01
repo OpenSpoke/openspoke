@@ -1,0 +1,56 @@
+[package]
+name = "tunnel-server"
+version = "0.1.0"
+edition = "2021"
+description = "OpenSpoke hub-side reverse tunnel server (Rust implementation)"
+
+[dependencies]
+# gRPC bidirectional streaming. tunnel-server runs cluster-internal
+# in plaintext (ingress-nginx terminates TLS in front), so TLS
+# features are unnecessary.
+tonic = { version = "0.12", default-features = false, features = [
+    "transport",
+    "codegen",
+    "prost",
+] }
+prost = "0.13"
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "net",
+    "sync",
+    "time",
+    "io-util",
+] }
+tokio-stream = "0.1"
+
+# Structured logging. Emits JSON to stdout to match the previous Go
+# implementation's slog JSON handler.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+# Prometheus metrics plus a small HTTP server that exposes /metrics
+# and /healthz. tonic 0.12 is on hyper 1.x, so axum 0.7 (also hyper
+# 1.x) coexists cleanly.
+prometheus = "0.13"
+axum = "0.7"
+
+# Randomness for handshake nonces (equivalent to Go's crypto/rand).
+rand = "0.8"
+
+# For the application-spoke HTTP proxy to the hub kernel.
+# tunnel-server -> rag-backend-kernel is cluster-internal plaintext,
+# so TLS features are unnecessary.
+reqwest = { version = "0.12", default-features = false, features = ["http2"] }
+
+[build-dependencies]
+tonic-build = { version = "0.12", default-features = false, features = [
+    "transport",
+    "prost",
+] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

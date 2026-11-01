@@ -1,0 +1,161 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: node-shell-server
+  namespace: rag-spoke
+data:
+  server.py: |
+    #!/usr/bin/env python3
+    """node-shell HTTP server.
+
+    DaemonSet として各ノードで動く。 hostPID=true + privileged により
+    nsenter で host の名前空間に入ってコマンドを実行する。 自クラスタの
+    spoke MCP がこの Pod に直接 POST してくる。
+
+    Endpoints:
+      GET  /health        ヘルスチェック
+      POST /exec          コマンド実行 (要 X-Node-Shell-Auth ヘッダ)
+        body: {"command": "<sh string>", "timeout": <sec, default=30, max=300>}
+        resp: {"stdout": "...", "stderr": "...", "exit_code": <int>,
+               "duration_ms": <int>, "truncated": <bool>, "node": "<name>"}
+
+    依存: Python 3.x + util-linux (nsenter)。 python:3.11-slim 標準で揃う。
+    """
+    from __future__ import annotations
+
+    import json
+    import logging
+    import os
+    import subprocess
+    import time
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    from socketserver import ThreadingMixIn
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [node-shell] %(message)s",
+    )
+    logger = logging.getLogger("node-shell")
+
+    API_KEY = os.environ.get("HTTP_API_KEY", "")
+    PORT = int(os.environ.get("PORT", "8080"))
+    NODE_NAME = os.environ.get("NODE_NAME", "unknown")
+    MAX_OUTPUT_BYTES = 1024 * 1024  # 1MB per stream
+    DEFAULT_TIMEOUT = 30
+    MAX_TIMEOUT = 300
+
+    if not API_KEY:
+        logger.error("HTTP_API_KEY env var not set, refusing to start")
+        raise SystemExit(1)
+
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            logger.info("%s - %s", self.address_string(), format % args)
+
+        def _send_json(self, status, body):
+            data = json.dumps(body).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            if self.path in ("/health", "/healthz"):
+                self._send_json(200, {"status": "ok", "node": NODE_NAME})
+                return
+            self._send_json(404, {"error": "not found"})
+
+        def do_POST(self):
+            if self.path != "/exec":
+                self._send_json(404, {"error": "not found"})
+                return
+            if self.headers.get("X-Node-Shell-Auth", "") != API_KEY:
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length) if length else b""
+                req = json.loads(raw.decode("utf-8")) if raw else {}
+            except Exception as e:
+                self._send_json(400, {"error": f"invalid json: {e}"})
+                return
+            command = req.get("command", "")
+            if not isinstance(command, str) or not command:
+                self._send_json(400, {"error": "command (str) required"})
+                return
+            try:
+                timeout = int(req.get("timeout", DEFAULT_TIMEOUT))
+            except Exception:
+                timeout = DEFAULT_TIMEOUT
+            timeout = max(1, min(MAX_TIMEOUT, timeout))
+
+            # host の PID 1 の名前空間に入って bash -c で実行。
+            argv = [
+                "nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p",
+                "--", "bash", "-c", command,
+            ]
+            logger.info("exec node=%s cmd=%r timeout=%ds", NODE_NAME, command[:200], timeout)
+            t0 = time.time()
+            try:
+                proc = subprocess.run(
+                    argv,
+                    capture_output=True,
+                    timeout=timeout,
+                )
+                duration_ms = int((time.time() - t0) * 1000)
+                stdout_raw = proc.stdout or b""
+                stderr_raw = proc.stderr or b""
+                stdout = stdout_raw[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
+                stderr = stderr_raw[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
+                truncated = (
+                    len(stdout_raw) > MAX_OUTPUT_BYTES
+                    or len(stderr_raw) > MAX_OUTPUT_BYTES
+                )
+                self._send_json(200, {
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "exit_code": proc.returncode,
+                    "duration_ms": duration_ms,
+                    "truncated": truncated,
+                    "timeout": False,
+                    "node": NODE_NAME,
+                })
+            except subprocess.TimeoutExpired:
+                duration_ms = int((time.time() - t0) * 1000)
+                self._send_json(200, {
+                    "stdout": "",
+                    "stderr": f"timeout after {timeout}s",
+                    "exit_code": -1,
+                    "duration_ms": duration_ms,
+                    "truncated": False,
+                    "timeout": True,
+                    "node": NODE_NAME,
+                })
+            except FileNotFoundError as e:
+                self._send_json(500, {
+                    "error": f"nsenter not found: {e}",
+                    "node": NODE_NAME,
+                })
+            except Exception as e:
+                logger.exception("unexpected error")
+                self._send_json(500, {
+                    "error": f"{type(e).__name__}: {str(e)[:200]}",
+                    "node": NODE_NAME,
+                })
+
+
+    class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+        daemon_threads = True
+        allow_reuse_address = True
+
+
+    def main():
+        server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+        logger.info("node-shell listening on :%d (node=%s)", PORT, NODE_NAME)
+        server.serve_forever()
+
+
+    if __name__ == "__main__":
+        main()

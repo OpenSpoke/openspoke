@@ -1,0 +1,482 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vuln-scanner-script
+  namespace: security
+data:
+  scan.py: |
+    #!/usr/bin/env python3
+    """
+    OpenSpoke vulnerability scanner
+    rag クラスタの動いている Pod のイメージを Trivy でスキャンして、
+    結果を OpenSearch と MinIO に投入する。
+    """
+    import os
+    import io
+    import sys
+    import json
+    import subprocess
+    import uuid
+    import datetime
+    from collections import defaultdict
+
+    from kubernetes import client, config
+    from minio import Minio
+    import requests
+
+    CLUSTER_NAME = os.environ.get('CLUSTER_NAME', 'rag')
+    OPENSEARCH_URL = os.environ.get('OPENSEARCH_URL', 'http://opensearch.opensearch.svc.cluster.local:9200')
+    MINIO_ENDPOINT = os.environ.get('MINIO_ENDPOINT', 'minio.milvus.svc.cluster.local:9000')
+    MINIO_ACCESS_KEY = os.environ.get('MINIO_ACCESS_KEY', 'minioadmin')
+    MINIO_SECRET_KEY = os.environ.get('MINIO_SECRET_KEY', 'minioadminpassword')
+    MINIO_BUCKET = os.environ.get('MINIO_BUCKET', 'security-scans')
+    TRIVY_VERSION = os.environ.get('TRIVY_VERSION', 'v0.72.0')
+    TRIVY_IMAGE_DIGEST = os.environ.get('TRIVY_IMAGE_DIGEST', '')
+    TARGET_IMAGE_PATTERNS = [
+        p.strip() for p in os.environ.get('TARGET_IMAGE_PATTERNS', '').split(',') if p.strip()
+    ]
+
+
+    def matches_target(image_tag):
+        if not TARGET_IMAGE_PATTERNS:
+            return True
+        return any(pat in image_tag for pat in TARGET_IMAGE_PATTERNS)
+
+
+    def now_utc():
+        return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+    def list_all_pod_images():
+        config.load_incluster_config()
+        v1 = client.CoreV1Api()
+        pods = v1.list_pod_for_all_namespaces()
+        digest_to_pods = defaultdict(list)
+        digest_to_image = {}
+        for pod in pods.items:
+            if pod.status.phase not in ('Running', 'Pending', 'Succeeded'):
+                continue
+            spec_containers = list(pod.spec.containers or []) + list(pod.spec.init_containers or [])
+            status_containers = list(pod.status.container_statuses or []) + list(pod.status.init_container_statuses or [])
+            status_by_name = {s.name: s for s in status_containers}
+            for c in spec_containers:
+                status = status_by_name.get(c.name)
+                if not status or not status.image_id:
+                    continue
+                digest = status.image_id
+                if '@' in digest:
+                    digest = digest.split('@', 1)[1]
+                elif '://' in digest:
+                    digest = digest.split('://', 1)[1]
+                if not digest.startswith('sha256:'):
+                    continue
+                image_tag = c.image
+                if not matches_target(image_tag):
+                    continue
+                digest_to_image[digest] = image_tag
+                digest_to_pods[digest].append({
+                    'namespace': pod.metadata.namespace,
+                    'pod': pod.metadata.name,
+                    'container': c.name,
+                    'image': image_tag,
+                })
+        return digest_to_image, digest_to_pods
+
+
+    def run_trivy(image_ref):
+        result = subprocess.run(
+            ['trivy', 'image', '--format', 'json', '--quiet', '--timeout', '10m', image_ref],
+            capture_output=True, text=True, timeout=1200
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"trivy failed for {image_ref}: {result.stderr[:500]}")
+        return json.loads(result.stdout)
+
+
+    def parse_trivy_result(trivy_json, image_digest, pod_info, scan_id, scanned_at):
+        findings = []
+        for result_block in (trivy_json.get('Results') or []):
+            for vuln in (result_block.get('Vulnerabilities') or []):
+                finding = {
+                    'scan_id': scan_id,
+                    'scanned_at': scanned_at,
+                    'cluster': CLUSTER_NAME,
+                    'namespace': pod_info['namespace'],
+                    'pod': pod_info['pod'],
+                    'container': pod_info['container'],
+                    'image': pod_info['image'],
+                    'image_digest': image_digest,
+                    'vulnerability_id': vuln.get('VulnerabilityID'),
+                    'severity': vuln.get('Severity'),
+                    'package_name': vuln.get('PkgName'),
+                    'installed_version': vuln.get('InstalledVersion'),
+                    'fixed_version': vuln.get('FixedVersion'),
+                    'layer_digest': (vuln.get('Layer') or {}).get('Digest'),
+                    'title': vuln.get('Title'),
+                    'description': (vuln.get('Description') or '')[:2000],
+                    'references': (vuln.get('References') or [])[:20],
+                    'cvss_score': None,
+                    'first_seen_at': scanned_at,
+                    'last_seen_at': scanned_at,
+                }
+                cvss = vuln.get('CVSS') or {}
+                for provider in ('nvd', 'redhat', 'ghsa'):
+                    score = (cvss.get(provider) or {}).get('V3Score')
+                    if score is not None:
+                        finding['cvss_score'] = score
+                        break
+                findings.append(finding)
+        return findings
+
+
+    def opensearch_bulk_insert(index, docs):
+        if not docs:
+            return
+        lines = []
+        for doc in docs:
+            lines.append(json.dumps({'index': {'_index': index}}))
+            lines.append(json.dumps(doc))
+        body = '\n'.join(lines) + '\n'
+        resp = requests.post(
+            f'{OPENSEARCH_URL}/_bulk',
+            headers={'Content-Type': 'application/x-ndjson'},
+            data=body,
+            timeout=120,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+        if result.get('errors'):
+            errored = [item for item in result.get('items', []) if item.get('index', {}).get('error')]
+            print(f"WARN: {len(errored)} items failed to index, first error: {errored[0] if errored else 'unknown'}", flush=True)
+
+
+    def opensearch_search(index, body):
+        """OpenSearch _search を叩く。 失敗時は空 dict を返す (index_not_found 等)。"""
+        try:
+            resp = requests.post(
+                f'{OPENSEARCH_URL}/{index}/_search',
+                headers={'Content-Type': 'application/json'},
+                data=json.dumps(body),
+                timeout=60,
+            )
+            if resp.status_code == 404:
+                # index が無いだけなら空 dict を返す (初回起動時)
+                return {}
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            print(f"WARN: opensearch_search {index} failed: {e}", flush=True)
+            return {}
+
+
+    def image_repo_only(image):
+        """image tag からレジストリ・tag・digest を除いた repository 末端を返す。
+        view_security.py の _image_repo_only と同じロジック。 対応履歴の
+        image_repo キーを合わせるため、 スキャナ側でもここで正規化する。"""
+        if not image:
+            return image
+        s = image
+        if '@' in s:
+            s = s.split('@', 1)[0]
+        if ':' in s:
+            s = s.split(':', 1)[0]
+        if '/' in s:
+            s = s.rsplit('/', 1)[-1]
+        return s
+
+
+    def record_vuln_event(event_type, image_repo, payload):
+        """vuln_events に 1 件記録する。 payload は event_type に対応する dict。"""
+        doc = {
+            'event_id': str(uuid.uuid4()),
+            'event_type': event_type,
+            'image_repo': image_repo,
+            'cluster': CLUSTER_NAME,
+            'timestamp': now_utc(),
+        }
+        if event_type in ('detected', 'patched', 'verified'):
+            doc[event_type] = payload
+        opensearch_bulk_insert('vuln_events', [doc])
+        return doc['event_id']
+
+
+    def get_previous_per_repo(image_repo, exclude_scan_id):
+        """指定 repo について、 前回スキャン (exclude_scan_id 以外の最新) の
+        findings 集約を返す。 該当なしは None。
+        戻り値: {cve_ids: set, severity_counts: {CRITICAL:N,...}, image_tag: str,
+                 scan_id: str} or None
+        """
+        # vuln_findings で image が該当 repo を含むもの (wildcard)、
+        # scan_id != 今回、 の全 findings を集約する。 aggregation で scan_id
+        # ごとに group し、 最新の 1 個を取る。
+        body = {
+            'size': 0,
+            'query': {
+                'bool': {
+                    'must': [
+                        {'wildcard': {'image': f'*/{image_repo}:*'}},
+                    ],
+                    'must_not': [
+                        {'term': {'scan_id': exclude_scan_id}},
+                    ],
+                }
+            },
+            'aggs': {
+                'by_scan': {
+                    'terms': {
+                        'field': 'scan_id',
+                        'size': 50,
+                        'order': {'latest_time': 'desc'},
+                    },
+                    'aggs': {
+                        'latest_time': {'max': {'field': 'scanned_at'}},
+                        'by_severity': {
+                            'terms': {'field': 'severity', 'size': 10}
+                        },
+                        'cve_ids': {
+                            'terms': {
+                                'field': 'vulnerability_id', 'size': 5000
+                            }
+                        },
+                        'image_tags': {
+                            'terms': {'field': 'image', 'size': 5}
+                        },
+                    },
+                }
+            },
+        }
+        resp = opensearch_search('vuln_findings', body)
+        buckets = (
+            resp.get('aggregations', {}).get('by_scan', {}).get('buckets', [])
+        )
+        if not buckets:
+            return None
+        bucket = buckets[0]
+        scan_id = bucket.get('key')
+        cve_ids = set(
+            b.get('key') for b in
+            bucket.get('cve_ids', {}).get('buckets', [])
+            if b.get('key')
+        )
+        severity_counts = {'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0, 'UNKNOWN': 0}
+        for b in bucket.get('by_severity', {}).get('buckets', []):
+            sev = b.get('key')
+            if sev in severity_counts:
+                severity_counts[sev] = int(b.get('doc_count') or 0)
+            else:
+                severity_counts['UNKNOWN'] += int(b.get('doc_count') or 0)
+        image_tags = [
+            b.get('key') for b in
+            bucket.get('image_tags', {}).get('buckets', [])
+        ]
+        image_tag = image_tags[0] if image_tags else ''
+        return {
+            'cve_ids': cve_ids,
+            'severity_counts': severity_counts,
+            'image_tag': image_tag,
+            'scan_id': scan_id,
+        }
+
+
+    def process_diff_events(scan_id, all_findings, digest_to_image):
+        """今回スキャンの結果を前回スキャンと比較して detected/verified event を記録する。
+
+        digest_to_image: 今回スキャン対象になった image tag の一覧を得るための dict。
+        findings 0 件で完了した image (今回スキャンで何も見つからなかった) も
+        「今回のスキャン対象」 として扱えるようにする。
+        """
+        # 今回スキャンの findings を repo 単位に集約
+        per_repo_now = {}
+        for f in all_findings:
+            image = f.get('image', '')
+            repo = image_repo_only(image)
+            if not repo:
+                continue
+            if repo not in per_repo_now:
+                per_repo_now[repo] = {
+                    'cve_ids': set(),
+                    'cve_severity': {},  # cve_id -> severity
+                    'severity_counts': {
+                        'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0,
+                        'LOW': 0, 'UNKNOWN': 0,
+                    },
+                    'image_tag': image,
+                }
+            cve = f.get('vulnerability_id') or ''
+            sev = (f.get('severity') or 'UNKNOWN').upper()
+            if cve:
+                per_repo_now[repo]['cve_ids'].add(cve)
+                per_repo_now[repo]['cve_severity'][cve] = sev
+            if sev in per_repo_now[repo]['severity_counts']:
+                per_repo_now[repo]['severity_counts'][sev] += 1
+            else:
+                per_repo_now[repo]['severity_counts']['UNKNOWN'] += 1
+
+        # findings 0 件で成功した image (今回スキャン対象だが CVE 無し) も
+        # per_repo_now に空エントリを入れる (verified 判定のため)
+        for image_tag in digest_to_image.values():
+            repo = image_repo_only(image_tag)
+            if not repo:
+                continue
+            if repo not in per_repo_now:
+                per_repo_now[repo] = {
+                    'cve_ids': set(),
+                    'cve_severity': {},
+                    'severity_counts': {
+                        'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0,
+                        'LOW': 0, 'UNKNOWN': 0,
+                    },
+                    'image_tag': image_tag,
+                }
+
+        detected_count = 0
+        verified_count = 0
+        for repo, now in per_repo_now.items():
+            prev = get_previous_per_repo(repo, exclude_scan_id=scan_id)
+            if prev is None:
+                # 初回スキャン: 全 CVE を detected として記録
+                if now['cve_ids']:
+                    record_vuln_event('detected', repo, {
+                        'scan_id': scan_id,
+                        'image_tag': now['image_tag'],
+                        'severity_counts': now['severity_counts'],
+                        'cve_ids': list(now['cve_ids'])[:200],
+                    })
+                    detected_count += 1
+                continue
+            # diff
+            new_cves = now['cve_ids'] - prev['cve_ids']
+            resolved_cves = prev['cve_ids'] - now['cve_ids']
+            if new_cves:
+                new_sev = {
+                    'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0,
+                    'LOW': 0, 'UNKNOWN': 0,
+                }
+                for cve in new_cves:
+                    sev = now['cve_severity'].get(cve, 'UNKNOWN')
+                    if sev in new_sev:
+                        new_sev[sev] += 1
+                    else:
+                        new_sev['UNKNOWN'] += 1
+                record_vuln_event('detected', repo, {
+                    'scan_id': scan_id,
+                    'image_tag': now['image_tag'],
+                    'severity_counts': new_sev,
+                    'cve_ids': list(new_cves)[:200],
+                })
+                detected_count += 1
+            if resolved_cves:
+                record_vuln_event('verified', repo, {
+                    'scan_id': scan_id,
+                    'severity_counts_before': prev['severity_counts'],
+                    'severity_counts_after': now['severity_counts'],
+                    'resolved_cve_ids': list(resolved_cves)[:200],
+                    'remaining_cve_ids': list(
+                        now['cve_ids'] & prev['cve_ids']
+                    )[:200],
+                })
+                verified_count += 1
+
+        print(
+            f"[scan] diff events recorded: detected={detected_count}, "
+            f"verified={verified_count}",
+            flush=True,
+        )
+
+
+    def upload_to_minio(mc, bucket, object_name, data):
+        data_bytes = data.encode('utf-8') if isinstance(data, str) else data
+        mc.put_object(bucket, object_name, io.BytesIO(data_bytes), len(data_bytes))
+
+
+    def main():
+        scan_id = str(uuid.uuid4())
+        started_at = now_utc()
+        print(f"[scan] scan_id={scan_id}, started_at={started_at}", flush=True)
+
+        mc = Minio(MINIO_ENDPOINT, access_key=MINIO_ACCESS_KEY, secret_key=MINIO_SECRET_KEY, secure=False)
+
+        print("[scan] listing pod images...", flush=True)
+        digest_to_image, digest_to_pods = list_all_pod_images()
+        total_container_instances = sum(len(v) for v in digest_to_pods.values())
+        print(f"[scan] found {len(digest_to_image)} unique image digests across {total_container_instances} container instances", flush=True)
+
+        total_findings = 0
+        severity_count = {'critical': 0, 'high': 0, 'medium': 0, 'low': 0, 'unknown': 0}
+        per_digest_reports = {}
+        all_findings = []
+        scan_errors = []
+
+        for i, (digest, image_tag) in enumerate(digest_to_image.items(), 1):
+            pods = digest_to_pods[digest]
+            print(f"[scan] ({i}/{len(digest_to_image)}) scanning {image_tag} ({digest[:24]}...) covers {len(pods)} containers", flush=True)
+            try:
+                trivy_json = run_trivy(image_tag)
+            except Exception as e:
+                err_msg = str(e)[:300]
+                print(f"[scan] WARN: trivy failed for {image_tag}: {err_msg}", flush=True)
+                scan_errors.append({'image': image_tag, 'digest': digest, 'error': err_msg})
+                continue
+
+            per_digest_reports[digest] = trivy_json
+            for pod_info in pods:
+                findings = parse_trivy_result(trivy_json, digest, pod_info, scan_id, started_at)
+                all_findings.extend(findings)
+                for f in findings:
+                    sev = (f.get('severity') or 'UNKNOWN').lower()
+                    if sev in severity_count:
+                        severity_count[sev] += 1
+                    else:
+                        severity_count['unknown'] += 1
+
+        total_findings = len(all_findings)
+
+        print(f"[scan] indexing {total_findings} findings into OpenSearch...", flush=True)
+        BATCH = 500
+        for i in range(0, len(all_findings), BATCH):
+            opensearch_bulk_insert('vuln_findings', all_findings[i:i+BATCH])
+
+        print(f"[scan] uploading {len(per_digest_reports)} raw reports to MinIO...", flush=True)
+        for digest, report in per_digest_reports.items():
+            digest_hex = digest.split(':', 1)[1] if ':' in digest else digest
+            object_name = f"{scan_id}/{digest_hex}.json"
+            upload_to_minio(mc, MINIO_BUCKET, object_name, json.dumps(report))
+
+        finished_at = now_utc()
+        scan_meta = {
+            'scan_id': scan_id,
+            'started_at': started_at,
+            'finished_at': finished_at,
+            'cluster': CLUSTER_NAME,
+            'trivy_version': TRIVY_VERSION,
+            'trivy_image_digest': TRIVY_IMAGE_DIGEST,
+            'scan_scope': 'targeted' if TARGET_IMAGE_PATTERNS else 'all',
+            'target_image_patterns': TARGET_IMAGE_PATTERNS,
+            'target_pod_count': total_container_instances,
+            'target_image_count': len(digest_to_image),
+            'findings_count': total_findings,
+            'severity_count': severity_count,
+            'status': 'success' if not scan_errors else 'partial',
+            'error_message': json.dumps(scan_errors) if scan_errors else None,
+            'minio_path': f"{MINIO_BUCKET}/{scan_id}/",
+        }
+        opensearch_bulk_insert('vuln_scans', [scan_meta])
+
+        # 対応履歴 (vuln_events) の自動記録:
+        # 前回スキャンとの diff から detected / verified event を作成する。
+        # 失敗しても scan 全体の成功扱いは変えない (best-effort)。
+        try:
+            process_diff_events(scan_id, all_findings, digest_to_image)
+        except Exception as e:
+            print(
+                f"WARN: process_diff_events failed: "
+                f"{type(e).__name__}: {e}",
+                flush=True,
+            )
+
+        print(f"[scan] DONE. scan_id={scan_id}, findings={total_findings}, severity={severity_count}, errors={len(scan_errors)}", flush=True)
+
+
+    if __name__ == '__main__':
+        main()

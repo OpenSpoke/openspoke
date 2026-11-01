@@ -1,0 +1,57 @@
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vuln-scanner-builder
+  namespace: security-builder
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: vuln-scanner-builder
+    spec:
+      restartPolicy: Never
+      initContainers:
+        - name: prepare-context
+          image: alpine:3.20
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              cp /config/Dockerfile /workspace/Dockerfile
+              echo "[init] Dockerfile placed in workspace"
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+            - name: workspace
+              mountPath: /workspace
+      containers:
+        - name: kaniko
+          image: gcr.io/kaniko-project/executor:v1.24.0-debug
+          command: ["/busybox/sh"]
+          args:
+            - -c
+            - |
+              set -eu
+              IMAGE_REF=$(cat /config/image_ref)
+              echo "[kaniko] target image: ${IMAGE_REF}"
+              /kaniko/executor \
+                --dockerfile=/workspace/Dockerfile \
+                --context=/workspace \
+                --destination="${IMAGE_REF}"
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+            - name: workspace
+              mountPath: /workspace
+      volumes:
+        - name: config
+          configMap:
+            name: vuln-scanner-config
+        - name: workspace
+          emptyDir: {}

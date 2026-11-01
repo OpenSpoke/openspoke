@@ -1,0 +1,31 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: rag-backend-kernel-scanner
+  namespace: security
+rules:
+  # 脆弱性診断オンデマンド発火のため、 kernel が security ネームスペースに
+  # 一時 Job を作成できるようにする (create/get/list/delete)。
+  # 権限最小化のため対象は batch/jobs のみ、 対象 namespace は security のみ。
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "delete"]
+  # 発火した Job の Pod ステータス確認用 (read-only)。
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rag-backend-kernel-scanner
+  namespace: security
+subjects:
+  - kind: ServiceAccount
+    name: rag-backend-kernel
+    namespace: rag-company1
+roleRef:
+  kind: Role
+  name: rag-backend-kernel-scanner
+  apiGroup: rbac.authorization.k8s.io

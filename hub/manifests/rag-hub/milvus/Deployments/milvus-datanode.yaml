@@ -1,0 +1,106 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: milvus-datanode
+  namespace: milvus
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: milvus-datanode
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: milvus-datanode
+      namespace: milvus
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: rag-type
+                    operator: In
+                    values:
+                      - milvus
+      initContainers:
+        - name: wait-deps
+          image: milvusdb/milvus:v2.6.20
+          imagePullPolicy: IfNotPresent
+          command:
+            - bash
+            - -c
+            - |
+              for dep in etcd:2379 minio:9000 pulsar:6650; do
+                host="${dep%%:*}"
+                port="${dep##*:}"
+                until getent hosts "$host" >/dev/null 2>&1 && (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null; do
+                  echo "waiting for $dep"
+                  sleep 2
+                done
+                echo "$dep ready"
+              done
+              echo "all dependencies ready"
+          resources:
+            limits:
+              cpu: 100m
+              memory: 64Mi
+            requests:
+              cpu: 10m
+              memory: 32Mi
+      containers:
+        - command:
+            - milvus
+            - run
+            - datanode
+          env:
+            - name: ETCD_USE_EMBED
+              value: 'false'
+            - name: ETCD_ENDPOINTS
+              value: etcd:2379
+            - name: ETCD_ROOT_PATH
+              value: by-dev
+            - name: MINIO_ADDRESS
+              value: minio:9000
+            - name: MINIO_ACCESS_KEY_ID
+              value: minioadmin
+            - name: MINIO_SECRET_ACCESS_KEY
+              value: minioadminpassword
+            - name: MINIO_USE_SSL
+              value: 'false'
+            - name: MINIO_BUCKET_NAME
+              value: milvus-bucket
+            - name: MINIO_ROOT_PATH
+              value: file
+            - name: PULSAR_ADDRESS
+              value: pulsar://pulsar:6650
+            - name: COMMON_STORAGETYPE
+              value: remote
+            - name: ROOT_COORD_ADDRESS
+              value: milvus-rootcoord:53100
+            - name: DATA_COORD_ADDRESS
+              value: milvus-datacoord:13333
+          image: milvusdb/milvus:v2.6.20
+          imagePullPolicy: IfNotPresent
+          name: datanode
+          resources:
+            limits:
+              cpu: '1'
+              memory: 4Gi
+            requests:
+              cpu: 500m
+              memory: 2Gi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30

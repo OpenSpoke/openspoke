@@ -1,0 +1,27 @@
+# Example Fleet GitRepo for deploying the hub RAG kernel.
+#
+# Adjust:
+#   - spec.repo:    your fork URL or the upstream OpenSpoke repo
+#   - spec.branch:  branch to track
+#   - spec.paths:   subdirectory to watch
+#   - spec.targets: cluster selector labels
+apiVersion: fleet.cattle.io/v1alpha1
+kind: GitRepo
+metadata:
+  name: hub-kernel
+  namespace: fleet-default
+spec:
+  repo: https://github.com/OpenSpoke/openspoke.git
+  branch: main
+  # For private forks, create a Secret in the fleet-default namespace and
+  # uncomment the line below:
+  # clientSecretName: fleet-git-credentials
+  paths:
+    - hub/manifests/kernel
+  pollingInterval: 1m0s
+  keepResources: true
+  targets:
+    - name: hub
+      clusterSelector:
+        matchLabels:
+          role: hub

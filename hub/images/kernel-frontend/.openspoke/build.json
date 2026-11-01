@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "name": "openspoke-frontend",
+  "branch": "main",
+  "jobs": [
+    {
+      "name": "image",
+      "workdir": "hub/images/kernel-frontend",
+      "dockerfile": "Dockerfile",
+      "image_push": "your-registry.example.com/openspoke-frontend",
+      "manifest_bump": { "paths": ["hub/manifests/kernel-frontend/Deployments/openspoke-frontend.yaml"] },
+      "cpu": "4",
+      "memory": "8Gi"
+    }
+  ]
+}

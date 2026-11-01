@@ -1,0 +1,103 @@
+---
+#  Nuxt 版 OpenSpoke ダッシュボード (Node.js)
+#
+#  イメージは OpenSpoke の CI がビルドする。タグはビルドした時刻と
+#  コミットから付く (ディスパッチャーが決める。人が書き換えるものではない)。
+#  新しいイメージに入れ替えるときは、ここの image をそのタグに差し替える。
+#
+#  全画面が揃ったので / 配信に切り替えた。
+#  これまでの Streamlit 版の Deployment は残してあるので、
+#  戻すときは oauth2-proxy の転送先を 1 行入れ替えるだけでよい。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openspoke-frontend
+  namespace: rag-company1
+  labels:
+    app: openspoke-frontend
+spec:
+  replicas: 1
+  revisionHistoryLimit: 5
+  progressDeadlineSeconds: 600
+  selector:
+    matchLabels:
+      app: openspoke-frontend
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: openspoke-frontend
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: purpose
+                    operator: In
+                    values:
+                      - general
+      containers:
+        - name: frontend
+          image: your-registry.example.com/openspoke-frontend:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: TZ
+              value: Asia/Tokyo
+            - name: NITRO_PORT
+              value: "3000"
+            - name: NITRO_HOST
+              value: "0.0.0.0"
+            - name: NUXT_APP_BASE_URL
+              value: "/"
+            #  Nuxt の runtimeConfig を実行時に上書きするには
+            #  NUXT_ を付けた名前にする必要がある。
+            #  nuxt.config.ts の process.env.* はビルド時に固定されるので、
+            #  素の名前で渡しても読まれない。
+            - name: NUXT_KERNEL_URL
+              value: http://rag-backend-kernel.rag-company1.svc.cluster.local:8000
+            - name: NUXT_KEYCLOAK_URL
+              value: https://keycloak.example.com
+            - name: NUXT_KEYCLOAK_REALM
+              value: rag
+            - name: NUXT_KEYCLOAK_ADMIN_CLIENT_ID
+              value: openspoke-admin-api
+            - name: NUXT_KEYCLOAK_ADMIN_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-admin-api-secret
+                  key: client-secret
+          ports:
+            - containerPort: 3000
+              name: http
+              protocol: TCP
+          #  中身は oauth2-proxy のヘッダを前提に動くので、
+          #  素の HTTP での生死確認はせず、口が開いているかだけを見る。
+          livenessProbe:
+            tcpSocket:
+              port: 3000
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 192Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30

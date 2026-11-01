@@ -1,0 +1,7 @@
+# Fleet bundle options for the self-managed-fleet control-plane
+# manifests.
+#
+# This bundle ships the Fleet UI and the self-managed-fleet reconciler
+# control plane itself. Deployment-specific GitRepo manifests belong
+# under fleet/manifests/managed/GitRepos/ and are authored by operators
+# from the templates in examples/fleet-gitrepos/.

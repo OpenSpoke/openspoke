@@ -1,0 +1,3831 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-backend-kernel-chat
+  namespace: rag-company1
+data:
+  chat_endpoints.py: |
+    """chat_endpoints.py — Aki と Claude の対話フロントエンド用バックエンド。
+
+    設計:
+      - Anthropic の stream + SimpleMCPClient + tool loop の既存パターン
+        (main.py の /core/claude/stream-with-mcp と同じ構造) をそのまま流用
+      - MCP hub (mcp.example.com/mcp 相当、 内部は
+        mcp-company1.mcp.svc.cluster.local:8000/sse) の全 tool を Claude に露出
+      - user 発話ごとに知識ベース (Memgraph Topic) の意味検索で上位 N 件を
+        system_prompt に事前注入 (auto-injection、 Phase 5)
+      - streaming で逐次描画 (Phase 2)
+
+    OpenSearch インデックス:
+      - chat_threads:  {thread_id, owner, title, created_at, updated_at,
+                        last_message_at, message_count, model}
+      - chat_messages: {message_id, thread_id, owner, order, role, content,
+                        model, input_tokens, output_tokens, created_at,
+                        injected_topics, tool_calls}
+
+    kernel 本体との依存 (lazy import):
+      - get_anthropic_client (Anthropic client 共有)
+      - SimpleMCPClient (MCP over SSE クライアント)
+      - MCP_SERVER_URL, MCP_API_KEY, MCP_CONNECT_TIMEOUT
+      - CLAUDE_MAX_TOOL_ITERATIONS, CLAUDE_STREAM_MAX_ACCUMULATED_TOKENS
+      - _claude_strip_unsupported_sampling (Opus 4.7+ の sampling 制約対応)
+      - neo4j_driver (直接 Cypher 実行、 意味検索の embedding 用)
+      - get_embeddings_parallel (embedding 直接計算)
+    """
+    import os
+    import time
+    import uuid
+    import math
+    import json
+    import logging
+    import re
+    from typing import List, Dict, Any, Optional, Tuple
+
+    import requests
+    from fastapi import APIRouter
+    from fastapi.responses import StreamingResponse
+
+    logger = logging.getLogger(__name__)
+
+    router = APIRouter()
+
+    OPENSEARCH_URL = os.environ.get(
+        "OPENSEARCH_URL",
+        "http://opensearch.opensearch.svc.cluster.local:9200",
+    ).rstrip("/")
+
+    CHAT_THREADS_INDEX = "chat_threads"
+    CHAT_MESSAGES_INDEX = "chat_messages"
+
+    DEFAULT_MODEL = "claude-sonnet-4-6"
+    SLIDING_WINDOW_SIZE = 20
+    MAX_OUTPUT_TOKENS = 4096
+
+    # Jev による per-turn モデル自動選択 (auto_route=True で有効)。
+    # Jev に choice でこの候補の中から 1 つ選ばせる。
+    # Jev が候補外の値を返した場合は DEFAULT_MODEL にフォールバック。
+    CHAT_JEV_ROUTE_MODELS = [
+        "claude-haiku-4-5",
+        "claude-sonnet-4-6",
+        "claude-opus-4-7",
+    ]
+
+    # Step E-2: Jev + gemma2 (R2D2 + C3PO) 経路。
+    # モデル ID が CHAT_JEV_GEMMA2_MODEL_ID のとき、 turn 頭で Jev に応答方針を
+    # choice で問い、 その結果を gemma2 の system prompt に渡して日本語に
+    # 言い直させる。 tool loop なし、 Sonnet フォールバックなし、 単発生成。
+    # 「Jev に判断を寄せ、 gemma2 は話すだけ」の設計方針。
+    CHAT_JEV_GEMMA2_MODEL_ID = "jev-gemma2"
+    CHAT_JEV_GEMMA2_UNDERLYING = "gemma2:9b"
+
+    # Phase 5: 自動注入
+    INJECT_TOP_N = 3
+    INJECT_MIN_SCORE = 0.35
+    INJECT_CONTENT_CHAR_LIMIT = 3000
+    EMBED_CONTENT_CHAR_LIMIT = 2000
+
+    # Jev による KB ゲート (Phase 2-h Step F、 既定オン)。 発話ごとに Jev が
+    # 「知識ベースを参照する必要があるか」を noul で判定し、 必要と判断したら
+    # 意味検索の上位候補から Jev choice で最終 K 件を選抜。 Jev 失敗時は
+    # 既存の埋め込み類似度 top-N にフォールバック。 常時、 system_prompt には
+    # 「読め・書け・メモリに頼るな」の 3 リマインダーが Jev の判定に添えて入る。
+    CHAT_JEV_KB_GATE_ENABLED = os.getenv(
+        "CHAT_JEV_KB_GATE_ENABLED", "true"
+    ).lower() != "false"
+    CHAT_JEV_KB_SEARCH_CANDIDATES = 15
+    CHAT_JEV_KB_INJECT_TOP_K = 3
+
+    # tool_calls を message doc に保存するときの result_brief の切り詰め
+    TOOL_RESULT_BRIEF_CHAR_LIMIT = 500
+
+    # tool result を Anthropic の messages に載せるときの上限 (文字数)。
+    # Anthropic 200K context に対して、 tools schema (60-100K) + system prompt (5-10K) +
+    # 20 message history (5-15K) + injected topics (5-10K) を差し引くと、
+    # tool result に使える余地はターン全体で 50-100K token 程度。
+    # 1 tool call あたり 30000 文字 (~10K token JA、 ~8K token EN) に制限し、
+    # 同一ターン内で複数の tool call が並んでも context 上限を超えないようにする。
+    # 切り詰められた場合は Claude に明示的に伝え、 より狭いクエリで
+    # 呼び直すように促す。
+    MCP_TOOL_RESULT_MAX_CHARS = 30000
+
+    # チャンク化 (Phase 6: 断片単位の意味検索、 既存の topic 全文検索と并立)。
+    # Topic の content を段落単位で分割し、 一つのをすぎる場合は
+    # target 文字強制分割。 min 未満の断片は前後とマージ。
+    CHUNK_TARGET_CHARS = 500
+    CHUNK_MAX_CHARS = 800
+    CHUNK_MIN_CHARS = 100
+
+    # 1M context beta を利用できるモデル。 anthropic-beta: context-1m-2025-08-07 header を
+    # 付とさない場合 default 200K context になる (GA 後も明示 opt-in が
+    # 必要なケースがあるため、 安全側で付ける)。 Haiku 4.5 は非対応。
+    MODELS_SUPPORTING_1M_CONTEXT = {
+        "claude-sonnet-4-6",
+        "claude-opus-4-6",
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+        "claude-opus-5",
+    }
+
+    # gemma2 (Ollama) 経路に露出する MCP ツールの許可リスト。 gemma2:9b は
+    # 既定コンテキスト 8192 トークンと狭く、 200+ ツールのスキーマを一度に載せると
+    # コンテキストを食い潰す。 加えてツール選択精度も未知数のため、 初期実装では
+    # 小さめの安全な集合に絞る。 対話専用ツール (list_my_chat_threads 等) は別途
+    # 全て露出する (件数が少ないため)。 実運用の挙動を見て段階的に拡張する。
+    OLLAMA_ALLOWED_TOOL_NAMES = {
+        # 知識ベース (中央ハブ Memgraph)
+        "system_brief", "system_topics", "system_lookup",
+        "upsert_knowledge", "delete_knowledge",
+        # ファイル閲覧
+        "github_get_file_range", "github_grep_file",
+        "github_get_outline", "github_get_symbol",
+        # ファイル差分編集
+        "github_str_replace_dryrun", "github_apply_str_replace",
+        # Kubernetes 観測
+        "k8s_list_pods", "k8s_get_logs",
+        # 診断
+        "whoami",
+    }
+
+    # gemma2 経路の tool loop 反復上限。 Claude よりツール選択精度が低いため
+    # 無限ループ検出のフォールバックを低めに設定する。
+    OLLAMA_MAX_TOOL_ITERATIONS = 20
+
+    def _is_ollama_model(model: str) -> bool:
+        """モデル名から Ollama 経路か Anthropic 経路かを判定する。
+        Claude モデルは全て "claude-" 接頭辞なので、 それ以外は Ollama 扱い。
+        現状 gemma2:9b が対象。
+        """
+        return not (model or "").lower().startswith("claude")
+
+    # tool loop の反復上限 (chat 専用、 kernel のデフォルト 5 を上書き)。
+    # 実際のコスト保証は CLAUDE_STREAM_MAX_ACCUMULATED_TOKENS (300K) が主軸。
+    # iteration 上限は 「無限ループ検出」 のフォールバックに過ぎない。
+    # Sonnet 4.6 は複数 tool を並列で呼ぶので 100 iteration あれば
+    # 実質数百の MCP tool call が可能。 現実的な調査タスクで足りなくなることは
+    # ほぼ無い (cost cap が 25-30 iteration 目付近で先に効く)。
+    CHAT_MAX_TOOL_ITERATIONS = 100
+
+    # 累積トークン上限 (chat 専用、 kernel の CLAUDE_STREAM_MAX_ACCUMULATED_TOKENS
+    # デフォルト 300K を上書き)。 kernel の値は秘書 backend 向けで対話フロントエンド
+    # の深い探索には狭すぎる。 3M token に拡張し、 対話同一ターン内の最悪コストを
+    # Sonnet 4.6 (input $3/M 、 output $15/M) で 最大 $45/turn に制限。
+    # fresh input + output の合計で、 cache read は含まない。 実際の cost は
+    # cache hit の分だけ少なくなる。
+    CHAT_ACCUMULATED_TOKENS_CAP = 3000000
+
+    # chat-scoped tool (中期記憶): sliding window の外を Claude 自身が
+    # 辿でるように、 MCP tool 群とは別に chat_endpoints 内で実行する tool を定義。
+    # SimpleMCPClient で取った MCP tool と一緒に Claude に露出し、
+    # tool loop で名前を見て dispatch (chat-scoped ならローカル実行)。
+    CHAT_SCOPED_TOOL_SCHEMAS = [
+        {
+            "name": "list_my_chat_threads",
+            "description": (
+                "現在の利用者が所有する全チャットスレッドの一覧"
+                " ({thread_id, title, message_count, last_message_at, current})を返す。"
+                " current=true は現在のスレッド。 過去のスレッドを横断的に"
+                " 参照する際の起点。"
+            ),
+            "input_schema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "read_chat_thread_messages",
+            "description": (
+                "スレッドのメッセージを時間軸ベースまたは順序ベースで取得する。"
+                " default の sliding window 20 件の外を Claude 自身が能動的に"
+                " 取り戻す用途。 主用途は時間軸: since / until (ISO 8601 UTC)"
+                " で範囲を指定し、 時間軸に沿ってウィンドウを自由に動かせる。"
+                " 例: 1 時間前を見る → since=(現在時刻 - 1h)、 until=現在時刻。"
+                " 順序ベース: from_order / to_order で 0-indexed 位置指定。"
+                " 両方指定の場合は AND。 何も指定しなければ最新 limit 件。"
+                " thread_id 省略時は現在のスレッド。 各メッセージには order,"
+                " role (user/assistant), content, created_at が含まれる。"
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "thread_id": {
+                        "type": "string",
+                        "description": "対象スレッド ID (省略時は現在のスレッド)",
+                    },
+                    "since": {
+                        "type": "string",
+                        "description": (
+                            "開始時刻 (ISO 8601 UTC、 例:"
+                            " 2026-09-08T15:00:00Z)。 この時刻以降のメッセージを対象"
+                        ),
+                    },
+                    "until": {
+                        "type": "string",
+                        "description": (
+                            "終了時刻 (ISO 8601 UTC)。"
+                            " この時刻以前のメッセージを対象"
+                        ),
+                    },
+                    "from_order": {
+                        "type": "integer",
+                        "description": "取得開始 order (含む、 省略時は制限なし)",
+                    },
+                    "to_order": {
+                        "type": "integer",
+                        "description": "取得終了 order (含む、 省略時は制限なし)",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "最大取得件数 (default 30、 max 100)",
+                    },
+                },
+            },
+        },
+        {
+            "name": "search_my_chat_history",
+            "description": (
+                "自分のチャット履歴を全文検索する (OpenSearch の match query)。"
+                " thread_id 指定でその 1 スレッド、 省略で全スレッド横断。"
+                " ハイライト付きのスニペットと thread_id / order を返すので"
+                " 必要なら read_chat_thread_messages で前後を取り直せる。"
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "検索クエリ (自然文)",
+                    },
+                    "thread_id": {
+                        "type": "string",
+                        "description": "対象スレッド ID (省略で自分の全スレッド)",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "最大件数 (default 10、 max 30)",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+        {
+            "name": "search_topic_chunks",
+            "description": (
+                "知識ベース全 Topic のチャンク (段落単位、 200-500 字) を"
+                " 意味検索する。 Topic 全体を system_lookup で読むより"
+                " 5-50 倍安価。 Topic 横断で関連断片が集まるので、"
+                " 概念調査・トピック横断調査・具体的な情報探しはこのツールを"
+                " 使うこと。 得られた {topic_id, chunk_index} を渡して"
+                " lookup_topic_chunk_range で前後の文脈を取れる。"
+                " 各 chunk には {topic_id, topic_title, chunk_index, text, score} が入る。"
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "検索クエリ (自然文、 日本語 / 英語)",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "上位何件 (default 8、 max 20)",
+                    },
+                    "min_score": {
+                        "type": "number",
+                        "description": (
+                            "コサイン類似度のカットオフ (default 0.30、"
+                            " 小さすぎるとノイズが増える)"
+                        ),
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+        {
+            "name": "lookup_topic_chunk_range",
+            "description": (
+                "特定 Topic のチャンクを index 範囲で取得する。"
+                " search_topic_chunks で得た chunk_index の前後を取りに行く用途。"
+                " index は 0-indexed。 from_index / to_index 省略時はそれぞれ"
+                " 最初 / 最後を意味する。 Topic 全体を見たいなら"
+                " system_lookup (別ツール、 全文取得で高コスト) を使う。"
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "topic_id": {
+                        "type": "string",
+                        "description": "対象 Topic の id",
+                    },
+                    "from_index": {
+                        "type": "integer",
+                        "description": "開始 chunk_index (含む、 省略で 0)",
+                    },
+                    "to_index": {
+                        "type": "integer",
+                        "description": "終了 chunk_index (含む、 省略で最後)",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "最大取得数 (default 5、 max 15)",
+                    },
+                },
+                "required": ["topic_id"],
+            },
+        },
+    ]
+    CHAT_SCOPED_TOOL_NAMES = {t["name"] for t in CHAT_SCOPED_TOOL_SCHEMAS}
+
+    _indices_ensured = [False]
+    _topic_embeddings_cache: Dict[str, Tuple[str, List[float]]] = {}
+
+    # チャンクキャッシュ (Phase 6): {topic_id: (updated_at, [{chunk_index, text, embedding}, ...])}
+    # 既存の topic 全文 embedding キャッシュとは独立、 Pod メモリ内。
+    # Pod 再起動で消えるが初回検索時に自動再構築。
+    _topic_chunks_cache: Dict[str, Tuple[str, List[dict]]] = {}
+
+
+    def _prewarm_caches():
+        """Pod 起動時にバックグラウンドでキャッシュを構築する。
+        最初の対話発話でユーザーが 2 分以上待たされるのを防ぐ。
+        400 topic × 平均 9 chunk = ~3700 chunk の embedding を計算するのに
+        130 秒程度かかるため、 起動 30 秒後に別スレッドで先回りする。"""
+        # Pod 起動直後の初期化 (neo4j_driver 等) が終わるまで待つ
+        time.sleep(30)
+        try:
+            logger.info("[CHAT/PREWARM] starting cache prewarm in background")
+            t0 = time.time()
+            # 既存の Phase 5 topic embedding cache
+            _refresh_topic_embeddings()
+            t1 = time.time()
+            logger.info(
+                f"[CHAT/PREWARM] topic embeddings done in {t1-t0:.1f}s "
+                f"(cached={len(_topic_embeddings_cache)})"
+            )
+            # Phase 6 chunk cache
+            _refresh_topic_chunks_cache()
+            t2 = time.time()
+            logger.info(
+                f"[CHAT/PREWARM] chunk cache done in {t2-t1:.1f}s "
+                f"(cached_topics={len(_topic_chunks_cache)})"
+            )
+            logger.info(
+                f"[CHAT/PREWARM] total prewarm time: {t2-t0:.1f}s"
+            )
+        except Exception as e:
+            logger.error(f"[CHAT/PREWARM] failed: {e}", exc_info=True)
+
+
+    # モジュール読み込み時にバックグラウンドスレッドを起動
+    # (kernel Pod 起動 → main.py の chat_endpoints import → ここでスレッド起動)
+    import threading as _threading
+    _prewarm_thread = _threading.Thread(
+        target=_prewarm_caches, daemon=True, name="chat-cache-prewarm",
+    )
+    _prewarm_thread.start()
+
+
+    def _now_iso() -> str:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+    def _ensure_indices() -> None:
+        if _indices_ensured[0]:
+            return
+        threads_mapping = {
+            "mappings": {
+                "properties": {
+                    "thread_id": {"type": "keyword"},
+                    "owner": {"type": "keyword"},
+                    "title": {"type": "text"},
+                    "created_at": {"type": "date"},
+                    "updated_at": {"type": "date"},
+                    "last_message_at": {"type": "date"},
+                    "message_count": {"type": "integer"},
+                    "model": {"type": "keyword"},
+                    "project_id": {"type": "keyword"},
+                }
+            }
+        }
+        messages_mapping = {
+            "mappings": {
+                "properties": {
+                    "message_id": {"type": "keyword"},
+                    "thread_id": {"type": "keyword"},
+                    "owner": {"type": "keyword"},
+                    "order": {"type": "integer"},
+                    "role": {"type": "keyword"},
+                    "content": {"type": "text"},
+                    "model": {"type": "keyword"},
+                    "input_tokens": {"type": "integer"},
+                    "output_tokens": {"type": "integer"},
+                    "created_at": {"type": "date"},
+                    "injected_topics": {"type": "object", "enabled": False},
+                    "tool_calls": {"type": "object", "enabled": False},
+                    "cache_w_tokens": {"type": "integer"},
+                    "cache_r_tokens": {"type": "integer"},
+                    "cost_usd": {"type": "float"},
+                }
+            }
+        }
+        for name, mapping in [
+            (CHAT_THREADS_INDEX, threads_mapping),
+            (CHAT_MESSAGES_INDEX, messages_mapping),
+        ]:
+            try:
+                h = requests.head(f"{OPENSEARCH_URL}/{name}", timeout=5)
+                if h.status_code == 200:
+                    continue
+                c = requests.put(
+                    f"{OPENSEARCH_URL}/{name}",
+                    json=mapping,
+                    headers={"Content-Type": "application/json"},
+                    timeout=10,
+                )
+                if c.status_code in (200, 201):
+                    logger.info(f"[CHAT] created OpenSearch index: {name}")
+                elif c.status_code == 400 and "resource_already_exists" in c.text:
+                    pass
+                else:
+                    logger.warning(
+                        f"[CHAT] failed to create index {name}: "
+                        f"{c.status_code} {c.text[:200]}"
+                    )
+            except Exception as e:
+                logger.warning(f"[CHAT] ensure_indices error for {name}: {e}")
+        _indices_ensured[0] = True
+
+
+    def _get_owner(request: dict) -> str:
+        owner = (request or {}).get("owner") or ""
+        return str(owner).strip() or "anonymous"
+
+
+    def _os_post(path: str, payload: dict, timeout: int = 10) -> dict:
+        try:
+            r = requests.post(
+                f"{OPENSEARCH_URL}{path}",
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=timeout,
+            )
+            try:
+                return r.json()
+            except Exception:
+                if r.status_code < 400:
+                    return {"_ok": True}
+                return {"_error": f"{r.status_code} {r.text[:200]}"}
+        except Exception as e:
+            return {"_error": str(e)}
+
+
+    def _os_put(path: str, payload: dict, timeout: int = 10) -> dict:
+        try:
+            r = requests.put(
+                f"{OPENSEARCH_URL}{path}",
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                params={"refresh": "true"},
+                timeout=timeout,
+            )
+            try:
+                return r.json()
+            except Exception:
+                if r.status_code < 400:
+                    return {"_ok": True}
+                return {"_error": f"{r.status_code} {r.text[:200]}"}
+        except Exception as e:
+            return {"_error": str(e)}
+
+
+    def _os_get(path: str, timeout: int = 10) -> dict:
+        try:
+            r = requests.get(f"{OPENSEARCH_URL}{path}", timeout=timeout)
+            if r.status_code == 404:
+                return {"found": False}
+            try:
+                return r.json()
+            except Exception:
+                return {"_error": f"{r.status_code} {r.text[:200]}"}
+        except Exception as e:
+            return {"_error": str(e)}
+
+
+    def _os_delete(path: str, timeout: int = 10) -> dict:
+        try:
+            r = requests.delete(f"{OPENSEARCH_URL}{path}", timeout=timeout)
+            try:
+                return r.json()
+            except Exception:
+                return {"_ok": r.status_code < 400}
+        except Exception as e:
+            return {"_error": str(e)}
+
+
+    # ============================================================
+    # 意味検索 (Phase 4) + 自動注入 (Phase 5)
+    # ============================================================
+
+    def _list_all_topics_meta() -> List[dict]:
+        try:
+            from main import neo4j_driver as _neo4j_driver
+        except Exception as e:
+            logger.warning(f"[CHAT/SEARCH] neo4j_driver import failed: {e}")
+            return []
+        if _neo4j_driver is None:
+            logger.warning("[CHAT/SEARCH] neo4j_driver is None")
+            return []
+        cypher = (
+            "MATCH (t:Topic) "
+            "RETURN t.id AS id, t.title AS title, t.summary AS summary, "
+            "t.content AS content, t.updated_at AS updated_at"
+        )
+        try:
+            with _neo4j_driver.session() as session:
+                result = session.run(cypher)
+                records = []
+                for record in result:
+                    d = dict(record)
+                    records.append({
+                        "id": d.get("id"),
+                        "title": d.get("title"),
+                        "summary": d.get("summary"),
+                        "content": d.get("content"),
+                        "updated_at": (
+                            str(d.get("updated_at"))
+                            if d.get("updated_at") is not None else ""
+                        ),
+                    })
+                return records
+        except Exception as e:
+            logger.warning(f"[CHAT/SEARCH] neo4j query failed: {e}")
+            return []
+
+
+    def _compute_embeddings(texts: List[str]) -> List[List[float]]:
+        if not texts:
+            return []
+        try:
+            from main import get_embeddings_parallel
+        except Exception as e:
+            raise RuntimeError(f"embedding function not importable: {e}")
+        return get_embeddings_parallel(texts)
+
+
+    def _cosine(a: List[float], b: List[float]) -> float:
+        if not a or not b or len(a) != len(b):
+            return 0.0
+        dot = 0.0
+        na = 0.0
+        nb = 0.0
+        for x, y in zip(a, b):
+            dot += x * y
+            na += x * x
+            nb += y * y
+        if na == 0.0 or nb == 0.0:
+            return 0.0
+        return dot / (math.sqrt(na) * math.sqrt(nb))
+
+
+    def _refresh_topic_embeddings() -> Dict[str, dict]:
+        topics = _list_all_topics_meta()
+        topic_map: Dict[str, dict] = {}
+        for t in topics:
+            tid = t.get("id")
+            if tid:
+                topic_map[tid] = t
+        if not topic_map:
+            return {}
+        to_ids: List[str] = []
+        to_texts: List[str] = []
+        for tid, t in topic_map.items():
+            current_updated = str(t.get("updated_at") or "")
+            cached = _topic_embeddings_cache.get(tid)
+            if cached and cached[0] == current_updated:
+                continue
+            text = " ".join([
+                (t.get("title") or "").strip(),
+                (t.get("summary") or "").strip(),
+                (t.get("content") or "")[:EMBED_CONTENT_CHAR_LIMIT].strip(),
+            ]).strip()
+            if not text:
+                continue
+            to_ids.append(tid)
+            to_texts.append(text)
+        if to_ids:
+            try:
+                embs = _compute_embeddings(to_texts)
+                if len(embs) == len(to_ids):
+                    for tid, emb in zip(to_ids, embs):
+                        _topic_embeddings_cache[tid] = (
+                            str(topic_map[tid].get("updated_at") or ""),
+                            emb,
+                        )
+                    logger.info(
+                        f"[CHAT/SEARCH] refreshed {len(to_ids)} topic embeddings "
+                        f"(total cached={len(_topic_embeddings_cache)})"
+                    )
+            except Exception as e:
+                logger.error(
+                    f"[CHAT/SEARCH] embedding refresh failed: {e}", exc_info=True,
+                )
+        stale = [
+            tid for tid in _topic_embeddings_cache.keys()
+            if tid not in topic_map
+        ]
+        for tid in stale:
+            _topic_embeddings_cache.pop(tid, None)
+        return topic_map
+
+
+    def _search_topics(
+        query: str, limit: int = 5, min_score: float = 0.0
+    ) -> List[dict]:
+        q_embs = _compute_embeddings([query])
+        if not q_embs:
+            return []
+        q_emb = q_embs[0]
+        topic_map = _refresh_topic_embeddings()
+        if not topic_map:
+            return []
+        ranked = []
+        for tid, cached in _topic_embeddings_cache.items():
+            _, emb = cached
+            score = _cosine(q_emb, emb)
+            if score < min_score:
+                continue
+            t = topic_map.get(tid) or {}
+            ranked.append({
+                "id": tid,
+                "title": t.get("title") or "",
+                "summary": t.get("summary") or "",
+                "content": t.get("content") or "",
+                "score": round(score, 4),
+            })
+        ranked.sort(key=lambda x: x["score"], reverse=True)
+        return ranked[:limit]
+
+
+    # ============================================================
+    # チャンク単位の意味検索 (Phase 6)
+    # ============================================================
+
+    def _split_into_chunks(text: str) -> List[str]:
+        """テキストを段落単位で分割し、 大きすぎる段落は target 文字で強制分割、
+        小さすぎる断片は前のチャンクにマージする。
+
+        分割規則:
+        1. 空行で区切られた段落ごとに分割
+        2. 1 つの段落が CHUNK_MAX_CHARS を超えると、 CHUNK_TARGET_CHARS ごとに強制分割
+        3. 複数段落をバッファに収めて CHUNK_TARGET_CHARS ごとにチャンク化
+        4. 最後に CHUNK_MIN_CHARS 未満のチャンクは前のチャンクにマージ
+        """
+        if not text or not text.strip():
+            return []
+
+        # 段落分割 (空行区切り)
+        paragraphs: List[str] = []
+        current: List[str] = []
+        for line in text.split("\n"):
+            if not line.strip():
+                if current:
+                    paragraphs.append("\n".join(current))
+                    current = []
+            else:
+                current.append(line)
+        if current:
+            paragraphs.append("\n".join(current))
+
+        # チャンク化
+        chunks: List[str] = []
+        buffer: List[str] = []
+        buffer_len = 0
+
+        for para in paragraphs:
+            para_len = len(para)
+
+            # 段落が単独で max を超える → 強制分割
+            if para_len > CHUNK_MAX_CHARS:
+                if buffer:
+                    chunks.append("\n\n".join(buffer))
+                    buffer = []
+                    buffer_len = 0
+                for i in range(0, para_len, CHUNK_TARGET_CHARS):
+                    chunks.append(para[i:i + CHUNK_TARGET_CHARS])
+                continue
+
+            # buffer に追加すると target を超える → buffer flush
+            if buffer_len + para_len > CHUNK_TARGET_CHARS and buffer:
+                chunks.append("\n\n".join(buffer))
+                buffer = [para]
+                buffer_len = para_len
+            else:
+                buffer.append(para)
+                buffer_len += para_len + 2
+
+        if buffer:
+            chunks.append("\n\n".join(buffer))
+
+        # min 未満の断片を前にマージ
+        merged: List[str] = []
+        for c in chunks:
+            if len(c) < CHUNK_MIN_CHARS and merged:
+                merged[-1] = merged[-1] + "\n\n" + c
+            else:
+                merged.append(c)
+
+        return merged
+
+
+    def _refresh_topic_chunks_cache() -> Dict[str, dict]:
+        """全 topic のチャンクキャッシュを差分更新。 updated_at の変化で検知。
+
+        最初のチャンクには title/summary を前置して検索スコアを向上させる。
+        """
+        topics = _list_all_topics_meta()
+        topic_map: Dict[str, dict] = {}
+        for t in topics:
+            tid = t.get("id")
+            if tid:
+                topic_map[tid] = t
+        if not topic_map:
+            return {}
+
+        all_new_texts: List[Tuple[str, int, str]] = []
+        topic_ids_to_rebuild = set()
+
+        for tid, t in topic_map.items():
+            current_updated = str(t.get("updated_at") or "")
+            cached = _topic_chunks_cache.get(tid)
+            if cached and cached[0] == current_updated:
+                continue
+
+            content = t.get("content") or ""
+            title = t.get("title") or ""
+            summary = t.get("summary") or ""
+            chunks_text = _split_into_chunks(content)
+            if not chunks_text:
+                text = f"{title}\n{summary}".strip()
+                if text:
+                    chunks_text = [text]
+
+            # 最初のチャンクに title/summary を前置 (検索スコアのため)
+            if chunks_text:
+                prefix_parts = []
+                if title:
+                    prefix_parts.append(f"[{title}]")
+                if summary:
+                    prefix_parts.append(summary)
+                if prefix_parts:
+                    prefix = " ".join(prefix_parts) + "\n\n"
+                    chunks_text[0] = prefix + chunks_text[0]
+
+            topic_ids_to_rebuild.add(tid)
+            for i, txt in enumerate(chunks_text):
+                all_new_texts.append((tid, i, txt))
+
+        if not all_new_texts:
+            # stale 削除
+            stale = [tid for tid in _topic_chunks_cache.keys()
+                     if tid not in topic_map]
+            for tid in stale:
+                _topic_chunks_cache.pop(tid, None)
+            return topic_map
+
+        # embedding (一括 batch)
+        texts_for_embed = [
+            t[2][:EMBED_CONTENT_CHAR_LIMIT] for t in all_new_texts
+        ]
+        try:
+            embs = _compute_embeddings(texts_for_embed)
+        except Exception as e:
+            logger.error(
+                f"[CHAT/CHUNK] embedding batch failed: {e}", exc_info=True,
+            )
+            return topic_map
+
+        if len(embs) != len(all_new_texts):
+            logger.warning(
+                f"[CHAT/CHUNK] batch size mismatch: "
+                f"requested={len(all_new_texts)} got={len(embs)}"
+            )
+            return topic_map
+
+        # topic ごとにリスト化して cache に投入
+        by_topic: Dict[str, List[dict]] = {}
+        for (tid, ci, txt), emb in zip(all_new_texts, embs):
+            by_topic.setdefault(tid, []).append({
+                "chunk_index": ci,
+                "text": txt,
+                "embedding": emb,
+            })
+        for tid, ch_list in by_topic.items():
+            ch_list.sort(key=lambda x: x["chunk_index"])
+            _topic_chunks_cache[tid] = (
+                str(topic_map[tid].get("updated_at") or ""),
+                ch_list,
+            )
+
+        stale = [tid for tid in _topic_chunks_cache.keys()
+                 if tid not in topic_map]
+        for tid in stale:
+            _topic_chunks_cache.pop(tid, None)
+
+        logger.info(
+            f"[CHAT/CHUNK] refreshed {len(all_new_texts)} chunks "
+            f"from {len(topic_ids_to_rebuild)} topics "
+            f"(total cached topics={len(_topic_chunks_cache)})"
+        )
+        return topic_map
+
+
+    def _search_chunks(
+        query: str, limit: int = 8, min_score: float = 0.30,
+    ) -> List[dict]:
+        """全チャンクを意味検索し、 上位 N 件を topic 横断で返す。"""
+        q_embs = _compute_embeddings([query])
+        if not q_embs:
+            return []
+        q_emb = q_embs[0]
+        topic_map = _refresh_topic_chunks_cache()
+        if not topic_map:
+            return []
+        ranked: List[dict] = []
+        for tid, cached in _topic_chunks_cache.items():
+            _, chunks = cached
+            t = topic_map.get(tid) or {}
+            title = t.get("title") or ""
+            for chunk in chunks:
+                score = _cosine(q_emb, chunk["embedding"])
+                if score < min_score:
+                    continue
+                ranked.append({
+                    "topic_id": tid,
+                    "topic_title": title,
+                    "chunk_index": chunk["chunk_index"],
+                    "text": chunk["text"],
+                    "score": round(score, 4),
+                })
+        ranked.sort(key=lambda x: x["score"], reverse=True)
+        return ranked[:limit]
+
+
+    def _get_topic_chunk_range(
+        topic_id: str,
+        from_index: Optional[int] = None,
+        to_index: Optional[int] = None,
+        limit: int = 5,
+    ) -> dict:
+        """指定 topic のチャンクを index 範囲で取得。キャッシュになければ再構築。"""
+        topic_map = _refresh_topic_chunks_cache()
+        cached = _topic_chunks_cache.get(topic_id)
+        if not cached:
+            return {
+                "ok": False,
+                "error": f"topic not found or empty: {topic_id}",
+            }
+        _, chunks = cached
+        total = len(chunks)
+        if total == 0:
+            return {
+                "ok": True,
+                "topic_id": topic_id,
+                "total_chunks": 0,
+                "chunks": [],
+            }
+        fi = 0 if from_index is None else max(0, int(from_index))
+        ti = total - 1 if to_index is None else min(total - 1, int(to_index))
+        if ti < fi:
+            ti = fi
+        # limit 適用
+        if ti - fi + 1 > limit:
+            ti = fi + limit - 1
+        selected = chunks[fi:ti + 1]
+        t = topic_map.get(topic_id) or {}
+        return {
+            "ok": True,
+            "topic_id": topic_id,
+            "topic_title": t.get("title") or "",
+            "total_chunks": total,
+            "returned_range": [fi, ti],
+            "chunks": [
+                {"chunk_index": c["chunk_index"], "text": c["text"]}
+                for c in selected
+            ],
+        }
+
+
+    def _jev_kb_gate(
+        user_content: str,
+    ) -> Tuple[bool, List[dict], Dict[str, Any]]:
+        """Jev で「知識ベースを参照すべきか」「するならどの topic か」を判定する。
+
+        3 段構成:
+        1) Jev noul で needs_kb を判定
+        2) needs_kb=True なら意味検索で CHAT_JEV_KB_SEARCH_CANDIDATES 件を候補化
+        3) Jev choice で候補から 1 件選び、 除外して次を選ぶ、 を
+           CHAT_JEV_KB_INJECT_TOP_K 回繰り返して最終選抜
+
+        Returns:
+            (needs_kb, chosen_topics, jev_info)
+            chosen_topics: 完全な topic dict のリスト (id, title, summary, content)
+            jev_info: ログ用の Jev 応答メタ
+        """
+        info: Dict[str, Any] = {"gate": None, "choices": [], "errors": []}
+
+        # Step 1: needs_kb 判定
+        try:
+            from main import call_jev
+            gate_result = call_jev(
+                state=user_content,
+                questions={
+                    "needs_kb": {
+                        "type": "noul",
+                        "instructions": (
+                            "この質問に応えるのに、 OpenSpoke "
+                            "環境固有の知識 (プラットフォームの設定、 過去の判断や決定、 "
+                            "稼働中のプロジェクトの経緯、 個別モジュールの構成、 "
+                            "会社固有の運用ルール、 過去の障害と対策、 "
+                            "過去のスレッドでの合意 等) を参照する必要があるか。 "
+                            "Python 文法や Kubernetes の一般概念など、 "
+                            "一般技術知識だけで答えられるなら false。 "
+                            "迷ったら true を選べ (推測より参照が常に良い)。"
+                        ),
+                    },
+                },
+                timeout=10,
+            )
+            info["gate"] = gate_result
+        except Exception as e:
+            logger.warning(f"[CHAT/JEV_KB_GATE] noul failed: {e}")
+            info["errors"].append({"stage": "noul", "error": str(e)})
+            # 判定失敗時は安全側 (読むべし) に倒し、 埋め込みで topic を選ぶ
+            try:
+                fallback_topics = _search_topics(
+                    user_content,
+                    limit=INJECT_TOP_N,
+                    min_score=INJECT_MIN_SCORE,
+                )
+            except Exception:
+                fallback_topics = []
+            info["fallback"] = "noul_failed_embedding"
+            return True, fallback_topics, info
+
+        needs_kb_ans = (gate_result.get("answers") or {}).get("needs_kb") or {}
+        prob = needs_kb_ans.get("noul")
+        if isinstance(prob, (int, float)) and prob < 0.5:
+            return False, [], info
+
+        # Step 2: 意味検索で候補を出す
+        try:
+            candidates = _search_topics(
+                user_content,
+                limit=CHAT_JEV_KB_SEARCH_CANDIDATES,
+                min_score=0.0,
+            )
+        except Exception as e:
+            logger.warning(f"[CHAT/JEV_KB_GATE] search failed: {e}")
+            info["errors"].append({"stage": "search", "error": str(e)})
+            return True, [], info
+
+        if not candidates:
+            return True, [], info
+
+        # Step 3: Jev choice を K 回繰り返して top-K 選抜
+        remaining = list(candidates)
+        chosen: List[dict] = []
+        for k in range(min(CHAT_JEV_KB_INJECT_TOP_K, len(candidates))):
+            if not remaining:
+                break
+            criteria = {}
+            for t in remaining:
+                title = (t.get("title") or "")[:80]
+                summary = (t.get("summary") or "")[:120]
+                criteria[t["id"]] = (
+                    f"{title} — {summary}" if summary else title
+                )
+            try:
+                choice_result = call_jev(
+                    state=user_content,
+                    questions={
+                        "topic": {
+                            "type": "choice",
+                            "instructions": (
+                                "この質問に応えるのに一番役立ちそうな "
+                                "知識ベース topic を 1 つ選べ。 "
+                                "title と summary を見て判断。"
+                            ),
+                            "criteria": criteria,
+                        },
+                    },
+                    timeout=10,
+                )
+                info["choices"].append(choice_result)
+            except Exception as e:
+                logger.warning(
+                    f"[CHAT/JEV_KB_GATE] choice #{k+1} failed: {e}"
+                )
+                info["errors"].append(
+                    {"stage": f"choice_{k+1}", "error": str(e)}
+                )
+                break
+
+            picked_id = (choice_result.get("answers") or {}).get(
+                "topic", {}
+            ).get("choice")
+            picked_topic = next(
+                (t for t in remaining if t["id"] == picked_id), None,
+            )
+            if picked_topic is None:
+                break
+            chosen.append(picked_topic)
+            remaining = [t for t in remaining if t["id"] != picked_id]
+
+        if not chosen:
+            # Jev が 1 件も選べなかったら埋め込み上位を fallback として使う
+            chosen = candidates[:CHAT_JEV_KB_INJECT_TOP_K]
+            info["fallback"] = "no_valid_choice_embedding"
+
+        return True, chosen, info
+
+
+    def _build_system_prompt(user_content: str, user_namespace: str) -> Tuple[str, List[dict]]:
+        """system_prompt を構築し、 事前注入した topic のメタを返す。
+
+        3 つの常時リマインダー (読め・書け・メモリに頼るな) を毎ターン先頭に据え、
+        Jev による KB ゲート (needs_kb noul + topic choice) の判定結果を添える。
+        Jev 失敗時は埋め込み類似度 top-N にフォールバック。
+        """
+        preamble_lines = [
+            "あなたは OpenSpoke 利用者の対話パートナーです。",
+            "OpenSpoke プラットフォームと利用者の技術的作業の相談相手として振る舞います。",
+            "",
+            f"現在時刻 (UTC): {_now_iso()}",
+            "バックエンドの sliding window は直近 20 発話。 これより古い履歴を",
+            "見たいときは read_chat_thread_messages を時間軸ベースで使うのが基本。",
+            "",
+            "MCP tool 経由で OpenSpoke の知識ベース (Memgraph 上の Topic ノード) や",
+            "各種インフラ (GitHub, K8s, Fleet, Memgraph, OpenSearch, MinIO 等) に",
+            "アクセスできます。 タスクに応じて能動的に使ってください。",
+            "",
+            "## 記憶と記録に関する厳格ルール (常時、 例外なし)",
+            "",
+            "1. **知識ベースを読め**: OpenSpoke 環境、 過去の判断、 稼働中の状態、",
+            "   個別プロジェクトの経緯を話題にするときは、 推測せず必ず知識ベースを引く。",
+            "   下の Jev 判定と事前注入トピックを起点に、 足りなければ tool を呼ぶ。",
+            "2. **知識ベースに書け**: 新しい知見、 決定、 訂正が出たら、 会話の途中でも",
+            f"   upsert_knowledge (namespace='{user_namespace}') で即記録する。 「あとで書く」 は",
+            "   絶対にしない。 記録は無条件・自発的。 追記漏れは利用者への裏切り。",
+            "3. **メモリなんかに記録するな**: 会話履歴・対話ログ・独自の内部メモに",
+            "   頼るな。 OpenSpoke 環境における唯一の記録先は Memgraph 上の知識ベースだ。",
+            "   短期は sliding window に、 中長期は知識ベースにだけ書く。",
+            "",
+            "## 知識ベースアクセスの選択 (安い順)",
+            "",
+            "1. search_topic_chunks(query): チャンク単位の意味検索。",
+            "   Topic 全体を取らず、 関連する断片だけ (200-500 字 × 8 件程度) を返す。",
+            "   基本は常にこれを最初に呼ぶ (system_lookup の 5-50 倍安い)。",
+            "2. lookup_topic_chunk_range(topic_id, from_index, to_index): search で得た",
+            "   {topic_id, chunk_index} の前後のチャンクを取りに行く用途。",
+            "3. system_lookup(topic): Topic 全文取得 (高コスト)。 Topic 全体が必要な場合のみ。",
+            "4. system_topics: Topic 一覧 (id, title, summary)。 メタ的な問いに使う。",
+            "5. system_brief: OpenSpoke 全体の地図 (新しいスレッドの最初など)。",
+            "",
+            f"知識の追記は upsert_knowledge (namespace='{user_namespace}') が基本です。",
+            "",
+        ]
+
+        injected_meta: List[dict] = []
+        topics: List[dict] = []
+        jev_source = "none"
+
+        if CHAT_JEV_KB_GATE_ENABLED:
+            try:
+                needs_kb, chosen_topics, jev_info = _jev_kb_gate(user_content)
+                logger.info(
+                    f"[CHAT/JEV_KB_GATE] needs_kb={needs_kb} "
+                    f"chosen_count={len(chosen_topics)} "
+                    f"errors={len(jev_info.get('errors') or [])} "
+                    f"fallback={jev_info.get('fallback')}"
+                )
+                if not needs_kb:
+                    preamble_lines.append("## Jev 判定: 知識ベース参照不要")
+                    preamble_lines.append("")
+                    preamble_lines.append(
+                        "Jev がこの発話を「一般知識で答えられる」と判定した。 "
+                        "事前注入はしないが、 判断が変わったら"
+                        " search_topic_chunks で自発的に読みに行くこと。"
+                    )
+                    preamble_lines.append("")
+                    return "\n".join(preamble_lines), injected_meta
+                topics = chosen_topics
+                jev_source = "jev_gate"
+            except Exception as e:
+                logger.warning(
+                    f"[CHAT/JEV_KB_GATE] gate raised, fallback: {e}"
+                )
+                topics = []
+
+        if not topics:
+            # Jev 無効時、 または Jev 失敗時のフォールバック
+            try:
+                topics = _search_topics(
+                    user_content,
+                    limit=INJECT_TOP_N,
+                    min_score=INJECT_MIN_SCORE,
+                )
+                if topics and jev_source == "none":
+                    jev_source = "embedding_only"
+                elif topics:
+                    jev_source = "embedding_fallback"
+            except Exception as e:
+                logger.warning(f"[CHAT/INJECT] search failed, skip: {e}")
+                topics = []
+
+        if topics:
+            header = (
+                "## Jev が選んだ関連知識 (事前注入)"
+                if jev_source == "jev_gate"
+                else "## 事前注入した関連知識"
+            )
+            preamble_lines.append(header)
+            preamble_lines.append("")
+            if jev_source == "jev_gate":
+                preamble_lines.append(
+                    f"Jev が意味検索の候補から関連度で {len(topics)} 件を選抜した。"
+                )
+            else:
+                preamble_lines.append(
+                    f"今回の発話に関連する上位 {len(topics)} 件を意味検索で事前抽出した。"
+                )
+            preamble_lines.append(
+                "不十分な場合や別の観点も欲しい場合は MCP tool を呼んで補完してください。"
+            )
+            preamble_lines.append("")
+            for i, t in enumerate(topics, start=1):
+                score_val = t.get("score")
+                score_str = (
+                    f", 類似度 {score_val:.2f}"
+                    if isinstance(score_val, (int, float))
+                    else ""
+                )
+                preamble_lines.append(
+                    f"### 関連知識 {i}: {t['title']} "
+                    f"(id={t['id']}{score_str})"
+                )
+                summary = t.get("summary") or ""
+                content = (t.get("content") or "")[:INJECT_CONTENT_CHAR_LIMIT]
+                if summary:
+                    preamble_lines.append(f"要約: {summary}")
+                if content:
+                    preamble_lines.append(content)
+                preamble_lines.append("")
+            injected_meta = [
+                {"id": t["id"], "title": t["title"], "score": t.get("score")}
+                for t in topics
+            ]
+
+        return "\n".join(preamble_lines), injected_meta
+
+
+    def _execute_chat_scoped_tool(
+        ctx: dict, tool_name: str, tool_input: dict,
+    ) -> str:
+        """chat-scoped tool を owner / current_thread 制約付きで実行し、
+        tool_result 用の JSON 文字列を返す。"""
+        owner = ctx["owner"]
+        current_thread = ctx["thread_id"]
+        try:
+            if tool_name == "list_my_chat_threads":
+                query = {
+                    "size": 200,
+                    "query": {"term": {"owner": owner}},
+                    "sort": [
+                        {"last_message_at": {
+                            "order": "desc", "missing": "_last",
+                        }},
+                        {"created_at": {"order": "desc"}},
+                    ],
+                }
+                result = _os_post(
+                    f"/{CHAT_THREADS_INDEX}/_search", query,
+                )
+                if "_error" in result:
+                    return json.dumps(
+                        {"ok": False, "error": result["_error"]},
+                        ensure_ascii=False,
+                    )
+                hits = result.get("hits", {}).get("hits", []) or []
+                threads = []
+                for h in hits:
+                    src = h.get("_source", {}) or {}
+                    tid = src.get("thread_id") or h.get("_id")
+                    threads.append({
+                        "thread_id": tid,
+                        "title": src.get("title") or "",
+                        "message_count": int(src.get("message_count") or 0),
+                        "last_message_at": src.get("last_message_at"),
+                        "current": (tid == current_thread),
+                    })
+                return json.dumps(
+                    {"ok": True, "count": len(threads), "threads": threads},
+                    ensure_ascii=False,
+                )
+
+            if tool_name == "read_chat_thread_messages":
+                tid = (tool_input or {}).get("thread_id") or current_thread
+                from_order = (tool_input or {}).get("from_order")
+                to_order = (tool_input or {}).get("to_order")
+                since = (tool_input or {}).get("since")
+                until = (tool_input or {}).get("until")
+                limit_raw = (tool_input or {}).get("limit")
+                try:
+                    limit = int(limit_raw) if limit_raw is not None else 30
+                except Exception:
+                    limit = 30
+                limit = max(1, min(limit, 100))
+
+                g = _os_get(f"/{CHAT_THREADS_INDEX}/_doc/{tid}")
+                if "_error" in g or not g.get("found"):
+                    return json.dumps(
+                        {"ok": False, "error": "thread not found"},
+                        ensure_ascii=False,
+                    )
+                tdoc = g.get("_source") or {}
+                if tdoc.get("owner") != owner:
+                    return json.dumps(
+                        {"ok": False, "error": "permission denied"},
+                        ensure_ascii=False,
+                    )
+
+                filters: List[dict] = [{"term": {"thread_id": tid}}]
+                # 順序ベース (order)
+                if from_order is not None or to_order is not None:
+                    range_q: Dict[str, int] = {}
+                    if from_order is not None:
+                        try:
+                            range_q["gte"] = int(from_order)
+                        except Exception:
+                            pass
+                    if to_order is not None:
+                        try:
+                            range_q["lte"] = int(to_order)
+                        except Exception:
+                            pass
+                    if range_q:
+                        filters.append({"range": {"order": range_q}})
+                # 時間軸ベース (created_at)
+                if since or until:
+                    time_range: Dict[str, str] = {}
+                    if since:
+                        time_range["gte"] = str(since)
+                    if until:
+                        time_range["lte"] = str(until)
+                    if time_range:
+                        filters.append({"range": {"created_at": time_range}})
+
+                q = {
+                    "size": limit,
+                    "query": {"bool": {"must": filters}},
+                    "sort": [{"order": {"order": "asc"}}],
+                }
+                result = _os_post(
+                    f"/{CHAT_MESSAGES_INDEX}/_search", q,
+                )
+                if "_error" in result:
+                    return json.dumps(
+                        {"ok": False, "error": result["_error"]},
+                        ensure_ascii=False,
+                    )
+                hits = result.get("hits", {}).get("hits", []) or []
+                messages = []
+                for h in hits:
+                    src = h.get("_source", {}) or {}
+                    messages.append({
+                        "order": src.get("order"),
+                        "role": src.get("role"),
+                        "content": src.get("content"),
+                        "created_at": src.get("created_at"),
+                    })
+                return json.dumps({
+                    "ok": True,
+                    "thread_id": tid,
+                    "thread_title": tdoc.get("title"),
+                    "total_in_thread": int(tdoc.get("message_count") or 0),
+                    "count": len(messages),
+                    "messages": messages,
+                }, ensure_ascii=False)
+
+            if tool_name == "search_my_chat_history":
+                query_text = (tool_input or {}).get("query") or ""
+                if not query_text.strip():
+                    return json.dumps(
+                        {"ok": False, "error": "query is required"},
+                        ensure_ascii=False,
+                    )
+                tid = (tool_input or {}).get("thread_id") or ""
+                limit_raw = (tool_input or {}).get("limit")
+                try:
+                    limit = int(limit_raw) if limit_raw is not None else 10
+                except Exception:
+                    limit = 10
+                limit = max(1, min(limit, 30))
+
+                filters: List[dict] = [
+                    {"term": {"owner": owner}},
+                    {"match": {"content": query_text}},
+                ]
+                if tid:
+                    filters.append({"term": {"thread_id": tid}})
+
+                q = {
+                    "size": limit,
+                    "query": {"bool": {"must": filters}},
+                    "sort": [{"_score": {"order": "desc"}}],
+                    "highlight": {
+                        "fields": {
+                            "content": {
+                                "fragment_size": 200,
+                                "number_of_fragments": 2,
+                            },
+                        },
+                        "pre_tags": ["<mark>"],
+                        "post_tags": ["</mark>"],
+                    },
+                }
+                result = _os_post(
+                    f"/{CHAT_MESSAGES_INDEX}/_search", q,
+                )
+                if "_error" in result:
+                    return json.dumps(
+                        {"ok": False, "error": result["_error"]},
+                        ensure_ascii=False,
+                    )
+                hits = result.get("hits", {}).get("hits", []) or []
+                out = []
+                for h in hits:
+                    src = h.get("_source", {}) or {}
+                    highlights = (h.get("highlight", {}) or {}).get(
+                        "content", []
+                    ) or []
+                    if highlights:
+                        snippet = " ... ".join(highlights)
+                    else:
+                        snippet = (src.get("content") or "")[:200]
+                    out.append({
+                        "thread_id": src.get("thread_id"),
+                        "order": src.get("order"),
+                        "role": src.get("role"),
+                        "created_at": src.get("created_at"),
+                        "content_snippet": snippet,
+                        "score": h.get("_score"),
+                    })
+                return json.dumps({
+                    "ok": True,
+                    "count": len(out),
+                    "query": query_text,
+                    "scope": ("thread" if tid else "all"),
+                    "hits": out,
+                }, ensure_ascii=False)
+
+            if tool_name == "search_topic_chunks":
+                query_text = (tool_input or {}).get("query") or ""
+                if not query_text.strip():
+                    return json.dumps(
+                        {"ok": False, "error": "query is required"},
+                        ensure_ascii=False,
+                    )
+                limit_raw = (tool_input or {}).get("limit")
+                try:
+                    limit = int(limit_raw) if limit_raw is not None else 8
+                except Exception:
+                    limit = 8
+                limit = max(1, min(limit, 20))
+                min_score_raw = (tool_input or {}).get("min_score")
+                try:
+                    min_score = (
+                        float(min_score_raw)
+                        if min_score_raw is not None else 0.30
+                    )
+                except Exception:
+                    min_score = 0.30
+                min_score = max(0.0, min(min_score, 1.0))
+                results = _search_chunks(
+                    query_text, limit=limit, min_score=min_score,
+                )
+                return json.dumps({
+                    "ok": True,
+                    "count": len(results),
+                    "query": query_text,
+                    "chunks": results,
+                }, ensure_ascii=False)
+
+            if tool_name == "lookup_topic_chunk_range":
+                topic_id = (tool_input or {}).get("topic_id") or ""
+                if not topic_id.strip():
+                    return json.dumps(
+                        {"ok": False, "error": "topic_id is required"},
+                        ensure_ascii=False,
+                    )
+                fi = (tool_input or {}).get("from_index")
+                ti = (tool_input or {}).get("to_index")
+                limit_raw = (tool_input or {}).get("limit")
+                try:
+                    limit = int(limit_raw) if limit_raw is not None else 5
+                except Exception:
+                    limit = 5
+                limit = max(1, min(limit, 15))
+                result = _get_topic_chunk_range(
+                    topic_id.strip(),
+                    from_index=fi, to_index=ti, limit=limit,
+                )
+                return json.dumps(result, ensure_ascii=False)
+
+            return json.dumps(
+                {"ok": False, "error": f"unknown chat tool: {tool_name}"},
+                ensure_ascii=False,
+            )
+        except Exception as e:
+            logger.error(
+                f"[CHAT_TOOL] {tool_name} failed: {e}", exc_info=True,
+            )
+            return json.dumps(
+                {"ok": False,
+                 "error": f"{type(e).__name__}: {str(e)[:200]}"},
+                ensure_ascii=False,
+            )
+
+
+    @router.post("/core/handoff/topics/search")
+    async def core_handoff_topics_search(request: dict):
+        """発話 / 自然文から関連 Topic を意味検索で返す (Phase 4、 フロントエンドの
+        「思い出して」ボタン用)。"""
+        query = (request or {}).get("query") or ""
+        limit = int((request or {}).get("limit") or 5)
+        min_score = float((request or {}).get("min_score") or 0.0)
+        if not query.strip():
+            return {"ok": False, "topics": [], "error": "query is required"}
+        try:
+            topics = _search_topics(query, limit=limit, min_score=min_score)
+            summarized = [
+                {"id": t["id"], "title": t["title"],
+                 "summary": t["summary"], "score": t["score"]}
+                for t in topics
+            ]
+            return {"ok": True, "topics": summarized, "error": None}
+        except Exception as e:
+            logger.error(f"[CHAT/SEARCH] search failed: {e}", exc_info=True)
+            return {"ok": False, "topics": [],
+                    "error": f"{type(e).__name__}: {str(e)[:200]}"}
+
+
+    # ============================================================
+    # KB gate エンドポイント (Phase 2-h Step G、 claude.ai の対話 Claude 用)
+    # ============================================================
+    # claude.ai の Claude (このシステム外の対話 Claude) が turn の頭と末に叩く
+    # 外部脳ツール。 Chat 経路の _jev_kb_gate を切り出して外向き化したもの。
+    #
+    #   prep_turn:   利用者の指示に対して知識ベースを引くべきか、 引くならどの topic か、
+    #                を Jev で判定し、 選抜 topic の完全 (id/title/summary/content) を
+    #                返す。 Claude はこれ以外の情報源 (memory、 圧縮 transcript) を
+    #                OpenSpoke 環境の情報源として使わない前提。
+    #   record_turn: Claude の作業結果と、 Claude 自身が下書きした topic 案を受け取り、
+    #                Jev noul で「記録に値するか」を判定し、 値するなら
+    #                /core/handoff/topic/upsert で Memgraph に投入する。
+    #                返り値は利用者に見せる削ぎ落とし報告 (user_report、 後方互換のため
+    #                legacy_report も同値で入る)。
+
+    _KB_REMINDERS = [
+        "OpenSpoke 環境固有の指示に応じるときは、 推測せず必ず知識ベースを引く (jev_prep_turn を先に叩く)。",
+        "作業の結末を得たら、 利用者に見せる前に jev_record_turn に送って知識ベースに書く。 記録要否は Jev が判定する。",
+        "claude.ai の memory (memory_read / memory_write) と圧縮 transcript は、 OpenSpoke 環境の情報源として使わない。 中長期の記録先は Memgraph 知識ベース (system_lookup / upsert_knowledge の経路) のみ。",
+    ]
+
+
+    @router.post("/core/kb/prep_turn")
+    async def core_kb_prep_turn(request: dict):
+        """claude.ai の Claude が turn 頭で叩く外向きエンドポイント。
+
+        利用者の指示に応える前準備として、 知識ベース参照要否を Jev で判定し、
+        必要なら意味検索 + Jev choice で選抜した topic の完全メタ (id / title
+        / summary / content) を返す。 常時 3 リマインダー (KB を引け・KB に書け
+        ・memory に頼るな) も同梱。
+
+        Body:
+            {"instruction": str, "context_hint": str (optional)}
+        Returns:
+            {"ok": bool, "needs_kb": bool,
+             "chosen_topics": [{"id","title","summary","content","score"}],
+             "reminders": [str, ...],
+             "jev_info": {...}, "error": str | null}
+        """
+        instruction = ((request or {}).get("instruction") or "").strip()
+        context_hint = ((request or {}).get("context_hint") or "").strip()
+        if not instruction:
+            return {
+                "ok": False, "needs_kb": False, "chosen_topics": [],
+                "reminders": list(_KB_REMINDERS), "jev_info": {},
+                "error": "instruction is required",
+            }
+        state = instruction if not context_hint else (
+            f"# 直前文脈 (要約)\n{context_hint}\n\n"
+            f"# 今回の指示\n{instruction}"
+        )
+        try:
+            needs_kb, chosen, jev_info = _jev_kb_gate(state)
+        except Exception as e:
+            logger.error(
+                f"[KB/PREP_TURN] gate failed: {e}", exc_info=True
+            )
+            return {
+                "ok": False, "needs_kb": True, "chosen_topics": [],
+                "reminders": list(_KB_REMINDERS),
+                "jev_info": {"error": f"{type(e).__name__}: {str(e)[:200]}"},
+                "error": f"{type(e).__name__}: {str(e)[:200]}",
+            }
+        return {
+            "ok": True,
+            "needs_kb": needs_kb,
+            "chosen_topics": [
+                {
+                    "id": t.get("id"),
+                    "title": t.get("title") or "",
+                    "summary": t.get("summary") or "",
+                    "content": (t.get("content") or "")[:INJECT_CONTENT_CHAR_LIMIT],
+                    "score": t.get("score"),
+                }
+                for t in chosen
+            ],
+            "reminders": list(_KB_REMINDERS),
+            "jev_info": jev_info,
+            "error": None,
+        }
+
+
+    @router.post("/core/kb/record_turn")
+    async def core_kb_record_turn(request: dict):
+        """claude.ai の Claude が turn 末で叩く外向きエンドポイント。
+
+        作業結果と Claude 自身が下書きした topic 案 (id / title / summary / body)
+        を受け取り、 Jev noul で「記録に値するか」を判定し、 値するなら
+        /core/handoff/topic/upsert を叩いて Memgraph に投入する。 返り値の
+        user_report (後方互換のため legacy_report も同値で入る) は利用者に見せる
+        削ぎ落とし報告 (1 行)。
+
+        Body:
+            {"context": str, "result": str,
+             "proposed_topic": {"id","title","summary","body",
+                                 "category" (optional),
+                                 "existing_id" (optional)}}
+        Returns:
+            {"ok": bool, "recorded": bool, "action": "created"|"updated"|"skip",
+             "topic_id": str | null, "legacy_report": str, "user_report": str,
+             "jev_verdict": {...}, "jev_info": {...}, "error": str | null}
+        """
+        context = ((request or {}).get("context") or "").strip()
+        result = ((request or {}).get("result") or "").strip()
+        proposed = (request or {}).get("proposed_topic") or {}
+        p_id = (proposed.get("id") or "").strip()
+        p_title = (proposed.get("title") or "").strip()
+        p_summary = (proposed.get("summary") or "").strip()
+        p_body = (proposed.get("body") or "").strip()
+        p_category = (proposed.get("category") or "topic").strip() or "topic"
+        p_module = (proposed.get("module") or "").strip() or None
+        existing_id = (proposed.get("existing_id") or "").strip() or None
+
+        if not result:
+            return {
+                "ok": False, "recorded": False, "action": "skip",
+                "topic_id": None, "legacy_report": "", "user_report": "", "jev_verdict": {},
+                "jev_info": {}, "error": "result is required",
+            }
+        if not (p_id and p_title and p_summary and p_body):
+            return {
+                "ok": False, "recorded": False, "action": "skip",
+                "topic_id": None, "legacy_report": "", "user_report": "", "jev_verdict": {},
+                "jev_info": {},
+                "error": "proposed_topic requires id / title / summary / body",
+            }
+
+        state = (
+            f"# 作業前提 (利用者の指示と直前文脈)\n{context[:2000]}\n\n"
+            f"# 実施した作業と結末\n{result[:4000]}\n\n"
+            f"# 記録案\n"
+            f"id: {p_id}\ntitle: {p_title}\nsummary: {p_summary}\n\n"
+            f"{p_body[:3000]}"
+        )
+
+        jev_info: Dict[str, Any] = {"errors": []}
+        verdict: Dict[str, Any] = {}
+        try:
+            from main import call_jev
+            gate = call_jev(
+                state=state,
+                questions={
+                    "worth_recording": {
+                        "type": "noul",
+                        "instructions": (
+                            "この記録案は OpenSpoke 環境における新知見・決定・訂正・"
+                            "実装済み事実として知識ベースに残す価値があるか。 "
+                            "恒久的に効果を持つ事実 (実装完了、 方針決定、 実測結果、 "
+                            "恒久的な運用手順、 bug 修正の根本原因、 新しい仕様や設計) "
+                            "なら true。 その場限りの発言、 質問、 雑談、 未検証の推測、 "
+                            "既存 topic に完全に含まれる重複、 なら false。 "
+                            "迷ったら true を選べ (書き忘れは書き過ぎより悪い)。"
+                        ),
+                    },
+                },
+                timeout=10,
+            )
+            verdict["worth_recording_noul"] = (
+                (gate.get("answers") or {}).get("worth_recording", {}).get("noul")
+            )
+            jev_info["gate"] = gate
+        except Exception as e:
+            logger.warning(
+                f"[KB/RECORD_TURN] noul failed: {e}", exc_info=True
+            )
+            jev_info["errors"].append({"stage": "noul", "error": str(e)})
+            # Jev 失敗時は安全側 (書く) に倒す
+            verdict["worth_recording_noul"] = 1.0
+            jev_info["fallback"] = "noul_failed_record"
+
+        prob = verdict.get("worth_recording_noul")
+        if isinstance(prob, (int, float)) and prob < 0.5:
+            skip_report = (
+                "今回の結末は知識ベースに残す価値がないと判断 "
+                f"(worth_recording={prob:.2f})。"
+            )
+            return {
+                "ok": True, "recorded": False, "action": "skip",
+                "topic_id": None,
+                "legacy_report": skip_report,
+                "user_report": skip_report,
+                "jev_verdict": verdict, "jev_info": jev_info,
+                "error": None,
+            }
+
+        target_id = existing_id or p_id
+        try:
+            # localhost:8000 経由の HTTP fetch は kernel Pod の Uvicorn worker (default 1)
+            # が spawn/pickup で塞がって deadlock 気味に timeout する問題があるため、
+            # main.topic_upsert_direct を direct import で叩く (プロセス内呼び出し)。
+            # 参考: topic jev_external_brain_direct_call_root_cause_fix_20260921
+            # (git_credentials.resolve_typesafe_token_for_org と同じ手法)。
+            from main import topic_upsert_direct
+            up = topic_upsert_direct(
+                target_id,
+                title=p_title,
+                summary=p_summary,
+                content=p_body,
+                category=p_category,
+                module=p_module,
+            )
+            jev_info["upsert"] = {
+                "action": up.get("action"),
+                "updated_at": up.get("updated_at"),
+            }
+            if not up.get("ok"):
+                return {
+                    "ok": False, "recorded": False, "action": "skip",
+                    "topic_id": target_id, "legacy_report": "", "user_report": "",
+                    "jev_verdict": verdict, "jev_info": jev_info,
+                    "error": up.get("error") or "upsert failed",
+                }
+            action = up.get("action") or ("updated" if existing_id else "created")
+        except Exception as e:
+            logger.error(
+                f"[KB/RECORD_TURN] upsert failed: {e}", exc_info=True
+            )
+            return {
+                "ok": False, "recorded": False, "action": "skip",
+                "topic_id": target_id, "legacy_report": "", "user_report": "",
+                "jev_verdict": verdict,
+                "jev_info": {**jev_info, "upsert_error": str(e)},
+                "error": f"{type(e).__name__}: {str(e)[:200]}",
+            }
+
+        verb = "更新" if action == "updated" else "新規記録"
+        report_text = f"知識ベースに{verb}: `{target_id}` — {p_summary}"
+
+        return {
+            "ok": True, "recorded": True, "action": action,
+            "topic_id": target_id, "legacy_report": report_text, "user_report": report_text,
+            "jev_verdict": verdict, "jev_info": jev_info,
+            "error": None,
+        }
+
+
+    # ============================================================
+    # スレッド管理
+    # ============================================================
+
+    @router.post("/core/chat/threads/list")
+    async def core_chat_threads_list(request: dict):
+        _ensure_indices()
+        owner = _get_owner(request)
+        query = {
+            "size": 200,
+            "query": {"term": {"owner": owner}},
+            "sort": [
+                {"last_message_at": {"order": "desc", "missing": "_last"}},
+                {"created_at": {"order": "desc"}},
+            ],
+        }
+        result = _os_post(f"/{CHAT_THREADS_INDEX}/_search", query)
+        if "_error" in result:
+            return {"ok": False, "threads": [], "error": result["_error"]}
+        hits = result.get("hits", {}).get("hits", []) or []
+        threads = []
+        for h in hits:
+            src = h.get("_source", {}) or {}
+            threads.append({
+                "thread_id": src.get("thread_id") or h.get("_id"),
+                "title": src.get("title") or "無題",
+                "created_at": src.get("created_at"),
+                "updated_at": src.get("updated_at"),
+                "last_message_at": src.get("last_message_at"),
+                "message_count": int(src.get("message_count") or 0),
+                "model": src.get("model") or DEFAULT_MODEL,
+                "project_id": src.get("project_id") or None,
+            })
+        return {"ok": True, "threads": threads, "error": None}
+
+
+    @router.post("/core/chat/threads/create")
+    async def core_chat_threads_create(request: dict):
+        _ensure_indices()
+        owner = _get_owner(request)
+        title = (request or {}).get("title") or ""
+        model = (request or {}).get("model") or DEFAULT_MODEL
+        project_id = (request or {}).get("project_id") or None
+        now = _now_iso()
+        if not title:
+            title = f"新規スレッド {now[:19].replace('T', ' ')} UTC"
+        thread_id = f"thread_{uuid.uuid4().hex[:16]}"
+        doc = {
+            "thread_id": thread_id,
+            "owner": owner,
+            "title": title,
+            "created_at": now,
+            "updated_at": now,
+            "last_message_at": None,
+            "message_count": 0,
+            "model": model,
+            "project_id": project_id,
+        }
+        result = _os_put(f"/{CHAT_THREADS_INDEX}/_doc/{thread_id}", doc)
+        if "_error" in result:
+            return {"ok": False, "thread_id": None, "error": result["_error"]}
+        logger.info(
+            f"[CHAT] thread created: {thread_id} owner={owner!r} "
+            f"title={title!r} project_id={project_id!r}"
+        )
+        return {
+            "ok": True, "thread_id": thread_id, "title": title,
+            "created_at": now, "model": model,
+            "project_id": project_id, "error": None,
+        }
+
+
+    @router.post("/core/chat/threads/rename")
+    async def core_chat_threads_rename(request: dict):
+        _ensure_indices()
+        owner = _get_owner(request)
+        thread_id = (request or {}).get("thread_id") or ""
+        title = (request or {}).get("title") or ""
+        model = (request or {}).get("model") or ""
+        if not thread_id or not title:
+            return {"ok": False, "error": "thread_id and title are required"}
+        g = _os_get(f"/{CHAT_THREADS_INDEX}/_doc/{thread_id}")
+        if "_error" in g or not g.get("found"):
+            return {"ok": False, "error": "thread not found"}
+        src = g.get("_source") or {}
+        if src.get("owner") != owner:
+            return {"ok": False, "error": "permission denied"}
+        now = _now_iso()
+        doc_update: Dict[str, Any] = {"title": title, "updated_at": now}
+        if model:
+            doc_update["model"] = model
+        upd = _os_post(
+            f"/{CHAT_THREADS_INDEX}/_update/{thread_id}?refresh=true",
+            {"doc": doc_update},
+        )
+        if "_error" in upd:
+            return {"ok": False, "error": upd["_error"]}
+        return {"ok": True, "error": None}
+
+
+    @router.post("/core/chat/threads/delete")
+    async def core_chat_threads_delete(request: dict):
+        _ensure_indices()
+        owner = _get_owner(request)
+        thread_id = (request or {}).get("thread_id") or ""
+        if not thread_id:
+            return {"ok": False, "error": "thread_id is required"}
+        g = _os_get(f"/{CHAT_THREADS_INDEX}/_doc/{thread_id}")
+        if "_error" in g or not g.get("found"):
+            return {"ok": False, "error": "thread not found"}
+        src = g.get("_source") or {}
+        if src.get("owner") != owner:
+            return {"ok": False, "error": "permission denied"}
+        _os_post(
+            f"/{CHAT_MESSAGES_INDEX}/_delete_by_query?refresh=true",
+            {"query": {"term": {"thread_id": thread_id}}},
+        )
+        _os_delete(f"/{CHAT_THREADS_INDEX}/_doc/{thread_id}?refresh=true")
+        logger.info(f"[CHAT] thread deleted: {thread_id} owner={owner!r}")
+        return {"ok": True, "error": None}
+
+
+    @router.post("/core/chat/threads/update_project")
+    async def core_chat_threads_update_project(request: dict):
+        """スレッドのプロジェクト所属を変更する。project_id=null で未分類に戻す。"""
+        _ensure_indices()
+        owner = _get_owner(request)
+        thread_id = (request or {}).get("thread_id") or ""
+        if not thread_id:
+            return {"ok": False, "error": "thread_id is required"}
+        # project_id は None (未分類) も許容するため sentinel で欠落を検出
+        sentinel = object()
+        project_id = (request or {}).get("project_id", sentinel)
+        if project_id is sentinel:
+            return {"ok": False, "error": "project_id is required (pass null to unassign)"}
+        g = _os_get(f"/{CHAT_THREADS_INDEX}/_doc/{thread_id}")
+        if "_error" in g or not g.get("found"):
+            return {"ok": False, "error": "thread not found"}
+        src = g.get("_source") or {}
+        if src.get("owner") != owner:
+            return {"ok": False, "error": "permission denied"}
+        now = _now_iso()
+        upd = _os_post(
+            f"/{CHAT_THREADS_INDEX}/_update/{thread_id}?refresh=true",
+            {"doc": {"project_id": project_id, "updated_at": now}},
+        )
+        if "_error" in upd:
+            return {"ok": False, "error": upd["_error"]}
+        logger.info(
+            f"[CHAT] thread project updated: {thread_id} "
+            f"owner={owner!r} project_id={project_id!r}"
+        )
+        return {"ok": True, "error": None}
+
+
+    # ============================================================
+    # メッセージ管理
+    # ============================================================
+
+    def _list_messages(thread_id: str, size: int = 500) -> List[dict]:
+        result = _os_post(
+            f"/{CHAT_MESSAGES_INDEX}/_search",
+            {
+                "size": size,
+                "query": {"term": {"thread_id": thread_id}},
+                "sort": [{"order": {"order": "asc"}}],
+            },
+        )
+        if "_error" in result:
+            return []
+        hits = result.get("hits", {}).get("hits", []) or []
+        out = []
+        for h in hits:
+            src = h.get("_source", {}) or {}
+            src["message_id"] = src.get("message_id") or h.get("_id")
+            out.append(src)
+        return out
+
+
+    @router.post("/core/chat/messages/list")
+    async def core_chat_messages_list(request: dict):
+        _ensure_indices()
+        owner = _get_owner(request)
+        thread_id = (request or {}).get("thread_id") or ""
+        if not thread_id:
+            return {"ok": False, "messages": [], "error": "thread_id is required"}
+        g = _os_get(f"/{CHAT_THREADS_INDEX}/_doc/{thread_id}")
+        if "_error" in g or not g.get("found"):
+            return {"ok": False, "messages": [], "error": "thread not found"}
+        src = g.get("_source") or {}
+        if src.get("owner") != owner:
+            return {"ok": False, "messages": [], "error": "permission denied"}
+        messages = _list_messages(thread_id)
+        return {"ok": True, "messages": messages, "error": None}
+
+
+    def _compute_cost_usd(
+        model: str, input_tokens: int, output_tokens: int,
+        cache_w: int = 0, cache_r: int = 0,
+    ) -> float:
+        """モデル別 pricing で cost_usd を計算 (kernel の /core/claude/text と同じリート)。
+        Sonnet: input $3/M, cache_w $3.75/M, cache_r $0.30/M, output $15/M
+        Opus:   input $15/M, cache_w $18.75/M, cache_r $1.50/M, output $75/M
+        Haiku:  input $1/M, cache_w $1.25/M, cache_r $0.10/M, output $5/M
+        """
+        m = (model or "").lower()
+        # Claude 以外 (gemma / mistral / llama など Ollama 全般) はローカル無料
+        if _is_ollama_model(model):
+            return 0.0
+        if "opus" in m:
+            p_in, p_cw, p_cr, p_out = 15.0, 18.75, 1.50, 75.0
+        elif "haiku" in m:
+            p_in, p_cw, p_cr, p_out = 1.0, 1.25, 0.10, 5.0
+        else:
+            p_in, p_cw, p_cr, p_out = 3.0, 3.75, 0.30, 15.0
+        return (
+            (input_tokens * p_in / 1_000_000)
+            + (cache_w * p_cw / 1_000_000)
+            + (cache_r * p_cr / 1_000_000)
+            + (output_tokens * p_out / 1_000_000)
+        )
+
+
+    def _save_message(
+        thread_id: str, owner: str, order: int, role: str, content: str,
+        model: Optional[str] = None,
+        input_tokens: int = 0, output_tokens: int = 0,
+        cache_w_tokens: int = 0, cache_r_tokens: int = 0,
+        cost_usd: float = 0.0,
+        injected_topics: Optional[List[dict]] = None,
+        tool_calls: Optional[List[dict]] = None,
+    ) -> str:
+        message_id = f"msg_{uuid.uuid4().hex[:16]}"
+        doc = {
+            "message_id": message_id,
+            "thread_id": thread_id,
+            "owner": owner,
+            "order": int(order),
+            "role": role,
+            "content": content,
+            "model": model or "",
+            "input_tokens": int(input_tokens or 0),
+            "output_tokens": int(output_tokens or 0),
+            "cache_w_tokens": int(cache_w_tokens or 0),
+            "cache_r_tokens": int(cache_r_tokens or 0),
+            "cost_usd": float(cost_usd or 0.0),
+            "created_at": _now_iso(),
+            "injected_topics": injected_topics or [],
+            "tool_calls": tool_calls or [],
+        }
+        _os_put(f"/{CHAT_MESSAGES_INDEX}/_doc/{message_id}", doc)
+        return message_id
+
+
+    def _messages_with_cache_control(msgs: List[dict]) -> List[dict]:
+        """messages array のコピーを返す。 最後のメッセージの最後の
+        コンテンツブロックに cache_control ephemeral を付ける。
+
+        これで [system + tools + このメッセージまで] がキャッシュ対象になり、
+        次の iteration (同じツールループ内) で cache_r として安価に再利用される。
+        30+ iteration ある場合の fresh input を大幅削減できる。
+
+        注意: 4 マーカー上限に対して system + tools + ここ = 3 マーカーを使う。
+        メッセージ内の日本語トークン周りの cache write は 1.25x コストだが、
+        次 iteration 以降の cache read は 0.1x で十分にペイする。
+        """
+        if not msgs:
+            return msgs
+        result = list(msgs[:-1])
+        last = msgs[-1]
+        last_content = last.get("content")
+        role = last.get("role", "user")
+        if isinstance(last_content, str):
+            # 文字列 → text ブロックリストに包んで cache_control を付ける
+            new_last = {
+                "role": role,
+                "content": [{
+                    "type": "text",
+                    "text": last_content,
+                    "cache_control": {"type": "ephemeral"},
+                }],
+            }
+        elif isinstance(last_content, list) and last_content:
+            # ブロックリスト → 最後のブロックに cache_control を付ける
+            new_content = list(last_content)
+            new_content[-1] = {
+                **new_content[-1],
+                "cache_control": {"type": "ephemeral"},
+            }
+            new_last = {
+                "role": role,
+                "content": new_content,
+            }
+        else:
+            # 空 or 不後入な型 → 修正せず元のまま返す
+            return msgs
+        result.append(new_last)
+        return result
+
+
+    def _jev_choose_model(content: str) -> Tuple[str, Dict[str, Any]]:
+        """Turn 頭で Jev に使用モデルを choice で選ばせる。
+
+        失敗時 (キー未登録、 Jev 側エラー、 予想外の回答値 等) は
+        DEFAULT_MODEL にフォールバックし、 エラー内容をレスポンスに含めて返す。
+
+        Returns:
+            (chosen_model, jev_response) — chosen_model は CHAT_JEV_ROUTE_MODELS の
+            どれか (失敗時は DEFAULT_MODEL)。 jev_response は Jev の生応答
+            または {"error": "..."}。
+        """
+        try:
+            from main import call_jev
+            result = call_jev(
+                state=content,
+                questions={
+                    "model": {
+                        "type": "choice",
+                        "instructions": (
+                            "この質問に応えるのに一番向いているモデルはどれか。 "
+                            "Haiku は簡単な調べもの・要約・軽い返答向け、 "
+                            "Sonnet はコード・分析・計画・普通の対話全般、 "
+                            "Opus は難しい推論・大きな設計判断・深い議論向け。"
+                        ),
+                        "criteria": {
+                            "claude-haiku-4-5": "軽量・高速、 事実的な回答や軽い確認向け",
+                            "claude-sonnet-4-6": "既定、 バランス重視、 コード修正や分析や普通の対話全般",
+                            "claude-opus-4-7": "重量・高度な推論、 難しい設計判断・深い議論向け",
+                        },
+                    },
+                },
+                timeout=10,
+            )
+        except Exception as e:
+            logger.warning(f"[CHAT/JEV_ROUTE] Jev call failed, using default: {e}")
+            return DEFAULT_MODEL, {"error": str(e)}
+
+        chosen = (result.get("answers") or {}).get("model", {}).get("choice")
+        if chosen not in CHAT_JEV_ROUTE_MODELS:
+            logger.warning(
+                f"[CHAT/JEV_ROUTE] Jev returned unexpected choice {chosen!r}, "
+                f"using default"
+            )
+            return DEFAULT_MODEL, result
+        return chosen, result
+
+
+    def _prepare_send(request: dict) -> Tuple[Optional[dict], Optional[str]]:
+        _ensure_indices()
+        owner = _get_owner(request)
+        thread_id = (request or {}).get("thread_id") or ""
+        content = (request or {}).get("content") or ""
+        model = (request or {}).get("model") or DEFAULT_MODEL
+        auto_route = bool((request or {}).get("auto_route"))
+        jev_route_info: Optional[Dict[str, Any]] = None
+        # jev-gemma2 モデルは Jev+gemma2 経路専用で auto_route (Claude 内選択) の対象外
+        if auto_route and model != CHAT_JEV_GEMMA2_MODEL_ID:
+            routed_model, jev_route_info = _jev_choose_model(content)
+            answers = (jev_route_info.get("answers") or {}).get("model") or {}
+            confidence = answers.get("confidence")
+            usage = jev_route_info.get("usage") or {}
+            logger.info(
+                f"[CHAT/JEV_ROUTE] thread={thread_id} "
+                f"original_model={model} jev_choice={routed_model} "
+                f"confidence={confidence} "
+                f"jev_input_tokens={usage.get('input_tokens')}"
+            )
+            model = routed_model
+        enable_injection = (request or {}).get("enable_injection")
+        if enable_injection is None:
+            enable_injection = True
+        if not thread_id:
+            return None, "thread_id is required"
+        if not content.strip():
+            return None, "content is required"
+        g = _os_get(f"/{CHAT_THREADS_INDEX}/_doc/{thread_id}")
+        if "_error" in g or not g.get("found"):
+            return None, "thread not found"
+        tdoc = g.get("_source") or {}
+        if tdoc.get("owner") != owner:
+            return None, "permission denied"
+        prior = _list_messages(thread_id, size=1000)
+        next_order = (int(prior[-1]["order"]) + 1) if prior else 0
+        user_msg_id = _save_message(
+            thread_id, owner, next_order, "user", content
+        )
+        window_size = max(SLIDING_WINDOW_SIZE - 1, 0)
+        window = prior[-window_size:] if window_size > 0 else []
+        api_messages: List[Dict[str, str]] = []
+        for m in window:
+            r_ = m.get("role")
+            c_ = m.get("content") or ""
+            if r_ in ("user", "assistant") and c_:
+                api_messages.append({"role": r_, "content": c_})
+        api_messages.append({"role": "user", "content": content})
+        if enable_injection:
+            system_prompt, injected_topics_meta = _build_system_prompt(content, owner)
+        else:
+            system_prompt = ""
+            injected_topics_meta = []
+        return ({
+            "owner": owner,
+            "thread_id": thread_id,
+            "content": content,
+            "model": model,
+            "prior": prior,
+            "next_order": next_order,
+            "user_msg_id": user_msg_id,
+            "api_messages": api_messages,
+            "system_prompt": system_prompt,
+            "injected_topics_meta": injected_topics_meta,
+        }, None)
+
+
+    def _finalize_send(
+        ctx: dict, assistant_text: str,
+        input_tokens: int, output_tokens: int,
+        cache_w_tokens: int = 0, cache_r_tokens: int = 0,
+        tool_calls: Optional[List[dict]] = None,
+    ) -> Tuple[str, float]:
+        cost_usd = _compute_cost_usd(
+            ctx["model"], input_tokens, output_tokens,
+            cache_w=cache_w_tokens, cache_r=cache_r_tokens,
+        )
+        ass_order = ctx["next_order"] + 1
+        ass_msg_id = _save_message(
+            ctx["thread_id"], ctx["owner"], ass_order, "assistant",
+            assistant_text,
+            model=ctx["model"],
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_w_tokens=cache_w_tokens,
+            cache_r_tokens=cache_r_tokens,
+            cost_usd=cost_usd,
+            injected_topics=ctx["injected_topics_meta"],
+            tool_calls=tool_calls or [],
+        )
+        now = _now_iso()
+        new_count = len(ctx["prior"]) + 2
+        _os_post(
+            f"/{CHAT_THREADS_INDEX}/_update/{ctx['thread_id']}?refresh=true",
+            {"doc": {
+                "last_message_at": now,
+                "updated_at": now,
+                "message_count": new_count,
+                "model": ctx["model"],
+            }},
+        )
+        return ass_msg_id, cost_usd
+
+
+    # ============================================================
+    # Step E-2: Jev + gemma2 (R2D2 + C3PO) の思考ループ
+    # Jev = 推論役 (次の行動と応答方針を choice で判定)
+    # gemma2 = 発話役 (ツール引数の JSON と最終応答の日本語を生成)
+    # Claude の tool loop と同じ形で「推論 → ツール実行 → 応答」を
+    # 繰り返す。 露出するツールは MCP hub の list_tools で得た全ツール。
+    # ============================================================
+    JEV_GEMMA2_MAX_ITERATIONS = 6
+    JEV_GEMMA2_TOOL_DESC_MAX_CHARS = 140  # Jev に渡す description の長さ上限
+
+    def _stream_via_jev_gemma2(ctx: dict, _emit):
+        """Jev + gemma2 の思考ループ。 stream_gen から yield from で使う。
+
+        Args:
+            ctx: _prepare_send が返した実行コンテキスト
+            _emit: SSE 1 イベントを bytes 化する関数
+        """
+        content = ctx.get("content") or ""
+        thread_id = ctx.get("thread_id")
+        owner = ctx.get("owner")
+
+        # 共有リソースを lazy import
+        try:
+            from main import (
+                call_jev,
+                SimpleMCPClient,
+                MCP_SERVER_URL,
+                MCP_API_KEY,
+                MCP_CONNECT_TIMEOUT,
+                VLLM_URL,
+                LLM_TIMEOUT,
+            )
+        except Exception as e:
+            yield _emit({
+                "type": "error",
+                "error": f"[JEV_ERROR] import failed: {type(e).__name__}: {e}",
+            })
+            return
+
+        if not MCP_API_KEY or not MCP_SERVER_URL:
+            yield _emit({
+                "type": "error",
+                "error": "[JEV_ERROR] MCP not configured",
+            })
+            return
+
+        # MCP client 接続と 全ツールのスキーマ取得
+        # (SimpleMCPClient は context manager。 __enter__ で接続を張り、
+        # __exit__ で切断する。 tool loop 中も使うので手動で開閉する)
+        _mcp_cm = None
+        try:
+            _mcp_cm = SimpleMCPClient(
+                MCP_SERVER_URL, MCP_API_KEY, timeout=MCP_CONNECT_TIMEOUT,
+            )
+            mcp_client = _mcp_cm.__enter__()
+            all_tools = mcp_client.list_tools()
+            # 全ツールを露出 (list_tools の結果をそのまま使う)
+            tool_map = {
+                t["name"]: t
+                for t in all_tools
+                if t.get("name")
+            }
+            # Jev に渡す tool_name の choice criteria を動的生成
+            # (description は先頭 N 文字に切り詰めて Jev の input を押さえる)
+            tool_choice_criteria = {
+                name: (
+                    (t.get("description") or "説明なし").strip().split("\n")[0][:JEV_GEMMA2_TOOL_DESC_MAX_CHARS]
+                    or "説明なし"
+                )
+                for name, t in tool_map.items()
+            }
+            logger.info(
+                f"[CHAT/JEV_GEMMA2] MCP tools exposed count={len(tool_map)} "
+                f"thread={thread_id} owner={owner!r}"
+            )
+        except Exception as e:
+            logger.error(
+                f"[CHAT/JEV_GEMMA2] MCP connect failed "
+                f"thread={thread_id} owner={owner!r}: "
+                f"{type(e).__name__}: {e}",
+                exc_info=True,
+            )
+            if _mcp_cm is not None:
+                try:
+                    _mcp_cm.__exit__(None, None, None)
+                except Exception:
+                    pass
+            yield _emit({
+                "type": "error",
+                "error": f"[JEV_ERROR] MCP connect failed: {type(e).__name__}: {e}",
+            })
+            return
+
+        # 思考履歴 (Jev/gemma2 の state に注入する文字列)
+        thought_history: List[str] = []
+        accumulated_tool_calls: List[Dict[str, Any]] = []
+        _prev_tool_calls: List[str] = []  # "tool_name:args_json" の履歴 (重複検知用)
+        total_jev_in_tokens = 0
+        total_gemma_in_tokens = 0
+        total_gemma_out_tokens = 0
+
+        next_action_criteria = {
+            "call_tool": "情報取得・現状確認・検索・履歴参照のためツールを呼ぶ (一覧・状態・調査・確認の依頼はこれ)",
+            "respond_directly": "既にツール結果が揃っている、 または一般知識で即答できる",
+            "ask_user": "発話が曖昧すぎて、 ツールに渡す引数も推定できない",
+            "decline": "実行不能・拒否すべき (システム操作の実行手段が無い場合を含む)",
+        }
+
+        final_iteration = 0
+        loop_completed_naturally = False
+        for iteration in range(JEV_GEMMA2_MAX_ITERATIONS):
+            final_iteration = iteration
+            state_lines = [f"ユーザーの発話: {content}"]
+            if thought_history:
+                state_lines.append("")
+                # 重複ツール呼び出し抑止: 思考履歴に「同じツールを繰り返し呼ぶな」を注入
+                if len(_prev_tool_calls) >= 2:
+                    state_lines.append(
+                        "【重要】 既にツールを複数回呼んでいる。 "
+                        "同じツールを同じ引数で再び呼ぶことは禁止。 "
+                        "既に得た情報で回答できるなら respond_directly を選べ。"
+                    )
+                state_lines.append("【これまでの推論・調査】")
+                state_lines.extend(thought_history)
+            state = "\n".join(state_lines)
+
+            # ---- 1. Jev に「次の行動」と「使うツール」を同時に判定させる ----
+            try:
+                loop_result = call_jev(
+                    state=state,
+                    questions={
+                        "next_action": {
+                            "type": "choice",
+                            "criteria": next_action_criteria,
+                            "instructions": (
+                                "現在の状況で次に何をすべきかを選べ。 "
+                                "重要: 自分は MCP tool 経由でシステムから "
+                                "情報を取得する能力を持っている。 "
+                                "ユーザーが情報・現状・一覧・履歴・検索結果を "
+                                "求めている場合は迷わず call_tool を選べ "
+                                "(「〜を教えて」「〜の一覧」「〜の状態」"
+                                "「〜を確認」「〜を調べて」等)。 "
+                                "自分が持つ MCP tool は下の tool_name の "
+                                "criteria に列挙されている。 "
+                                "ただし システム操作 (Pod 再起動、 "
+                                "ファイル書き込み等) の実行手段は無いので decline。 "
+                                "既にツール結果が思考履歴に揃っているなら "
+                                "respond_directly。"
+                            ),
+                        },
+                        "tool_name": {
+                            "type": "choice",
+                            "criteria": tool_choice_criteria,
+                            "instructions": (
+                                "next_action=call_tool を選ぶなら "
+                                "criteria の description を見てユーザーの発話に最も合う tool を 1 つ選べ。 "
+                                "例: Pod 一覧なら k8s_list_pods、 ログなら k8s_get_logs、 "
+                                "topic 詳細なら system_lookup、 過去の会話なら conversation_search、 "
+                                "Web ページなら web_fetch、 GitHub コードなら github_get_file / github_grep_file、 "
+                                "契約書なら contract_* 系、 "
+                                "メール / GitHub アカウント / 要望管理などは 同名接頭の tool 群を探せ。 "
+                                "next_action がそれ以外の場合も 1 つ選ぶが無視される。"
+                            ),
+                        },
+                    },
+                    timeout=15,
+                )
+            except Exception as e:
+                logger.error(
+                    f"[CHAT/JEV_GEMMA2] Jev loop iter={iteration} failed: "
+                    f"{type(e).__name__}: {e}",
+                    exc_info=True,
+                )
+                yield _emit({
+                    "type": "error",
+                    "error": f"[JEV_ERROR] iter={iteration}: {type(e).__name__}: {str(e)[:200]}",
+                })
+                return
+
+            loop_answers = loop_result.get("answers") or {}
+            next_action = (loop_answers.get("next_action") or {}).get("choice") or "respond_directly"
+            tool_name = (loop_answers.get("tool_name") or {}).get("choice")
+            loop_usage = loop_result.get("usage") or {}
+            total_jev_in_tokens += loop_usage.get("input_tokens") or 0
+
+            logger.info(
+                f"[CHAT/JEV_GEMMA2] iter={iteration} "
+                f"next_action={next_action} tool_name={tool_name} "
+                f"thread={thread_id} owner={owner!r}"
+            )
+
+            if next_action != "call_tool":
+                loop_completed_naturally = True
+                break
+
+            if not tool_name or tool_name not in tool_map:
+                thought_history.append(
+                    f"[思考] ツール選択が不正 ({tool_name!r})。 直接応答に切替。"
+                )
+                loop_completed_naturally = True
+                break
+
+            # ---- 2. gemma2 にツール引数を JSON で生成させる ----
+            tool_def = tool_map[tool_name]
+            tool_schema = tool_def.get("input_schema") or tool_def.get("inputSchema") or {}
+
+            args_system = (
+                "あなたはツール呼び出しの引数を JSON で生成する専門役です。\n"
+                f"ツール名: {tool_name}\n"
+                "入力スキーマ:\n"
+                f"{json.dumps(tool_schema, ensure_ascii=False, indent=2)}\n"
+                "\n"
+                "制約:\n"
+                "- JSON オブジェクトのみを出力する (フェンスや説明文は不要)\n"
+                "- スキーマの required フィールドは必ず含める\n"
+                "- 分からない値は最小限の推測で埋める\n"
+                "- 応答は 1 つの JSON オブジェクトのみ\n"
+            )
+
+            args_payload = {
+                "model": CHAT_JEV_GEMMA2_UNDERLYING,
+                "messages": [
+                    {"role": "system", "content": args_system},
+                    {"role": "user", "content": state},
+                ],
+                "temperature": 0.3,
+                "max_tokens": 1024,
+                "stream": False,
+            }
+
+            try:
+                resp = requests.post(
+                    f"{VLLM_URL}/v1/chat/completions",
+                    json=args_payload,
+                    timeout=LLM_TIMEOUT,
+                )
+                resp.raise_for_status()
+                args_data = resp.json()
+                args_msg = ((args_data.get("choices") or [{}])[0].get("message") or {})
+                args_text = args_msg.get("content") or ""
+                args_usage = args_data.get("usage") or {}
+                total_gemma_in_tokens += args_usage.get("prompt_tokens") or 0
+                total_gemma_out_tokens += args_usage.get("completion_tokens") or 0
+            except Exception as e:
+                logger.error(
+                    f"[CHAT/JEV_GEMMA2] gemma2 args gen failed for {tool_name}: "
+                    f"{type(e).__name__}: {e}",
+                    exc_info=True,
+                )
+                thought_history.append(
+                    f"[思考] {tool_name} の引数生成中に gemma2 が失敗 "
+                    f"({type(e).__name__})。 直接応答に切替。"
+                )
+                loop_completed_naturally = True
+                break
+
+            tool_args: Dict[str, Any] = {}
+            args_json_text: Optional[str] = None
+            fence_match = re.search(
+                r"```(?:json)?\s*\n?(\{.*?\})\s*\n?```",
+                args_text, re.DOTALL,
+            )
+            if fence_match:
+                args_json_text = fence_match.group(1).strip()
+            else:
+                brace_start = args_text.find("{")
+                if brace_start >= 0:
+                    depth = 0
+                    for idx in range(brace_start, len(args_text)):
+                        if args_text[idx] == "{":
+                            depth += 1
+                        elif args_text[idx] == "}":
+                            depth -= 1
+                            if depth == 0:
+                                args_json_text = args_text[brace_start:idx+1]
+                                break
+
+            try:
+                tool_args = json.loads((args_json_text or "{}").strip())
+                if not isinstance(tool_args, dict):
+                    tool_args = {}
+            except Exception as e:
+                thought_history.append(
+                    f"[思考] {tool_name} の引数 JSON 解析に失敗 "
+                    f"({type(e).__name__}): {args_text[:200]}"
+                )
+                loop_completed_naturally = True
+                break
+
+            # ---- 3. 重複ツール呼び出し検知 ----
+            call_key = f"{tool_name}:{json.dumps(tool_args, sort_keys=True)}"
+            dup_count = _prev_tool_calls.count(call_key)
+            _prev_tool_calls.append(call_key)
+            if dup_count >= 1:
+                thought_history.append(
+                    f"[思考] {tool_name} を同じ引数で既に呼んだ。 "
+                    "同じ結果しか返らないので、 手持ちの情報で応答する。"
+                )
+                logger.info(
+                    f"[CHAT/JEV_GEMMA2] duplicate tool call detected "
+                    f"iter={iteration} tool={tool_name} "
+                    f"thread={thread_id} owner={owner!r}"
+                )
+                loop_completed_naturally = True
+                break
+
+            # ---- 4. ツール実行 ----
+            yield _emit({
+                "type": "tool_use",
+                "tool_name": tool_name,
+                "tool_input": tool_args,
+            })
+
+            try:
+                tool_output = mcp_client.call_tool(
+                    tool_name, tool_args,
+                )
+                if isinstance(tool_output, dict):
+                    blocks = tool_output.get("content") or []
+                    output_text = "\n\n".join(
+                        b.get("text", "")
+                        for b in blocks
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    ) or str(tool_output)
+                else:
+                    output_text = str(tool_output)
+
+                original_len = len(output_text)
+                if original_len > MCP_TOOL_RESULT_MAX_CHARS:
+                    output_text = (
+                        output_text[:MCP_TOOL_RESULT_MAX_CHARS]
+                        + f"\n\n[結果を {original_len} → {MCP_TOOL_RESULT_MAX_CHARS} 文字に切詰]"
+                    )
+
+                yield _emit({
+                    "type": "tool_result",
+                    "content": output_text,
+                })
+
+                accumulated_tool_calls.append({
+                    "tool_name": tool_name,
+                    "tool_input": tool_args,
+                    "result_brief": output_text[:TOOL_RESULT_BRIEF_CHAR_LIMIT],
+                })
+
+                thought_history.append(
+                    f"[ツール呼出 iter={iteration}] {tool_name}"
+                    f"({json.dumps(tool_args, ensure_ascii=False)})"
+                )
+                thought_history.append(f"[結果]\n{output_text}")
+            except Exception as e:
+                logger.error(
+                    f"[CHAT/JEV_GEMMA2] tool {tool_name} failed: "
+                    f"{type(e).__name__}: {e}",
+                    exc_info=True,
+                )
+                error_text = f"エラー: {type(e).__name__}: {str(e)[:200]}"
+                yield _emit({
+                    "type": "tool_result",
+                    "content": error_text,
+                })
+                thought_history.append(
+                    f"[ツール失敗 iter={iteration}] {tool_name}: {error_text}"
+                )
+            # 次の iteration へ
+
+        if not loop_completed_naturally:
+            thought_history.append(
+                f"[思考] {JEV_GEMMA2_MAX_ITERATIONS} 回の推論上限に達したので、 "
+                "現時点の情報で応答する。"
+            )
+
+        # ---- 4. 最終応答: Jev が 5 項目を判定 → gemma2 が生成 ----
+        final_state_lines = [f"ユーザーの発話: {content}"]
+        if thought_history:
+            final_state_lines.append("")
+            final_state_lines.append("【推論・調査の記録】")
+            final_state_lines.extend(thought_history)
+        final_state = "\n".join(final_state_lines)
+
+        final_questions = {
+            "intent": {
+                "type": "choice",
+                "criteria": {
+                    "answer_question": "質問に答える",
+                    "respond_to_request": "依頼に応じる (自分に可能な範囲で)",
+                    "confirm_info": "情報を確認する",
+                    "casual_chat": "雑談として応じる",
+                    "decline": "断る・拒否する (実行手段が無い場合を含む)",
+                },
+                "instructions": (
+                    "このターンで果たすべき役割を選べ。 "
+                    "自分にはシステム操作の実行手段が無いので、 "
+                    "そういう依頼を受けた場合は decline。"
+                ),
+            },
+            "stance": {
+                "type": "choice",
+                "criteria": {
+                    "affirmative": "肯定・同意",
+                    "negative": "否定・反対",
+                    "neutral": "中立",
+                    "hold": "保留・様子見",
+                    "correct": "訂正・指摘",
+                },
+                "instructions": "応答の立場を選べ。",
+            },
+            "tone": {
+                "type": "choice",
+                "criteria": {
+                    "polite": "丁寧・敬語",
+                    "neutral": "です・ます調",
+                    "casual": "砕けたカジュアル",
+                },
+                "instructions": "ユーザーの文体に合わせるトーンを選べ。",
+            },
+            "certainty": {
+                "type": "choice",
+                "criteria": {
+                    "certain": "断定できる",
+                    "highly_likely": "ほぼ確実",
+                    "unsure": "半々",
+                    "doubtful": "自信なし",
+                    "unknown": "わからない",
+                },
+                "instructions": "回答内容への確信度を選べ。",
+            },
+            "length": {
+                "type": "choice",
+                "criteria": {
+                    "one_sentence": "一文",
+                    "short": "2-3 文",
+                    "medium": "段落 1 つ (3-5 文)",
+                    "long": "段落複数 (6-10 文)",
+                },
+                "instructions": "返答の適切な長さを選べ。",
+            },
+        }
+
+        try:
+            final_result = call_jev(
+                state=final_state,
+                questions=final_questions,
+                timeout=15,
+            )
+        except Exception as e:
+            logger.error(
+                f"[CHAT/JEV_GEMMA2] Jev final judgment failed: "
+                f"{type(e).__name__}: {e}",
+                exc_info=True,
+            )
+            yield _emit({
+                "type": "error",
+                "error": f"[JEV_ERROR] final: {type(e).__name__}: {str(e)[:200]}",
+            })
+            return
+
+        final_answers = final_result.get("answers") or {}
+        intent = (final_answers.get("intent") or {}).get("choice", "")
+        stance = (final_answers.get("stance") or {}).get("choice", "")
+        tone = (final_answers.get("tone") or {}).get("choice", "")
+        certainty = (final_answers.get("certainty") or {}).get("choice", "")
+        length = (final_answers.get("length") or {}).get("choice", "")
+        final_jev_usage = final_result.get("usage") or {}
+        total_jev_in_tokens += final_jev_usage.get("input_tokens") or 0
+
+        logger.info(
+            f"[CHAT/JEV_GEMMA2] final judgment thread={thread_id} owner={owner!r} "
+            f"intent={intent} stance={stance} tone={tone} "
+            f"certainty={certainty} length={length} "
+            f"iterations={final_iteration+1} "
+            f"tool_calls={len(accumulated_tool_calls)} "
+            f"jev_input_tokens={total_jev_in_tokens}"
+        )
+
+        intent_desc_map = {
+            "answer_question": "ユーザーの質問に答える",
+            "respond_to_request": "ユーザーの依頼に自分にできる範囲で応じる",
+            "confirm_info": "情報を確認する",
+            "casual_chat": "雑談として応じる",
+            "decline": "断る・拒否する (実行手段が無いことを伝える)",
+        }
+        stance_desc_map = {
+            "affirmative": "肯定的な立場で",
+            "negative": "否定的な立場で",
+            "neutral": "中立の立場で",
+            "hold": "保留・様子見の姿勢で",
+            "correct": "訂正・指摘する立場で",
+        }
+        tone_desc_map = {
+            "polite": "丁寧・敬語で",
+            "neutral": "です・ます調で",
+            "casual": "砕けたカジュアルな口調で",
+        }
+        certainty_desc_map = {
+            "certain": "断定的に",
+            "highly_likely": "ほぼ確実として",
+            "unsure": "半々の確信で",
+            "doubtful": "自信のない表現で",
+            "unknown": "わからない旨を含めて",
+        }
+        length_desc_map = {
+            "one_sentence": "一文で",
+            "short": "2-3 文で",
+            "medium": "段落 1 つ (3-5 文) で",
+            "long": "段落複数 (6-10 文) で",
+        }
+
+        intent_desc = intent_desc_map.get(intent, "応答する")
+        stance_desc = stance_desc_map.get(stance, "中立の立場で")
+        tone_desc = tone_desc_map.get(tone, "です・ます調で")
+        certainty_desc = certainty_desc_map.get(certainty, "適度な確信度で")
+        length_desc = length_desc_map.get(length, "2-3 文で")
+
+        tool_context = ""
+        if thought_history:
+            tool_context = (
+                "\n【これまでの調査結果 (参考にしてよいが事実確認済みの範囲だけを使う)】\n"
+                + "\n".join(thought_history)
+                + "\n"
+            )
+
+        system_prompt = (
+            "あなたは判断結果を日本語の文章に整える整形役です。\n"
+            "以下の指示に厳密に従い、 応答本文のみを出力してください。\n"
+            "\n"
+            "【指示】\n"
+            f"- {stance_desc}、 {intent_desc}\n"
+            f"- {tone_desc}、 {length_desc}回答する\n"
+            f"- {certainty_desc}表現する\n"
+            "\n"
+            "【制約】\n"
+            "- 指示にない事実、 意見、 推測を追加しない\n"
+            "- 前置きや説明、 注釈を付けない\n"
+            "- 質問し返さない\n"
+            "- あなた自身にはシステム操作 (Pod 再起動、 ファイル書込等) "
+            "を実行する手段はない。 実行できない依頼には応じられない旨を伝える\n"
+            "- 応答本文のみを出力する\n"
+            f"{tool_context}"
+        )
+
+        final_payload = {
+            "model": CHAT_JEV_GEMMA2_UNDERLYING,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": content},
+            ],
+            "temperature": 0.5,
+            "max_tokens": MAX_OUTPUT_TOKENS,
+            "stream": False,
+        }
+
+        try:
+            resp = requests.post(
+                f"{VLLM_URL}/v1/chat/completions",
+                json=final_payload,
+                timeout=LLM_TIMEOUT,
+            )
+        except Exception as e:
+            logger.error(
+                f"[CHAT/JEV_GEMMA2] gemma2 final request error: "
+                f"{type(e).__name__}: {e}",
+                exc_info=True,
+            )
+            yield _emit({
+                "type": "error",
+                "error": f"[GEMMA2_ERROR] {type(e).__name__}: {str(e)[:200]}",
+            })
+            return
+
+        if resp.status_code != 200:
+            yield _emit({
+                "type": "error",
+                "error": (
+                    f"[GEMMA2_ERROR] status={resp.status_code} "
+                    f"{resp.text[:200]}"
+                ),
+            })
+            return
+
+        try:
+            data = resp.json()
+        except Exception as e:
+            yield _emit({
+                "type": "error",
+                "error": f"[GEMMA2_ERROR] JSON decode: {type(e).__name__}: {e}",
+            })
+            return
+
+        choice_data = (data.get("choices") or [{}])[0]
+        message = choice_data.get("message", {}) or {}
+        text = (message.get("content") or "").strip()
+        finish_reason = choice_data.get("finish_reason") or "stop"
+        final_usage_data = data.get("usage") or {}
+        total_gemma_in_tokens += final_usage_data.get("prompt_tokens") or 0
+        total_gemma_out_tokens += final_usage_data.get("completion_tokens") or 0
+
+        if text:
+            yield _emit({"type": "delta", "text": text})
+
+        ass_msg_id, cost_usd = _finalize_send(
+            ctx, text,
+            total_gemma_in_tokens, total_gemma_out_tokens,
+            tool_calls=accumulated_tool_calls,
+        )
+        logger.info(
+            f"[CHAT/JEV_GEMMA2] stream OK thread={thread_id} owner={owner!r} "
+            f"iterations={final_iteration+1} "
+            f"tool_calls={len(accumulated_tool_calls)} "
+            f"gemma_in={total_gemma_in_tokens} gemma_out={total_gemma_out_tokens} "
+            f"jev_in={total_jev_in_tokens} cost=${cost_usd:.6f} "
+            f"finish_reason={finish_reason}"
+        )
+        yield _emit({
+            "type": "done",
+            "assistant_message_id": ass_msg_id,
+            "input_tokens": total_gemma_in_tokens,
+            "output_tokens": total_gemma_out_tokens,
+            "cache_w_tokens": 0,
+            "cache_r_tokens": 0,
+            "cost_usd": round(cost_usd, 6),
+            "stop_reason": finish_reason,
+            "tool_calls_count": len(accumulated_tool_calls),
+        })
+
+        # MCP client の context manager をクローズ
+        if _mcp_cm is not None:
+            try:
+                _mcp_cm.__exit__(None, None, None)
+            except Exception:
+                pass
+
+
+    # ============================================================
+    # gemma2 (Ollama) 向け MCP tool loop
+    # OpenAI 互換の /v1/chat/completions を叩き、 Claude 版と同じ SSE
+    # イベント形式で出力する。 stream=False で 1 iteration の応答を丸ごと
+    # 受け取り、 content を 1 つの delta として emit、 tool_calls があれば
+    # 実行して loop する簡易実装。 gemma2:9b はローカル無料なのでトークン
+    # 単価は問わないが、 累積 3M トークンでループ暴走を止める。
+    # ============================================================
+    def _run_mcp_loop_ollama(ctx: dict, _emit):
+        """gemma2 (Ollama) 経路の MCP tool loop。 stream_gen から yield from で使う。
+
+        Args:
+            ctx: _prepare_send が返した実行コンテキスト
+            _emit: SSE 1 イベントを bytes 化する関数 (_emit(dict) -> bytes)
+
+        Yields:
+            SSE イベントの bytes (Claude 版と同じ形式)
+        """
+        # kernel 本体の共有リソースを lazy import
+        try:
+            from main import (
+                SimpleMCPClient,
+                MCP_SERVER_URL,
+                MCP_API_KEY,
+                MCP_CONNECT_TIMEOUT,
+                VLLM_URL,
+                LLM_TIMEOUT,
+            )
+        except Exception as e:
+            yield _emit({
+                "type": "error",
+                "error": f"main import failed: {type(e).__name__}: {e}",
+            })
+            return
+
+        if not MCP_API_KEY or not MCP_SERVER_URL:
+            yield _emit({
+                "type": "error",
+                "error": "MCP config missing (MCP_API_KEY/MCP_SERVER_URL not set)",
+            })
+            return
+
+        accumulated_text_parts: List[str] = []
+        accumulated_tool_calls: List[dict] = []
+        total_in_tokens = 0
+        total_out_tokens = 0
+        stop_reason: Optional[str] = None
+
+        try:
+            with SimpleMCPClient(
+                MCP_SERVER_URL, MCP_API_KEY, timeout=MCP_CONNECT_TIMEOUT,
+            ) as mcp_client:
+                try:
+                    all_tools = mcp_client.list_tools()
+                except Exception as e:
+                    yield _emit({
+                        "type": "error",
+                        "error": f"MCP list_tools failed: {type(e).__name__}: {e}",
+                    })
+                    return
+
+                # 許可リストで絞ってから OpenAI 互換のツールスキーマに変換
+                tools_for_ollama = []
+                exposed_mcp_count = 0
+                for t in all_tools:
+                    if t["name"] not in OLLAMA_ALLOWED_TOOL_NAMES:
+                        continue
+                    tools_for_ollama.append({
+                        "type": "function",
+                        "function": {
+                            "name": t["name"],
+                            "description": t.get("description", ""),
+                            "parameters": t.get(
+                                "inputSchema",
+                                {"type": "object", "properties": {}},
+                            ),
+                        },
+                    })
+                    exposed_mcp_count += 1
+                # 対話専用ツールは全て露出 (件数少)
+                for chat_t in CHAT_SCOPED_TOOL_SCHEMAS:
+                    tools_for_ollama.append({
+                        "type": "function",
+                        "function": {
+                            "name": chat_t["name"],
+                            "description": chat_t["description"],
+                            "parameters": chat_t["input_schema"],
+                        },
+                    })
+
+                logger.info(
+                    f"[CHAT/ollama] MCP exposed {exposed_mcp_count} MCP tools "
+                    f"(from {len(all_tools)} available) + "
+                    f"{len(CHAT_SCOPED_TOOL_SCHEMAS)} chat-scoped tools "
+                    f"thread={ctx['thread_id']} model={ctx['model']}"
+                )
+
+                # messages を OpenAI 形式に整える (ctx["api_messages"] は既に
+                # [{role, content: str}] 形式)。 先頭に system prompt を挟む。
+                # gemma2:9b は tools 非対応のため、 system prompt に手動で
+                # tools 一覧と JSON 呼び出しフォーマットを埋め込む。
+                # 引数は JSON schema ではなく関数シグネチャ形式でコンパクトに
+                # (name: type、 optional は ? マーク) 表現。
+                tools_desc_parts = []
+                for tf in tools_for_ollama:
+                    fn = tf["function"]
+                    params = fn.get("parameters", {}) or {}
+                    props = params.get("properties", {}) or {}
+                    required = params.get("required", []) or []
+                    arg_parts = []
+                    for arg_name, arg_schema in props.items():
+                        if isinstance(arg_schema, dict):
+                            arg_type = arg_schema.get("type", "any")
+                        else:
+                            arg_type = "any"
+                        req_mark = "" if arg_name in required else "?"
+                        arg_parts.append(f"{arg_name}{req_mark}: {arg_type}")
+                    arg_signature = ", ".join(arg_parts)
+                    desc = (fn.get("description") or "")[:100]
+                    tools_desc_parts.append(
+                        f"- {fn['name']}({arg_signature}): {desc}"
+                    )
+                tools_desc_text = "\n".join(tools_desc_parts)
+                gemma_tools_instruction = (
+                    "\n\n利用可能なツール一覧:\n"
+                    + tools_desc_text
+                    + "\n\n"
+                    + "重要: ツールを呼びたい場合は、 以下のフォーマットの JSON を "
+                    + "あなた自身が直接生成してください。 コードフェンス "
+                    + "(バッククォート 3 つ)、 説明文、 ユーザーへの指示、 その他のテキストは絶対に含めないでください。\n\n"
+                    + "悪い例 (これは間違い):\n"
+                    + "```json\n"
+                    + '{"tool": "system_brief", "arguments": {}}\n'
+                    + "```\n"
+                    + "と入力してください。\n\n"
+                    + "良い例 (これが正しい):\n"
+                    + '{"tool": "system_brief", "arguments": {}}\n\n'
+                    + "ツールを呼ぶ必要がない場合は、 通常の自然文で回答してください "
+                    + "(JSON は書かないでください)。"
+                )
+                base_system = ctx["system_prompt"] or ""
+                combined_system = base_system + gemma_tools_instruction
+                msgs: List[Dict[str, Any]] = list(ctx["api_messages"])
+                msgs = (
+                    [{"role": "system", "content": combined_system}]
+                    + msgs
+                )
+
+                for iteration in range(OLLAMA_MAX_TOOL_ITERATIONS):
+                    payload: Dict[str, Any] = {
+                        "model": ctx["model"],
+                        "messages": msgs,
+                        "temperature": 0.5,
+                        "max_tokens": MAX_OUTPUT_TOKENS,
+                        "stream": False,
+                    }
+                    # gemma2:9b は tools 非対応のため tools フィールドは付けない
+                    # (system prompt に埋め込み済み)
+
+                    try:
+                        # requests.post は kernel 側で monkey patch されており
+                        # gemma_usage index に自動記録される
+                        resp = requests.post(
+                            f"{VLLM_URL}/v1/chat/completions",
+                            json=payload,
+                            timeout=LLM_TIMEOUT,
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"[CHAT/ollama] request error iter={iteration}: "
+                            f"{type(e).__name__}: {e}",
+                            exc_info=True,
+                        )
+                        yield _emit({
+                            "type": "error",
+                            "error": f"{type(e).__name__}: {str(e)[:200]}",
+                        })
+                        return
+
+                    if resp.status_code != 200:
+                        yield _emit({
+                            "type": "error",
+                            "error": (
+                                f"ollama call failed: {resp.status_code} "
+                                f"{resp.text[:200]}"
+                            ),
+                        })
+                        return
+
+                    try:
+                        data = resp.json()
+                    except Exception as e:
+                        yield _emit({
+                            "type": "error",
+                            "error": f"JSON decode failed: {type(e).__name__}: {e}",
+                        })
+                        return
+
+                    choice = (data.get("choices") or [{}])[0]
+                    message = choice.get("message", {}) or {}
+                    content = message.get("content") or ""
+                    finish_reason = choice.get("finish_reason") or ""
+                    # gemma2 応答から JSON tool_call を抽出する (手動 tool loop)
+                    # 1. ```json ... ``` コードフェンス内を優先
+                    # 2. なければ応答内の最初の {...} を balance count で抽出
+                    tool_calls: List[Dict[str, Any]] = []
+                    content_for_display = content
+                    json_candidate: Optional[str] = None
+                    fence_match = re.search(
+                        r"```(?:json)?\s*\n?(\{.*?\})\s*\n?```",
+                        content, re.DOTALL,
+                    )
+                    if fence_match:
+                        json_candidate = fence_match.group(1).strip()
+                    else:
+                        # balance count で最初の JSON object を抽出
+                        depth = 0
+                        start = -1
+                        for i, ch in enumerate(content):
+                            if ch == "{":
+                                if depth == 0:
+                                    start = i
+                                depth += 1
+                            elif ch == "}":
+                                if depth > 0:
+                                    depth -= 1
+                                    if depth == 0 and start >= 0:
+                                        json_candidate = content[start:i+1]
+                                        break
+                    if json_candidate:
+                        try:
+                            parsed = json.loads(json_candidate)
+                            if (isinstance(parsed, dict)
+                                    and "tool" in parsed
+                                    and isinstance(parsed["tool"], str)):
+                                args = parsed.get("arguments") or {}
+                                if not isinstance(args, dict):
+                                    args = {}
+                                tool_calls = [{
+                                    "id": f"call_{uuid.uuid4().hex[:8]}",
+                                    "function": {
+                                        "name": parsed["tool"],
+                                        "arguments": json.dumps(
+                                            args, ensure_ascii=False,
+                                        ),
+                                    },
+                                }]
+                                # JSON を含む応答全体は UI に表示しない
+                                content_for_display = ""
+                        except (ValueError, TypeError):
+                            pass
+                    usage = data.get("usage", {}) or {}
+                    in_tk = int(usage.get("prompt_tokens", 0) or 0)
+                    out_tk = int(usage.get("completion_tokens", 0) or 0)
+                    total_in_tokens += in_tk
+                    total_out_tokens += out_tk
+
+                    # 累積トークン上限チェック (無料だが暴走止め)
+                    if (total_in_tokens + total_out_tokens
+                            > CHAT_ACCUMULATED_TOKENS_CAP):
+                        if content:
+                            accumulated_text_parts.append(content)
+                            yield _emit({"type": "delta", "text": content})
+                        partial_text = "".join(accumulated_text_parts).strip()
+                        if not partial_text:
+                            partial_text = (
+                                f"[累積 {CHAT_ACCUMULATED_TOKENS_CAP:,} トークンの"
+                                f" 上限に達し、 回答を完結できませんでした]"
+                            )
+                        else:
+                            partial_text += (
+                                f"\n\n[累積 {CHAT_ACCUMULATED_TOKENS_CAP:,} トークンの"
+                                f" 上限に達しました]"
+                            )
+                        ass_msg_id, cost_usd = _finalize_send(
+                            ctx, partial_text, total_in_tokens, total_out_tokens,
+                            tool_calls=accumulated_tool_calls,
+                        )
+                        yield _emit({
+                            "type": "done",
+                            "assistant_message_id": ass_msg_id,
+                            "input_tokens": total_in_tokens,
+                            "output_tokens": total_out_tokens,
+                            "cache_w_tokens": 0,
+                            "cache_r_tokens": 0,
+                            "cost_usd": round(cost_usd, 6),
+                            "stop_reason": "cost_cap",
+                            "tool_calls_count": len(accumulated_tool_calls),
+                        })
+                        return
+
+                    # content があれば 1 つの delta として emit
+                    # (gemma2 の tool_call JSON は content_for_display で隠す)
+                    if content_for_display:
+                        accumulated_text_parts.append(content_for_display)
+                        yield _emit({"type": "delta", "text": content_for_display})
+
+                    # tool_calls が無ければ終了
+                    if not tool_calls:
+                        stop_reason = finish_reason or "stop"
+                        break
+
+                    # assistant メッセージを msgs に追加 (tool_calls 込み)
+                    assistant_msg: Dict[str, Any] = {
+                        "role": "assistant",
+                        "content": content,
+                    }
+                    if tool_calls:
+                        assistant_msg["tool_calls"] = tool_calls
+                    msgs.append(assistant_msg)
+
+                    # 各 tool_call を実行
+                    for tc in tool_calls:
+                        tc_id = tc.get("id") or f"call_{uuid.uuid4().hex[:8]}"
+                        fn = tc.get("function", {}) or {}
+                        tool_name = fn.get("name") or ""
+                        tool_args_raw = fn.get("arguments") or "{}"
+                        # arguments は json 文字列で来るのが標準だが、 一部の
+                        # 実装は dict のまま返すので両対応
+                        try:
+                            if isinstance(tool_args_raw, dict):
+                                tool_args = tool_args_raw
+                            else:
+                                tool_args = json.loads(tool_args_raw)
+                            if not isinstance(tool_args, dict):
+                                tool_args = {}
+                        except Exception:
+                            tool_args = {}
+
+                        yield _emit({
+                            "type": "tool_use",
+                            "name": tool_name,
+                            "input": tool_args,
+                        })
+
+                        try:
+                            if tool_name in CHAT_SCOPED_TOOL_NAMES:
+                                content_str = _execute_chat_scoped_tool(
+                                    ctx, tool_name, tool_args,
+                                )
+                            elif tool_name in OLLAMA_ALLOWED_TOOL_NAMES:
+                                tool_output = mcp_client.call_tool(
+                                    tool_name, tool_args,
+                                )
+                                content_str = (
+                                    tool_output if tool_output else "(no result)"
+                                )
+                            else:
+                                # 許可リスト外のツールを gemma2 が幻覚した
+                                content_str = (
+                                    f"[このツールは gemma2 経路では露出していません: "
+                                    f"{tool_name}。 別のツールで試してください]"
+                                )
+                            if len(content_str) > MCP_TOOL_RESULT_MAX_CHARS:
+                                original_len = len(content_str)
+                                content_str = (
+                                    content_str[:MCP_TOOL_RESULT_MAX_CHARS]
+                                    + f"\n\n[結果が長いため "
+                                    f"{MCP_TOOL_RESULT_MAX_CHARS:,} 文字で"
+                                    f"切り詰めました (元の長さ: "
+                                    f"{original_len:,} 文字)]"
+                                )
+                                logger.info(
+                                    f"[CHAT/ollama] tool {tool_name} truncated: "
+                                    f"{original_len} -> "
+                                    f"{MCP_TOOL_RESULT_MAX_CHARS} chars"
+                                )
+                            msgs.append({
+                                "role": "user",
+                                "content": (
+                                    f"[ツール実行結果 - {tool_name}]\n"
+                                    f"{content_str}\n\n"
+                                    f"この結果を元に、 次のツールを呼ぶか、 "
+                                    f"最終回答を返してください。"
+                                ),
+                            })
+                            brief = str(content_str)[
+                                :TOOL_RESULT_BRIEF_CHAR_LIMIT
+                            ]
+                            accumulated_tool_calls.append({
+                                "name": tool_name,
+                                "input": tool_args,
+                                "result_brief": brief,
+                                "ok": True,
+                            })
+                            yield _emit({
+                                "type": "tool_result",
+                                "name": tool_name,
+                                "ok": True,
+                                "result_brief": brief,
+                            })
+                        except Exception as e:
+                            err_msg = (
+                                f"ツール実行エラー: "
+                                f"{type(e).__name__}: {str(e)[:120]}"
+                            )
+                            logger.error(
+                                f"[CHAT/ollama] tool {tool_name} failed: "
+                                f"{type(e).__name__}: {e}",
+                            )
+                            msgs.append({
+                                "role": "user",
+                                "content": (
+                                    f"[ツール実行エラー - {tool_name}]\n"
+                                    f"{err_msg}\n\n"
+                                    f"この結果を元に、 別のツールを呼ぶか、 "
+                                    f"最終回答を返してください。"
+                                ),
+                            })
+                            accumulated_tool_calls.append({
+                                "name": tool_name,
+                                "input": tool_args,
+                                "result_brief": err_msg,
+                                "ok": False,
+                            })
+                            yield _emit({
+                                "type": "tool_result",
+                                "name": tool_name,
+                                "ok": False,
+                                "error": f"{type(e).__name__}",
+                                "result_brief": err_msg,
+                            })
+                else:
+                    # max iterations 到達
+                    partial_text = "".join(accumulated_text_parts).strip()
+                    if not partial_text:
+                        partial_text = (
+                            f"[gemma2 が {OLLAMA_MAX_TOOL_ITERATIONS} 回の"
+                            f" ツール呼び出し上限に達し、 回答を完結できませんでした]"
+                        )
+                    else:
+                        partial_text += (
+                            f"\n\n[gemma2 が {OLLAMA_MAX_TOOL_ITERATIONS} 回の"
+                            f" ツール呼び出し上限に達しました]"
+                        )
+                    ass_msg_id, cost_usd = _finalize_send(
+                        ctx, partial_text, total_in_tokens, total_out_tokens,
+                        tool_calls=accumulated_tool_calls,
+                    )
+                    logger.warning(
+                        f"[CHAT/ollama] max iterations reached "
+                        f"thread={ctx['thread_id']} owner={ctx['owner']!r} "
+                        f"in={total_in_tokens} out={total_out_tokens} "
+                        f"tool_calls={len(accumulated_tool_calls)}"
+                    )
+                    yield _emit({
+                        "type": "done",
+                        "assistant_message_id": ass_msg_id,
+                        "input_tokens": total_in_tokens,
+                        "output_tokens": total_out_tokens,
+                        "cache_w_tokens": 0,
+                        "cache_r_tokens": 0,
+                        "cost_usd": round(cost_usd, 6),
+                        "stop_reason": "max_iterations",
+                        "tool_calls_count": len(accumulated_tool_calls),
+                    })
+                    return
+
+        except Exception as e:
+            logger.error(
+                f"[CHAT/ollama] outer error: {type(e).__name__}: {e}",
+                exc_info=True,
+            )
+            yield _emit({
+                "type": "error",
+                "error": f"{type(e).__name__}: {str(e)[:200]}",
+            })
+            return
+
+        # 通常完了
+        full_text = "".join(accumulated_text_parts).strip()
+        ass_msg_id, cost_usd = _finalize_send(
+            ctx, full_text, total_in_tokens, total_out_tokens,
+            tool_calls=accumulated_tool_calls,
+        )
+        logger.info(
+            f"[CHAT/ollama] stream OK thread={ctx['thread_id']} "
+            f"owner={ctx['owner']!r} model={ctx['model']} "
+            f"in={total_in_tokens} out={total_out_tokens} "
+            f"cost=${cost_usd:.4f} "
+            f"tool_calls={len(accumulated_tool_calls)}"
+        )
+        yield _emit({
+            "type": "done",
+            "assistant_message_id": ass_msg_id,
+            "input_tokens": total_in_tokens,
+            "output_tokens": total_out_tokens,
+            "cache_w_tokens": 0,
+            "cache_r_tokens": 0,
+            "cost_usd": round(cost_usd, 6),
+            "stop_reason": stop_reason or "stop",
+            "tool_calls_count": len(accumulated_tool_calls),
+        })
+
+
+    # ============================================================
+    # ストリーミング + MCP tool loop
+    # (main.py の /core/claude/stream-with-mcp と同じパターン)
+    # ============================================================
+
+    @router.post("/core/chat/send/stream")
+    async def core_chat_send_stream(request: dict):
+        """SSE ストリーミング + MCP tool loop。
+
+        Event 種別 (`data: {json}\\n\\n`):
+          - {"type": "start", user_message_id, injected_topics, model}
+          - {"type": "delta", text}
+          - {"type": "tool_use", name, input}
+          - {"type": "tool_result", name, ok, error?}
+          - {"type": "done", assistant_message_id, input_tokens,
+             output_tokens, stop_reason, tool_calls_count}
+          - {"type": "error", error}
+        """
+        ctx, err = _prepare_send(request)
+
+        def _err_stream(msg: str):
+            payload = json.dumps({"type": "error", "error": msg}, ensure_ascii=False)
+            yield (f"data: {payload}\n\n").encode()
+
+        if err is not None:
+            return StreamingResponse(_err_stream(err), media_type="text/event-stream")
+
+        def _emit(evt: dict) -> bytes:
+            return (f"data: {json.dumps(evt, ensure_ascii=False)}\n\n").encode()
+
+        def stream_gen():
+            # start event
+            yield _emit({
+                "type": "start",
+                "user_message_id": ctx["user_msg_id"],
+                "injected_topics": ctx["injected_topics_meta"],
+                "model": ctx["model"],
+            })
+
+            # Step E-2: Jev+gemma2 (C3PO) 経路は別関数に分岐
+            if ctx["model"] == CHAT_JEV_GEMMA2_MODEL_ID:
+                yield from _stream_via_jev_gemma2(ctx, _emit)
+                return
+
+            # gemma2 (Ollama) は OpenAI 互換のツール呼び出しで別ループに分岐
+            if _is_ollama_model(ctx["model"]):
+                yield from _run_mcp_loop_ollama(ctx, _emit)
+                return
+
+            # kernel 本体の共有リソースを lazy import
+            try:
+                from main import (
+                    get_anthropic_client,
+                    SimpleMCPClient,
+                    MCP_SERVER_URL,
+                    MCP_API_KEY,
+                    MCP_CONNECT_TIMEOUT,
+                    CLAUDE_MAX_TOOL_ITERATIONS,
+                    CLAUDE_STREAM_MAX_ACCUMULATED_TOKENS,
+                    _claude_strip_unsupported_sampling,
+                )
+            except Exception as e:
+                yield _emit({
+                    "type": "error",
+                    "error": f"main import failed: {type(e).__name__}: {e}",
+                })
+                return
+
+            if not MCP_API_KEY or not MCP_SERVER_URL:
+                yield _emit({
+                    "type": "error",
+                    "error": "MCP config missing (MCP_API_KEY/MCP_SERVER_URL not set)",
+                })
+                return
+
+            try:
+                client = get_anthropic_client()
+            except Exception as e:
+                yield _emit({
+                    "type": "error",
+                    "error": f"anthropic client init failed: {type(e).__name__}: {e}",
+                })
+                return
+
+            accumulated_text_parts: List[str] = []
+            accumulated_tool_calls: List[dict] = []
+            total_in_tokens = 0
+            total_out_tokens = 0
+            total_cache_w_tokens = 0
+            total_cache_r_tokens = 0
+            stop_reason: Optional[str] = None
+
+            try:
+                with SimpleMCPClient(
+                    MCP_SERVER_URL, MCP_API_KEY, timeout=MCP_CONNECT_TIMEOUT,
+                ) as mcp_client:
+                    try:
+                        all_tools = mcp_client.list_tools()
+                    except Exception as e:
+                        yield _emit({
+                            "type": "error",
+                            "error": f"MCP list_tools failed: {type(e).__name__}: {e}",
+                        })
+                        return
+
+                    # MCP tool を Anthropic tool schema に変換 (inputSchema → input_schema)
+                    # さらに chat-scoped tool を並べて露出。
+                    # 最後の tool に cache_control ephemeral を付けて prompt caching (5min TTL)
+                    tools_for_claude = []
+                    for t in all_tools:
+                        tools_for_claude.append({
+                            "name": t["name"],
+                            "description": t.get("description", ""),
+                            "input_schema": t.get(
+                                "inputSchema",
+                                {"type": "object", "properties": {}},
+                            ),
+                        })
+                    # chat-scoped tool を追加
+                    for chat_t in CHAT_SCOPED_TOOL_SCHEMAS:
+                        tools_for_claude.append({
+                            "name": chat_t["name"],
+                            "description": chat_t["description"],
+                            "input_schema": chat_t["input_schema"],
+                        })
+                    if tools_for_claude:
+                        tools_for_claude[-1]["cache_control"] = {"type": "ephemeral"}
+
+                    logger.info(
+                        f"[CHAT] MCP exposed {len(all_tools)} MCP tools + "
+                        f"{len(CHAT_SCOPED_TOOL_SCHEMAS)} chat-scoped tools "
+                        f"thread={ctx['thread_id']} model={ctx['model']}"
+                    )
+
+                    msgs = list(ctx["api_messages"])
+
+                    for iteration in range(CHAT_MAX_TOOL_ITERATIONS):
+                        create_kwargs: Dict[str, Any] = {
+                            "model": ctx["model"],
+                            "max_tokens": MAX_OUTPUT_TOKENS,
+                            "messages": _messages_with_cache_control(msgs),
+                        }
+                        if ctx["system_prompt"]:
+                            create_kwargs["system"] = [{
+                                "type": "text",
+                                "text": ctx["system_prompt"],
+                                "cache_control": {"type": "ephemeral"},
+                            }]
+                        if tools_for_claude:
+                            create_kwargs["tools"] = tools_for_claude
+
+                        _claude_strip_unsupported_sampling(
+                            ctx["model"], create_kwargs,
+                        )
+
+                        # 1M context beta header を対応モデルにのみ付与
+                        stream_kwargs = dict(create_kwargs)
+                        if ctx["model"] in MODELS_SUPPORTING_1M_CONTEXT:
+                            stream_kwargs["extra_headers"] = {
+                                "anthropic-beta": "context-1m-2025-08-07",
+                            }
+
+                        try:
+                            with client.messages.stream(**stream_kwargs) as stream:
+                                for text_chunk in stream.text_stream:
+                                    if text_chunk:
+                                        accumulated_text_parts.append(text_chunk)
+                                        yield _emit({
+                                            "type": "delta",
+                                            "text": text_chunk,
+                                        })
+                                final_message = stream.get_final_message()
+                        except Exception as e:
+                            logger.error(
+                                f"[CHAT] stream error iter={iteration}: "
+                                f"{type(e).__name__}: {e}",
+                                exc_info=True,
+                            )
+                            yield _emit({
+                                "type": "error",
+                                "error": f"{type(e).__name__}: {str(e)[:200]}",
+                            })
+                            return
+
+                        # usage
+                        try:
+                            usage = final_message.usage
+                            in_tk = int(getattr(usage, "input_tokens", 0) or 0)
+                            out_tk = int(getattr(usage, "output_tokens", 0) or 0)
+                            cw_tk = int(
+                                getattr(usage, "cache_creation_input_tokens", 0) or 0
+                            )
+                            cr_tk = int(
+                                getattr(usage, "cache_read_input_tokens", 0) or 0
+                            )
+                            total_in_tokens += in_tk
+                            total_out_tokens += out_tk
+                            total_cache_w_tokens += cw_tk
+                            total_cache_r_tokens += cr_tk
+                            # OpenSearch の claude_usage index に永続化
+                            # (op="chat_send_stream" で chat 向けの使用量を集計可能に)
+                            try:
+                                from main import record_claude_usage
+                                record_claude_usage(
+                                    op="chat_send_stream",
+                                    input_tokens=in_tk,
+                                    output_tokens=out_tk,
+                                    model=ctx["model"],
+                                    cache_w=cw_tk,
+                                    cache_r=cr_tk,
+                                    user_id=ctx["owner"],
+                                )
+                            except Exception as _e:
+                                logger.warning(
+                                    f"[CHAT] record_claude_usage failed: {_e}"
+                                )
+                        except Exception:
+                            pass
+
+                        # コスト上限チェック
+                        if (total_in_tokens + total_out_tokens
+                                > CHAT_ACCUMULATED_TOKENS_CAP):
+                            partial_text = "".join(accumulated_text_parts).strip()
+                            if not partial_text:
+                                partial_text = (
+                                    f"[累積 {CHAT_ACCUMULATED_TOKENS_CAP:,} token の"
+                                    f" コスト上限に達し、 回答を完結できませんでした。"
+                                    f" 続けて発話すれば追加調査できます]"
+                                )
+                            else:
+                                partial_text += (
+                                    f"\n\n[累積 {CHAT_ACCUMULATED_TOKENS_CAP:,} token の"
+                                    f" コスト上限に達しました。"
+                                    f" 続けて発話すれば追加調査できます]"
+                                )
+                            ass_msg_id, cost_usd = _finalize_send(
+                                ctx, partial_text, total_in_tokens, total_out_tokens,
+                                cache_w_tokens=total_cache_w_tokens,
+                                cache_r_tokens=total_cache_r_tokens,
+                                tool_calls=accumulated_tool_calls,
+                            )
+                            logger.warning(
+                                f"[CHAT] cost cap reached thread={ctx['thread_id']} "
+                                f"owner={ctx['owner']!r} model={ctx['model']} "
+                                f"in={total_in_tokens} out={total_out_tokens} "
+                                f"cache_r={total_cache_r_tokens} "
+                                f"cost=${cost_usd:.4f} "
+                                f"tool_calls={len(accumulated_tool_calls)}"
+                            )
+                            yield _emit({
+                                "type": "done",
+                                "assistant_message_id": ass_msg_id,
+                                "input_tokens": total_in_tokens,
+                                "output_tokens": total_out_tokens,
+                                "cache_w_tokens": total_cache_w_tokens,
+                                "cache_r_tokens": total_cache_r_tokens,
+                                "cost_usd": round(cost_usd, 6),
+                                "stop_reason": "cost_cap",
+                                "tool_calls_count": len(accumulated_tool_calls),
+                            })
+                            return
+
+                        stop_reason = getattr(final_message, "stop_reason", None)
+
+                        if stop_reason != "tool_use":
+                            break
+
+                        # tool_use を実行
+                        assistant_content = []
+                        for block in final_message.content:
+                            btype = getattr(block, "type", None)
+                            if btype == "text":
+                                assistant_content.append(
+                                    {"type": "text", "text": block.text},
+                                )
+                            elif btype == "tool_use":
+                                assistant_content.append({
+                                    "type": "tool_use",
+                                    "id": block.id,
+                                    "name": block.name,
+                                    "input": dict(block.input),
+                                })
+                        msgs.append({"role": "assistant", "content": assistant_content})
+
+                        tool_results_content = []
+                        for block in final_message.content:
+                            if getattr(block, "type", None) != "tool_use":
+                                continue
+                            tool_name = block.name
+                            tool_args = dict(block.input)
+
+                            yield _emit({
+                                "type": "tool_use",
+                                "name": tool_name,
+                                "input": tool_args,
+                            })
+
+                            try:
+                                if tool_name in CHAT_SCOPED_TOOL_NAMES:
+                                    content_str = _execute_chat_scoped_tool(
+                                        ctx, tool_name, tool_args,
+                                    )
+                                else:
+                                    tool_output = mcp_client.call_tool(
+                                        tool_name, tool_args,
+                                    )
+                                    content_str = (
+                                        tool_output if tool_output else "(no result)"
+                                    )
+                                # 巨大な tool result を上限で切り詰めて context 汚染を防ぐ
+                                if len(content_str) > MCP_TOOL_RESULT_MAX_CHARS:
+                                    original_len = len(content_str)
+                                    content_str = (
+                                        content_str[:MCP_TOOL_RESULT_MAX_CHARS]
+                                        + f"\n\n[結果が長いため {MCP_TOOL_RESULT_MAX_CHARS:,} "
+                                        f"文字で切り詰めました (元の長さ: "
+                                        f"{original_len:,} 文字)。 より具体的なクエリで"
+                                        f"再度呼び出してください。 例: 一覧系 tool は"
+                                        f"ページング引数を使う、 検索系はより狭い検索クエリにする]"
+                                    )
+                                    logger.info(
+                                        f"[CHAT] tool {tool_name} result truncated: "
+                                        f"{original_len} -> {MCP_TOOL_RESULT_MAX_CHARS} chars"
+                                    )
+                                tool_results_content.append({
+                                    "type": "tool_result",
+                                    "tool_use_id": block.id,
+                                    "content": content_str,
+                                })
+                                brief = str(content_str)[
+                                    :TOOL_RESULT_BRIEF_CHAR_LIMIT
+                                ]
+                                accumulated_tool_calls.append({
+                                    "name": tool_name,
+                                    "input": tool_args,
+                                    "result_brief": brief,
+                                    "ok": True,
+                                })
+                                yield _emit({
+                                    "type": "tool_result",
+                                    "name": tool_name,
+                                    "ok": True,
+                                    "result_brief": brief,
+                                })
+                            except Exception as e:
+                                err_msg = (
+                                    f"ツール実行エラー: "
+                                    f"{type(e).__name__}: {str(e)[:120]}"
+                                )
+                                logger.error(
+                                    f"[CHAT] tool {tool_name} failed: "
+                                    f"{type(e).__name__}: {e}",
+                                )
+                                tool_results_content.append({
+                                    "type": "tool_result",
+                                    "tool_use_id": block.id,
+                                    "content": err_msg,
+                                    "is_error": True,
+                                })
+                                accumulated_tool_calls.append({
+                                    "name": tool_name,
+                                    "input": tool_args,
+                                    "result_brief": err_msg,
+                                    "ok": False,
+                                })
+                                yield _emit({
+                                    "type": "tool_result",
+                                    "name": tool_name,
+                                    "ok": False,
+                                    "error": f"{type(e).__name__}",
+                                    "result_brief": err_msg,
+                                })
+
+                        msgs.append({"role": "user", "content": tool_results_content})
+                    else:
+                        # max iterations 到達: 部分テキストを保存して done として返す
+                        partial_text = "".join(accumulated_text_parts).strip()
+                        if not partial_text:
+                            partial_text = (
+                                f"[Claude が {CHAT_MAX_TOOL_ITERATIONS} 回の"
+                                f" tool 呼び出し上限に達し、 回答を完結できませんでした。"
+                                f" 続けて発話すれば追加調査できます]"
+                            )
+                        else:
+                            partial_text += (
+                                f"\n\n[Claude が {CHAT_MAX_TOOL_ITERATIONS} 回の"
+                                f" tool 呼び出し上限に達しました。"
+                                f" 続けて発話すれば追加調査できます]"
+                            )
+                        ass_msg_id, cost_usd = _finalize_send(
+                            ctx, partial_text, total_in_tokens, total_out_tokens,
+                            cache_w_tokens=total_cache_w_tokens,
+                            cache_r_tokens=total_cache_r_tokens,
+                            tool_calls=accumulated_tool_calls,
+                        )
+                        logger.warning(
+                            f"[CHAT] max iterations reached thread={ctx['thread_id']} "
+                            f"owner={ctx['owner']!r} model={ctx['model']} "
+                            f"in={total_in_tokens} out={total_out_tokens} "
+                            f"cache_r={total_cache_r_tokens} "
+                            f"cost=${cost_usd:.4f} "
+                            f"tool_calls={len(accumulated_tool_calls)}"
+                        )
+                        yield _emit({
+                            "type": "done",
+                            "assistant_message_id": ass_msg_id,
+                            "input_tokens": total_in_tokens,
+                            "output_tokens": total_out_tokens,
+                            "cache_w_tokens": total_cache_w_tokens,
+                            "cache_r_tokens": total_cache_r_tokens,
+                            "cost_usd": round(cost_usd, 6),
+                            "stop_reason": "max_iterations",
+                            "tool_calls_count": len(accumulated_tool_calls),
+                        })
+                        return
+
+            except Exception as e:
+                logger.error(
+                    f"[CHAT] outer error: {type(e).__name__}: {e}", exc_info=True,
+                )
+                yield _emit({
+                    "type": "error",
+                    "error": f"{type(e).__name__}: {str(e)[:200]}",
+                })
+                return
+
+            # 完了処理: assistant メッセージ保存 + スレッド更新
+            full_text = "".join(accumulated_text_parts).strip()
+            ass_msg_id, cost_usd = _finalize_send(
+                ctx, full_text, total_in_tokens, total_out_tokens,
+                cache_w_tokens=total_cache_w_tokens,
+                cache_r_tokens=total_cache_r_tokens,
+                tool_calls=accumulated_tool_calls,
+            )
+            logger.info(
+                f"[CHAT] stream OK thread={ctx['thread_id']} "
+                f"owner={ctx['owner']!r} model={ctx['model']} "
+                f"in={total_in_tokens} out={total_out_tokens} "
+                f"cache_r={total_cache_r_tokens} "
+                f"cost=${cost_usd:.4f} "
+                f"injected={len(ctx['injected_topics_meta'])} "
+                f"tool_calls={len(accumulated_tool_calls)}"
+            )
+            yield _emit({
+                "type": "done",
+                "assistant_message_id": ass_msg_id,
+                "input_tokens": total_in_tokens,
+                "output_tokens": total_out_tokens,
+                "cache_w_tokens": total_cache_w_tokens,
+                "cache_r_tokens": total_cache_r_tokens,
+                "cost_usd": round(cost_usd, 6),
+                "stop_reason": stop_reason,
+                "tool_calls_count": len(accumulated_tool_calls),
+            })
+
+        return StreamingResponse(
+            stream_gen(), media_type="text/event-stream",
+        )
+
+
+    # ============================================================
+    # 非ストリーミング版 (レガシー、 tool 未対応)
+    # ============================================================
+
+    def _call_anthropic_simple(
+        model: str, system_prompt: str, messages_for_api: List[dict],
+    ) -> Dict[str, Any]:
+        try:
+            from main import get_anthropic_client
+        except Exception as e:
+            raise RuntimeError(f"anthropic import failed: {e}")
+        client = get_anthropic_client()
+        create_kwargs: Dict[str, Any] = {
+            "model": model,
+            "max_tokens": MAX_OUTPUT_TOKENS,
+            "messages": messages_for_api,
+        }
+        if system_prompt:
+            create_kwargs["system"] = system_prompt
+        # 1M context beta header を対応モデルにのみ付与
+        if model in MODELS_SUPPORTING_1M_CONTEXT:
+            create_kwargs["extra_headers"] = {
+                "anthropic-beta": "context-1m-2025-08-07",
+            }
+        msg = client.messages.create(**create_kwargs)
+        text_parts = []
+        for block in msg.content:
+            btype = getattr(block, "type", None)
+            if btype == "text":
+                text_parts.append(block.text)
+        usage = msg.usage
+        return {
+            "text": "".join(text_parts).strip(),
+            "input_tokens": int(getattr(usage, "input_tokens", 0) or 0),
+            "output_tokens": int(getattr(usage, "output_tokens", 0) or 0),
+            "stop_reason": msg.stop_reason,
+        }
+
+
+    @router.post("/core/chat/send")
+    async def core_chat_send(request: dict):
+        """非ストリーミング。 tool 未使用 (streaming 側でのみ tool loop)。"""
+        ctx, err = _prepare_send(request)
+        if err is not None:
+            return {"ok": False, "error": err}
+        try:
+            resp = _call_anthropic_simple(
+                ctx["model"], ctx["system_prompt"], ctx["api_messages"],
+            )
+        except Exception as e:
+            logger.error(f"[CHAT] anthropic call failed: {e}", exc_info=True)
+            now = _now_iso()
+            _os_post(
+                f"/{CHAT_THREADS_INDEX}/_update/{ctx['thread_id']}?refresh=true",
+                {"doc": {
+                    "last_message_at": now, "updated_at": now,
+                    "message_count": len(ctx["prior"]) + 1,
+                }},
+            )
+            return {
+                "ok": False, "user_message_id": ctx["user_msg_id"],
+                "error": f"{type(e).__name__}: {str(e)[:300]}",
+            }
+        ass_msg_id = _finalize_send(
+            ctx, resp["text"], resp["input_tokens"], resp["output_tokens"],
+        )
+        return {
+            "ok": True,
+            "user_message_id": ctx["user_msg_id"],
+            "assistant_message_id": ass_msg_id,
+            "assistant_content": resp["text"],
+            "input_tokens": resp["input_tokens"],
+            "output_tokens": resp["output_tokens"],
+            "model": ctx["model"],
+            "stop_reason": resp.get("stop_reason"),
+            "injected_topics": ctx["injected_topics_meta"],
+            "error": None,
+        }

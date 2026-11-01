@@ -1,0 +1,32 @@
+# Example Fleet GitRepo for the vLLM + Swallow kernel variant
+# (NVIDIA GPU reference topology).
+#
+# Adjust:
+#   - spec.repo:    your fork URL or the upstream OpenSpoke repo
+#   - spec.branch:  branch to track
+#   - spec.paths:   set to hub/manifests/kernel-vllm and rag-vllm to
+#                   deploy the vLLM variant; use hub/manifests/kernel
+#                   and rag-hub/rag for the Ollama variant instead.
+#   - spec.targets: cluster selector labels
+apiVersion: fleet.cattle.io/v1alpha1
+kind: GitRepo
+metadata:
+  name: hub-kernel-vllm
+  namespace: fleet-default
+spec:
+  repo: https://github.com/OpenSpoke/openspoke.git
+  branch: main
+  # For private forks, create a Secret in the fleet-default namespace and
+  # uncomment the line below:
+  # clientSecretName: fleet-git-credentials
+  paths:
+    - hub/manifests/kernel-vllm
+    - hub/manifests/rag-hub/rag-vllm
+  pollingInterval: 1m0s
+  keepResources: true
+  targets:
+    - name: hub-vllm
+      clusterSelector:
+        matchLabels:
+          role: hub
+          llm: vllm

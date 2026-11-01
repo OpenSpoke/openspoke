@@ -1,0 +1,47 @@
+---
+#  OpenSpoke CI 司令役の権限
+#
+#  司令役は Kubernetes API を直接叩いて実行役の Job を作る。
+#  名前空間 builder の中だけで完結するので ClusterRole は要らない。
+#
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ci-dispatcher
+  namespace: builder
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ci-dispatcher
+  namespace: builder
+rules:
+  #  実行役の Job を作る / 既にあるか調べる / 片づける
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  #  実行役の様子とログを見る
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  #  手動のビルド要求の受け皿 (ci-requests) を作る / 読む / 消化する
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create", "get", "list", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ci-dispatcher
+  namespace: builder
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ci-dispatcher
+subjects:
+  - kind: ServiceAccount
+    name: ci-dispatcher
+    namespace: builder

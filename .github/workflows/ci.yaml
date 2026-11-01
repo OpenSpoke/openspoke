@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+
+  # ----------------------------------------------------------------------
+  # 1. yamllint
+  #    Catch YAML syntax errors and gross formatting mistakes.
+  #    Rules are relaxed to match the current repo state (see .yamllint.yml).
+  # ----------------------------------------------------------------------
+  yamllint:
+    name: yamllint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install --no-cache-dir yamllint==1.38.0
+      - run: yamllint .
+
+  # ----------------------------------------------------------------------
+  # 2. shellcheck
+  #    Lint every *.sh in the tree.
+  # ----------------------------------------------------------------------
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: run shellcheck
+        run: |
+          set -e
+          shopt -s globstar nullglob
+          files=(**/*.sh)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "no *.sh files to check"
+            exit 0
+          fi
+          shellcheck "${files[@]}"
+
+  # ----------------------------------------------------------------------
+  # 3. kubeconform
+  #    Validate every Kubernetes manifest against the k8s OpenAPI schema.
+  #    Fleet CRDs and other CRDs are ignored via -ignore-missing-schemas.
+  # ----------------------------------------------------------------------
+  kubeconform:
+    name: kubeconform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install kubeconform
+        run: |
+          set -e
+          curl -fsSL -o kubeconform.tgz \
+            https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz
+          tar xzf kubeconform.tgz kubeconform
+          sudo mv kubeconform /usr/local/bin/
+          kubeconform -v
+      - name: validate manifests
+        run: |
+          set -e
+          # hub, fleet, spoke, rancher directories contain K8s manifests.
+          # examples/ contains templates that reference values users fill in
+          # later; still runnable through kubeconform in strict mode.
+          # fleet.yaml files are Fleet bundle configuration (helm: block etc.),
+          # not K8s resources, so they are excluded from kubeconform.
+          find hub fleet spoke rancher examples \
+            \( -name '*.yaml' -o -name '*.yml' \) \
+            ! -name 'fleet.yaml' \
+            -print0 |
+            xargs -0 kubeconform \
+              -strict \
+              -summary \
+              -ignore-missing-schemas

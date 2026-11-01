@@ -1,0 +1,21 @@
+---
+#  Nuxt 版 OpenSpoke ダッシュボードの受け口。
+#
+#  oauth2-proxy がここを指す。利用者の browser は oauth2-proxy しか
+#  見ないので、ここはクラスターの内側だけで足りる (ClusterIP)。
+apiVersion: v1
+kind: Service
+metadata:
+  name: openspoke-frontend
+  namespace: rag-company1
+  labels:
+    app: openspoke-frontend
+spec:
+  type: ClusterIP
+  selector:
+    app: openspoke-frontend
+  ports:
+    - name: http
+      port: 3000
+      protocol: TCP
+      targetPort: 3000

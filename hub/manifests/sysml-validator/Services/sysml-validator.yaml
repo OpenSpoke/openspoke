@@ -1,0 +1,18 @@
+---
+#  kernel から http://sysml-validator.rag-company1.svc.cluster.local:8080 で呼ぶ。クラスターの外には出さない。
+apiVersion: v1
+kind: Service
+metadata:
+  name: sysml-validator
+  namespace: rag-company1
+  labels:
+    app: sysml-validator
+spec:
+  type: ClusterIP
+  selector:
+    app: sysml-validator
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      protocol: TCP

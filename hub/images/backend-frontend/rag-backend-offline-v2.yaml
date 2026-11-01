@@ -1,0 +1,190 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-backend
+  namespace: rag-company1
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: rag-backend
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: rag-backend
+      namespace: rag-company1
+    spec:
+      containers:
+        - command:
+            - bash
+            - '-c'
+            - >
+              echo "Preloading Level Zero libraries..."
+
+              export LD_PRELOAD="/usr/local/lib/libze_loader.so.1
+              /usr/local/lib/libze_intel_gpu.so.1
+              /usr/local/lib/libigdgmm.so.12"
+
+              echo "Starting backend (packages pre-installed in image)"
+
+              export HF_HOME=/model-cache
+
+              export TRANSFORMERS_CACHE=/model-cache
+
+              cd /app
+
+              python3 main.py
+          env:
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  key: token
+                  name: github-api-token
+            - name: PYTHONPATH
+              value: /model-cache/packages
+            - name: HF_HOME
+              value: /model-cache
+            - name: TRANSFORMERS_CACHE
+              value: /model-cache
+            - name: LD_LIBRARY_PATH
+              value: >-
+                /opt/intel/oneapi/redist/lib:/opt/intel/oneapi/pti/0.10/lib:/usr/local/lib
+            - name: ZE_ENABLE_PCI_ID_DEVICE_ORDER
+              value: '1'
+            - name: SYCL_DEVICE_FILTER
+              value: level_zero:gpu
+            - name: ONEAPI_DEVICE_SELECTOR
+              value: level_zero:gpu
+          image: rag-backend-gpu-offline:latest
+          imagePullPolicy: IfNotPresent
+          name: backend
+          ports:
+            - containerPort: 8000
+              name: 8000tcp
+              protocol: TCP
+          resources:
+            limits:
+              cpu: '2'
+              memory: 4Gi
+            requests:
+              cpu: '1'
+              memory: 2Gi
+          securityContext:
+            privileged: true
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+            - mountPath: /app
+              name: backend-code
+              readOnly: true
+            - mountPath: /model-cache
+              name: model-cache
+            - mountPath: /dev/dri
+              name: dev-dri
+            - mountPath: /opt/intel/oneapi/redist/lib
+              name: intel-libs
+              readOnly: true
+            - mountPath: /usr/local/lib/libze_loader.so.1
+              name: level-zero
+              readOnly: true
+            - mountPath: /usr/local/lib/libOpenCL.so.1
+              name: opencl
+              readOnly: true
+            - mountPath: /usr/local/lib/libze_intel_gpu.so.1
+              name: level-zero-driver
+              readOnly: true
+            - mountPath: /usr/local/lib/libigdgmm.so.12
+              name: intel-gmmlib
+              readOnly: true
+            - mountPath: /opt/intel/oneapi/pti/0.10/lib
+              name: intel-pti
+              readOnly: true
+      dnsPolicy: ClusterFirst
+      initContainers:
+        - command:
+            - bash
+            - '-c'
+            - >
+              echo "All packages and models are pre-installed in Docker image"
+
+              echo "Initialization complete (offline mode)"
+
+              exit 0
+          image: rag-backend-gpu-offline:latest
+          imagePullPolicy: IfNotPresent
+          name: download-models
+          resources: {}
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+            - mountPath: /model-cache
+              name: model-cache
+            - mountPath: /opt/intel/oneapi/redist/lib
+              name: intel-libs
+              readOnly: true
+            - mountPath: /usr/local/lib/libze_loader.so.1
+              name: level-zero
+              readOnly: true
+            - mountPath: /usr/local/lib/libOpenCL.so.1
+              name: opencl
+              readOnly: true
+            - mountPath: /usr/local/lib/libze_intel_gpu.so.1
+              name: level-zero-driver
+              readOnly: true
+            - mountPath: /usr/local/lib/libigdgmm.so.12
+              name: intel-gmmlib
+              readOnly: true
+            - mountPath: /opt/intel/oneapi/pti/0.10/lib
+              name: intel-pti
+              readOnly: true
+      nodeSelector:
+        gpu: enabled
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext:
+        supplementalGroups:
+          - 991
+      terminationGracePeriodSeconds: 30
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-cache
+        - configMap:
+            defaultMode: 420
+            name: rag-backend-code-reranking
+          name: backend-code
+        - hostPath:
+            path: /dev/dri
+            type: Directory
+          name: dev-dri
+        - hostPath:
+            path: /opt/intel/oneapi/redist/lib
+            type: Directory
+          name: intel-libs
+        - hostPath:
+            path: /usr/lib/x86_64-linux-gnu/libze_loader.so.1
+            type: File
+          name: level-zero
+        - hostPath:
+            path: /usr/lib/x86_64-linux-gnu/libOpenCL.so.1
+            type: File
+          name: opencl
+        - hostPath:
+            path: /usr/lib/x86_64-linux-gnu/libze_intel_gpu.so.1
+            type: File
+          name: level-zero-driver
+        - hostPath:
+            path: /usr/lib/x86_64-linux-gnu/libigdgmm.so.12
+            type: File
+          name: intel-gmmlib
+        - hostPath:
+            path: /opt/intel/oneapi/pti/0.10/lib
+            type: Directory
+          name: intel-pti

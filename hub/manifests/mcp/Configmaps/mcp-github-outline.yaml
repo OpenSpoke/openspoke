@@ -1,0 +1,320 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcp-github-outline
+  namespace: mcp
+data:
+  github_outline.py: |
+    """
+    GitHub Outline / Symbol ツール (Phase B - 低コンテキスト編集)。
+
+    大きなファイル (kernel ConfigMap、 mcp-server-code 等 数百 KB) を毎回
+    全文取得するのではなく、 構造の骨格 (function/class 名、 YAML key) と
+    行範囲だけ返して LLM コンテキスト消費を抑える。
+
+    対応ファイル形式:
+      - Python (.py)
+      - YAML (.yaml/.yml)
+      - YAML 内 Python literal block (data: <name>.py: |) — 自動検出
+
+    mcp_server.py から register_github_outline_tools(mcp, ensure_kernel_url)
+    で登録する。
+    """
+
+    import httpx as _httpx
+
+
+    def register_github_outline_tools(mcp, ensure_kernel_url):
+        """Outline / Symbol 系ツールを mcp に登録する。"""
+
+        async def _post(kernel, endpoint, body):
+            async with _httpx.AsyncClient(timeout=180.0) as client:
+                r = await client.post(kernel + endpoint, json=body)
+            r.raise_for_status()
+            return r.json()
+
+        def _fmt_symbol(sym, indent=0):
+            """1 symbol を 1 行にフォーマット。"""
+            kind = sym.get("kind", "")
+            name = sym.get("name", "")
+            sl = sym.get("start_line", 0)
+            el = sym.get("end_line", 0)
+            pad = "  " * indent
+            return f"{pad}[{kind}] {name} ({sl}-{el})"
+
+        def _fmt_outline(d):
+            """outline response を多行テキストに整形。"""
+            lang = d.get("language", "")
+            total = d.get("total_lines", 0)
+            head = f"language: {lang}, total_lines: {total}"
+            block = d.get("yaml_python_block")
+            if block:
+                head += (f"\nyaml_python_block: key={block.get('key')} "
+                         f"lines {block.get('content_start_line')}-{block.get('content_end_line')} "
+                         f"(indent {block.get('content_indent')})")
+            lines = [head, "symbols:"]
+            for sym in d.get("symbols", []) or []:
+                lines.append(_fmt_symbol(sym, indent=1))
+                for child in sym.get("children", []) or []:
+                    lines.append(_fmt_symbol(child, indent=2))
+            if len(lines) == 2:
+                lines.append("  (なし)")
+            return "\n".join(lines)
+
+        @mcp.tool()
+        async def github_get_outline(
+            owner: str,
+            repo: str,
+            path: str,
+            treat_as: str = "auto",
+            branch: str = "",
+            user_id: str = "",
+        ) -> str:
+            """ファイル構造のアウトライン (symbol 名 + 行範囲) を返す。
+
+            大ファイルを全文取得せず、 「どこに何があるか」 だけを引いて
+            次の get_symbol / get_file_range / str_replace の位置決めに使う。
+
+            対応:
+              - .py: Python AST で top-level def/class + クラス内 method、
+                および UPPER_CASE な module 定数
+              - .yaml/.yml: top-level key、 K8s manifest なら kind+name
+              - YAML 内 Python (data: <name>.py: | のリテラルブロック):
+                treat_as="auto" で自動検出し、 中身を Python として解析する。
+                行番号は YAML ファイル全体の行番号で返す (そのまま
+                get_file_range / str_replace に使える)。
+
+            Args:
+                owner: リポジトリ owner
+                repo: リポジトリ名
+                path: ファイルパス
+                treat_as: "auto" (default) | "python" | "yaml" | "python_in_yaml"
+                branch: branch 名 (省略時は default branch)
+                user_id: the assistant system利用者 ID
+            Returns:
+                複数行テキスト。 1 行目に language + total_lines、
+                必要なら 2 行目に yaml_python_block の位置、
+                以降に symbols (1 symbol = 1 行)
+            """
+            owner = (owner or "").strip()
+            repo = (repo or "").strip()
+            path = (path or "").strip()
+            if not owner or not repo or not path:
+                return "NG: owner, repo, path は必須"
+            try:
+                kernel = ensure_kernel_url()
+            except Exception as e:
+                return f"NG: KERNEL_URL 未設定: {e}"
+            try:
+                d = await _post(kernel, "/core/github/get-outline", {
+                    "owner": owner, "repo": repo, "path": path,
+                    "branch": branch if branch else None,
+                    "treat_as": treat_as or "auto",
+                    "user_id": user_id,
+                })
+            except Exception as e:
+                return f"NG: 通信失敗: {type(e).__name__}: {e}"
+            if not d.get("ok"):
+                return "NG: " + str(d.get("error", "unknown"))
+            return _fmt_outline(d)
+
+        @mcp.tool()
+        async def github_get_symbol(
+            owner: str,
+            repo: str,
+            path: str,
+            symbol: str,
+            treat_as: str = "auto",
+            branch: str = "",
+            user_id: str = "",
+        ) -> str:
+            """指定 symbol (def/class/method) の本体だけを返す。
+
+            github_get_outline で得た symbol 名をそのまま渡す。 decorator も
+            含めた完全な定義が返る。 ClassName.method 形式で method も指定可。
+
+            YAML 内 Python の場合、 返ってくる body の各行は YAML ファイル内の
+            実際のインデント (例 col 4) を保ったまま返る。 そのまま
+            github_apply_str_replace の old_str に使える。
+
+            Args:
+                owner: リポジトリ owner
+                repo: リポジトリ名
+                path: ファイルパス
+                symbol: symbol 名 (例 "core_github_get_file",
+                        "GitHubAPIClient" 、 "GitHubAPIClient.put_file")
+                treat_as: "auto" (default) | "python" | "python_in_yaml"
+                branch: branch 名 (省略時は default branch)
+                user_id: the assistant system利用者 ID
+            Returns:
+                "--- {path}:{start_line}-{end_line} ({language}) ---\\n{body}"
+                or "NG: {error}"
+            """
+            owner = (owner or "").strip()
+            repo = (repo or "").strip()
+            path = (path or "").strip()
+            symbol = (symbol or "").strip()
+            if not owner or not repo or not path or not symbol:
+                return "NG: owner, repo, path, symbol は必須"
+            try:
+                kernel = ensure_kernel_url()
+            except Exception as e:
+                return f"NG: KERNEL_URL 未設定: {e}"
+            try:
+                d = await _post(kernel, "/core/github/get-symbol", {
+                    "owner": owner, "repo": repo, "path": path,
+                    "symbol": symbol,
+                    "branch": branch if branch else None,
+                    "treat_as": treat_as or "auto",
+                    "user_id": user_id,
+                })
+            except Exception as e:
+                return f"NG: 通信失敗: {type(e).__name__}: {e}"
+            if not d.get("ok"):
+                return "NG: " + str(d.get("error", "unknown"))
+            sl = d.get("start_line", 0)
+            el = d.get("end_line", 0)
+            lang = d.get("language", "")
+            body = d.get("body", "")
+            return f"--- {path}:{sl}-{el} ({lang}) ---\n{body}"
+
+        @mcp.tool()
+        async def github_replace_symbol(
+            owner: str,
+            repo: str,
+            path: str,
+            symbol: str,
+            new_body: str,
+            message: str,
+            treat_as: str = "auto",
+            branch: str = "",
+            dry_run: bool = False,
+            user_id: str = "",
+        ) -> str:
+            """指定 symbol (def/class/method) を new_body で置き換えて push する。
+
+            AST aware の置換。 new_body は column 0 で書いた Python ソース
+            として渡す (decorator から本体まで)。 元の symbol が置かれていた
+            位置の indent を計測して、 new_body の各行に自動で prefix する。
+            これでクラス内 method や YAML 内 Python でも適切な indent で
+            挿入される (str_replace のインデント完全一致地獄を回避)。
+
+            push 前に AST parse で syntax check を実行する。 syntax error が
+            あれば push せずエラーを返す (post-edit syntax error)。
+
+            dry_run=True にすると push せず diff_preview だけ返す。 大きな
+            ファイルの編集前に「本当にこの範囲だけ変わるか」 を確認するのに使う。
+
+            Args:
+                owner: リポジトリ owner
+                repo: リポジトリ名
+                path: ファイルパス
+                symbol: symbol 名 ("func_name" or "ClassName.method")
+                new_body: 新しい本体 (column 0 で書いた Python)
+                message: commit message (dry_run=False のとき必須)
+                treat_as: "auto" (default) | "python" | "python_in_yaml"
+                branch: branch 名 (省略時は default branch)
+                dry_run: True なら push せず diff だけ返す
+                user_id: the assistant system利用者 ID
+            Returns:
+                成功: "OK: replaced {path}:{sl}-{el} ({sha[:12]})\\n{diff}"
+                dry_run: "DRY-RUN: {path}:{sl}-{el}\\n{diff}"
+                失敗: "NG: {error}"
+            """
+            owner = (owner or "").strip()
+            repo = (repo or "").strip()
+            path = (path or "").strip()
+            symbol = (symbol or "").strip()
+            message = (message or "").strip()
+            if not owner or not repo or not path or not symbol:
+                return "NG: owner, repo, path, symbol は必須"
+            if new_body is None:
+                return "NG: new_body は必須"
+            if not dry_run and not message:
+                return "NG: commit message は必須 (dry_run=True 時のみ省略可)"
+            try:
+                kernel = ensure_kernel_url()
+            except Exception as e:
+                return f"NG: KERNEL_URL 未設定: {e}"
+            try:
+                d = await _post(kernel, "/core/github/replace-symbol", {
+                    "owner": owner, "repo": repo, "path": path,
+                    "symbol": symbol, "new_body": new_body,
+                    "message": message,
+                    "branch": branch if branch else None,
+                    "treat_as": treat_as or "auto",
+                    "dry_run": bool(dry_run),
+                    "user_id": user_id,
+                })
+            except Exception as e:
+                return f"NG: 通信失敗: {type(e).__name__}: {e}"
+            if not d.get("ok"):
+                return "NG: " + str(d.get("error", "unknown"))
+            sl = d.get("start_line", 0)
+            el = d.get("end_line", 0)
+            diff = d.get("diff_preview", "") or "(diff なし)"
+            action = d.get("action", "")
+            if action == "dry_run":
+                return f"DRY-RUN: {path}:{sl}-{el}\n{diff}"
+            sha = str(d.get("commit_sha", ""))
+            return f"OK: replaced {path}:{sl}-{el} ({sha[:12]})\n{diff}"
+
+        @mcp.tool()
+        async def github_str_replace_dryrun(
+            owner: str,
+            repo: str,
+            path: str,
+            old_str: str,
+            new_str: str,
+            count: int = 1,
+            branch: str = "",
+            user_id: str = "",
+        ) -> str:
+            """str_replace の dry-run。 push せず、 マッチ位置と diff だけ返す。
+
+            github_apply_str_replace の事前検証に使う。 old_str が
+            ファイル内で何箇所にマッチするか、 どの行にマッチするかを
+            確認できる。 マッチ数が期待 (count) と一致しなければ NG。
+
+            Args:
+                owner: リポジトリ owner
+                repo: リポジトリ名
+                path: ファイルパス
+                old_str: 置換対象 (apply_str_replace と同じ)
+                new_str: 置換後 (空文字なら削除扱い)
+                count: 期待マッチ数 (default 1)
+                branch: branch 名
+                user_id: the assistant system利用者 ID
+            Returns:
+                成功: "DRY-RUN OK: {N} match(es) at lines [...]\\n{diff}"
+                失敗: "NG: {error} (found {N} at lines [...])"
+            """
+            owner = (owner or "").strip()
+            repo = (repo or "").strip()
+            path = (path or "").strip()
+            if not owner or not repo or not path:
+                return "NG: owner, repo, path は必須"
+            if not isinstance(old_str, str) or not old_str:
+                return "NG: old_str は必須 (空不可)"
+            if new_str is None:
+                return "NG: new_str は必須"
+            try:
+                kernel = ensure_kernel_url()
+            except Exception as e:
+                return f"NG: KERNEL_URL 未設定: {e}"
+            try:
+                d = await _post(kernel, "/core/github/str-replace-dryrun", {
+                    "owner": owner, "repo": repo, "path": path,
+                    "old_str": old_str, "new_str": new_str,
+                    "count": int(count or 1),
+                    "branch": branch if branch else None,
+                    "user_id": user_id,
+                })
+            except Exception as e:
+                return f"NG: 通信失敗: {type(e).__name__}: {e}"
+            found = d.get("found_occurrences", 0)
+            lines = d.get("match_lines", []) or []
+            if not d.get("ok"):
+                return f"NG: {d.get('error', 'unknown')} (found {found} at lines {lines})"
+            diff = d.get("diff_preview", "") or "(diff なし)"
+            return f"DRY-RUN OK: {found} match(es) at lines {lines}\n{diff}"

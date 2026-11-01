@@ -1,0 +1,28 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: llm-ingress
+  namespace: rag-company1
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-set-headers: rag-company1/websocket-headers
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: llm.example.com
+      http:
+        paths:
+          - backend:
+              service:
+                name: oauth2-proxy
+                port:
+                  number: 4180
+            path: /
+            pathType: Prefix
+  tls:
+    - hosts:
+        - llm.example.com
+      secretName: llm-example-com-tls

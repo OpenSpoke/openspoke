@@ -1,0 +1,120 @@
+---
+# Weekly mobile-binary-scan CronJob.
+#
+# For every enabled entry in mobile-scan-targets this runner asks a
+# native spoke (nsmt) that has iOS/Android build toolchains installed
+# to statically inspect the already-built .app / .apk on the spoke.
+# The findings are POSTed back to the kernel as vuln events.
+#
+# The runner reaches the native spoke through the tunnel-server's
+# per-spoke internal listener; the port is allocated by
+# spoke_register. No Kubernetes Secret is used.
+#
+# Each scan emits vuln events on the kernel and is not idempotent, so
+# backoffLimit: 0 disables retries.
+#
+# Defaults to suspend: true so a fresh install does not fire before
+# the operator has swapped in a real NSMT_MCP_URL, real targets, and
+# done a manual test job.
+#
+# To trigger a manual run:
+#   kubectl -n security-mobile create job mobile-binary-scan-manual-$(date +%s) \
+#     --from=cronjob/mobile-binary-scan
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: mobile-binary-scan
+  namespace: security-mobile
+  labels:
+    purpose: mobile-vulnerability-scan
+spec:
+  # Weekly at 03:30 UTC on Monday, 30 minutes after the source scan.
+  schedule: "30 3 * * 1"
+  suspend: true
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # One nsm_sh_exec call per app (up to 45 s), so the whole run
+      # should fit in a few minutes. 30 minutes is the hard cap.
+      activeDeadlineSeconds: 1800
+      backoffLimit: 0
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            purpose: mobile-vulnerability-scan
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: runner
+              image: python:3.12-alpine
+              imagePullPolicy: IfNotPresent
+              command:
+                - sh
+                - -c
+                - |
+                  set -e
+                  pip install --quiet --root-user-action=ignore pyyaml
+                  exec python3 /runner/binary_scan_runner.py
+              env:
+                - name: KERNEL_URL
+                  value: "http://rag-backend-kernel.rag-company1.svc.cluster.local:8000"
+                # tunnel-server exposes each native spoke on its own
+                # internal port. Replace 10008 with the port that
+                # spoke_register allocated to your NSMT spoke.
+                - name: NSMT_MCP_URL
+                  value: "http://tunnel-server.mcp.svc.cluster.local:10008/mcp"
+                - name: TARGETS_CONFIG_PATH
+                  value: "/config/targets.yaml"
+                - name: IOS_SCANNER_PATH
+                  value: "/scanners/ios/mobile_binary_scan_ios.py"
+                - name: ANDROID_SCANNER_PATH
+                  value: "/scanners/android/mobile_binary_scan_android.py"
+                # First rollout should be DRY_RUN=true so no vuln
+                # events are POSTed to the kernel until the operator
+                # has looked at the output.
+                - name: DRY_RUN
+                  value: "true"
+              volumeMounts:
+                - name: runner-script
+                  mountPath: /runner
+                  readOnly: true
+                - name: ios-scanner
+                  mountPath: /scanners/ios
+                  readOnly: true
+                - name: android-scanner
+                  mountPath: /scanners/android
+                  readOnly: true
+                - name: targets-config
+                  mountPath: /config
+                  readOnly: true
+              resources:
+                requests:
+                  cpu: "20m"
+                  memory: "64Mi"
+                limits:
+                  cpu: "200m"
+                  memory: "256Mi"
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
+          volumes:
+            - name: runner-script
+              configMap:
+                name: mobile-binary-scan-runner
+                defaultMode: 0555
+            - name: ios-scanner
+              configMap:
+                name: mobile-binary-scan-ios-script
+                defaultMode: 0444
+            - name: android-scanner
+              configMap:
+                name: mobile-binary-scan-android-script
+                defaultMode: 0444
+            - name: targets-config
+              configMap:
+                name: mobile-scan-targets
+                defaultMode: 0444

@@ -1,0 +1,333 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcp-valkey-resume
+  namespace: mcp
+data:
+  valkey_resume.py: |
+    """Valkey ベースの MCP Streamable HTTP 再開層。
+
+    外部パッケージを一切追加せず (redis-py 不要)、 asyncio + 最小 RESP 実装のみで
+    以下を提供する。
+
+      ValkeyEventStore        : SDK の EventStore 実装。 Valkey Stream に event を
+                                退避し、 Last-Event-ID による再送を可能にする。
+      ResumableSessionManager : StreamableHTTPSessionManager のサブクラス。
+                                session id を Valkey に永続化し、 Pod 再起動後に
+                                未知の session id が来ても transport を作り直す
+                                (再水和) ことで 404 Session not found を回避する。
+
+    Valkey が落ちている / 未設定の場合は全て no-op に縮退し、 例外を外に出さない。
+    MCP サーバ本体の可用性を Valkey の可用性より優先するための設計。
+    """
+
+    from __future__ import annotations
+
+    import asyncio
+    import json
+    import logging
+    import os
+    from collections.abc import Awaitable, Callable
+    from typing import Any
+
+    logger = logging.getLogger(__name__)
+
+    # ── 設定 (環境変数) ───────────────────────────────────────────────
+    VALKEY_HOST = os.environ.get("VALKEY_HOST", "")
+    VALKEY_PORT = int(os.environ.get("VALKEY_PORT", "6379"))
+    VALKEY_PASSWORD = os.environ.get("VALKEY_PASSWORD", "")
+    VALKEY_DB = int(os.environ.get("VALKEY_DB", "0"))
+    # event stream 1 本あたりの保持件数と TTL
+    EVENT_MAXLEN = int(os.environ.get("MCP_EVENT_MAXLEN", "512"))
+    EVENT_TTL = int(os.environ.get("MCP_EVENT_TTL", "3600"))
+    # session 登録の TTL (秒)。 これを超えて放置された session は再水和しない
+    SESSION_TTL = int(os.environ.get("MCP_SESSION_TTL", "86400"))
+
+    _KEY_PREFIX = os.environ.get("MCP_VALKEY_PREFIX", "mcp")
+
+
+    # ── 最小 RESP クライアント ────────────────────────────────────────
+    class ValkeyError(Exception):
+        pass
+
+
+    class ValkeyClient:
+        """1 接続を保持する最小 RESP2 クライアント (asyncio)。
+
+        再接続は execute 時に透過的に行う。 並行呼び出しは Lock で直列化する。
+        Valkey へのアクセスは event store / session registry の低頻度用途のみなので
+        パイプライン化やプールは行わない。
+        """
+
+        def __init__(self, host: str, port: int, password: str = "", db: int = 0):
+            self._host = host
+            self._port = port
+            self._password = password
+            self._db = db
+            self._reader: asyncio.StreamReader | None = None
+            self._writer: asyncio.StreamWriter | None = None
+            self._lock = asyncio.Lock()
+
+        @property
+        def configured(self) -> bool:
+            return bool(self._host)
+
+        async def _connect(self) -> None:
+            self._reader, self._writer = await asyncio.open_connection(self._host, self._port)
+            if self._password:
+                await self._raw("AUTH", self._password)
+            if self._db:
+                await self._raw("SELECT", str(self._db))
+
+        def _close(self) -> None:
+            if self._writer is not None:
+                try:
+                    self._writer.close()
+                except Exception:
+                    pass
+            self._reader = None
+            self._writer = None
+
+        @staticmethod
+        def _encode(args: tuple[Any, ...]) -> bytes:
+            out = [f"*{len(args)}\r\n".encode()]
+            for a in args:
+                b = a if isinstance(a, bytes) else str(a).encode()
+                out.append(b"$" + str(len(b)).encode() + b"\r\n" + b + b"\r\n")
+            return b"".join(out)
+
+        async def _read_reply(self) -> Any:
+            assert self._reader is not None
+            line = await self._reader.readline()
+            if not line:
+                raise ValkeyError("connection closed")
+            tag, body = line[:1], line[1:-2]
+            if tag == b"+":
+                return body.decode()
+            if tag == b"-":
+                raise ValkeyError(body.decode())
+            if tag == b":":
+                return int(body)
+            if tag == b"$":
+                n = int(body)
+                if n == -1:
+                    return None
+                data = await self._reader.readexactly(n + 2)
+                return data[:-2]
+            if tag == b"*":
+                n = int(body)
+                if n == -1:
+                    return None
+                return [await self._read_reply() for _ in range(n)]
+            raise ValkeyError(f"unexpected reply tag: {tag!r}")
+
+        async def _raw(self, *args: Any) -> Any:
+            assert self._writer is not None
+            self._writer.write(self._encode(args))
+            await self._writer.drain()
+            return await self._read_reply()
+
+        async def execute(self, *args: Any) -> Any:
+            """コマンドを実行する。 切断されていたら 1 度だけ再接続して再試行する。"""
+            if not self.configured:
+                return None
+            async with self._lock:
+                for attempt in (1, 2):
+                    try:
+                        if self._writer is None:
+                            await self._connect()
+                        return await self._raw(*args)
+                    except ValkeyError:
+                        raise
+                    except Exception as e:
+                        self._close()
+                        if attempt == 2:
+                            raise ValkeyError(str(e)) from e
+                return None
+
+        async def safe(self, *args: Any) -> Any:
+            """execute の例外握り潰し版。 Valkey 障害でサーバを止めないため。"""
+            try:
+                return await self.execute(*args)
+            except Exception as e:
+                logger.warning("valkey command failed (%s): %s", args[0] if args else "?", e)
+                return None
+
+
+    _client = ValkeyClient(VALKEY_HOST, VALKEY_PORT, VALKEY_PASSWORD, VALKEY_DB)
+
+
+    def get_client() -> ValkeyClient:
+        return _client
+
+
+    # ── EventStore ───────────────────────────────────────────────────
+    def _event_key(stream_id: str) -> str:
+        return f"{_KEY_PREFIX}:evt:{stream_id}"
+
+
+    def _session_key(session_id: str) -> str:
+        return f"{_KEY_PREFIX}:sess:{session_id}"
+
+
+    class ValkeyEventStore:
+        """SDK の EventStore ABC 実装 (Valkey Stream 版)。
+
+        event_id は "<stream_id>|<xid>" 形式。 stream_id を含めることで
+        replay_events_after が単一の event_id から対象 stream を復元できる。
+        """
+
+        def __init__(self, client: ValkeyClient | None = None):
+            self._c = client or _client
+
+        async def store_event(self, stream_id: str, message: Any) -> str:
+            payload = ""
+            if message is not None:
+                try:
+                    payload = message.model_dump_json(by_alias=True, exclude_none=True)
+                except AttributeError:
+                    payload = json.dumps(message)
+            key = _event_key(str(stream_id))
+            xid = await self._c.safe(
+                "XADD", key, "MAXLEN", "~", str(EVENT_MAXLEN), "*", "m", payload
+            )
+            if xid is None:
+                # Valkey 不通。 resumability は諦めるが接続は維持する
+                return f"{stream_id}|0-0"
+            await self._c.safe("EXPIRE", key, str(EVENT_TTL))
+            xid_s = xid.decode() if isinstance(xid, bytes) else str(xid)
+            return f"{stream_id}|{xid_s}"
+
+        async def replay_events_after(
+            self,
+            last_event_id: str,
+            send_callback: Callable[[Any], Awaitable[None]],
+        ) -> str | None:
+            if "|" not in last_event_id:
+                return None
+            stream_id, xid = last_event_id.split("|", 1)
+            rows = await self._c.safe("XRANGE", _event_key(stream_id), f"({xid}", "+")
+            if not rows:
+                return stream_id if rows is not None else None
+
+            from mcp.server.streamable_http import EventMessage
+            from mcp.types import JSONRPCMessage
+            from pydantic import TypeAdapter
+
+            adapter = TypeAdapter(JSONRPCMessage)
+            for row in rows:
+                try:
+                    rid = row[0].decode() if isinstance(row[0], bytes) else str(row[0])
+                    fields = row[1]
+                    raw = None
+                    for i in range(0, len(fields), 2):
+                        if fields[i] in (b"m", "m"):
+                            raw = fields[i + 1]
+                            break
+                    if not raw:
+                        continue
+                    if isinstance(raw, bytes):
+                        raw = raw.decode()
+                    msg = adapter.validate_json(raw)
+                    await send_callback(EventMessage(msg, f"{stream_id}|{rid}"))
+                except Exception as e:
+                    logger.warning("replay skipped one event: %s", e)
+            return stream_id
+
+
+    # ── セッション再水和 ──────────────────────────────────────────────
+    async def register_session(session_id: str) -> None:
+        await _client.safe("SETEX", _session_key(session_id), str(SESSION_TTL), "1")
+
+
+    async def session_known(session_id: str) -> bool:
+        return bool(await _client.safe("EXISTS", _session_key(session_id)))
+
+
+    async def forget_session(session_id: str) -> None:
+        await _client.safe("DEL", _session_key(session_id))
+
+
+    def make_resumable_manager_class() -> type:
+        """StreamableHTTPSessionManager を継承した再水和対応クラスを返す。
+
+        import 時点で SDK に依存しないよう、 関数内で import してクラスを組み立てる。
+        """
+        import anyio
+        from mcp.server.streamable_http import StreamableHTTPServerTransport
+        from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+
+        MCP_SESSION_ID_HEADER = "mcp-session-id"
+
+        class ResumableSessionManager(StreamableHTTPSessionManager):
+            """未知の session id を Valkey 照合の上で再水和する session manager。
+
+            通常の新規セッション作成時は session id を Valkey に登録する。
+            Pod 再起動後、 プロセス内 dict は空だが Valkey に登録が残っている
+            session id が来た場合、 同じ session id で transport を作り直し、
+            ServerSession を初期化済み状態 (stateless=True 相当) で起動する。
+            これにより クライアントは再 initialize なしで継続できる。
+
+            制約: 再水和されたセッションでは client capabilities が復元されない
+            ため、 サーバ発の sampling / roots 要求は使えない。 本サーバは
+            tool call のみを提供するので実害はない。
+            """
+
+            async def _handle_stateful_request(self, scope, receive, send) -> None:
+                from starlette.requests import Request
+
+                request = Request(scope, receive)
+                sid = request.headers.get(MCP_SESSION_ID_HEADER)
+
+                # プロセス内に生きている、 または新規作成 → 本家の処理に任せる
+                if sid is None or sid in self._server_instances:
+                    await super()._handle_stateful_request(scope, receive, send)
+                    if sid is None:
+                        # 新規作成された session id を Valkey に登録する
+                        for new_id in list(self._server_instances.keys()):
+                            await register_session(new_id)
+                    return
+
+                # 未知の session id → Valkey に登録が残っていれば再水和する
+                if not await session_known(sid):
+                    await super()._handle_stateful_request(scope, receive, send)
+                    return
+
+                logger.info("rehydrating session %s after restart", sid[:16])
+                async with self._session_creation_lock:
+                    if sid in self._server_instances:  # 競合で他タスクが作った
+                        await self._server_instances[sid].handle_request(scope, receive, send)
+                        return
+
+                    transport = StreamableHTTPServerTransport(
+                        mcp_session_id=sid,
+                        is_json_response_enabled=self.json_response,
+                        event_store=self.event_store,
+                        security_settings=self.security_settings,
+                    )
+                    self._server_instances[sid] = transport
+
+                    async def run_server(*, task_status=anyio.TASK_STATUS_IGNORED) -> None:
+                        async with transport.connect() as streams:
+                            read_stream, write_stream = streams
+                            task_status.started()
+                            try:
+                                # stateless=True で ServerSession を初期化済みとして起動する。
+                                # transport 側は session id を保持したままなので、
+                                # クライアントから見ると同一セッションが継続している。
+                                await self.app.run(
+                                    read_stream,
+                                    write_stream,
+                                    self.app.create_initialization_options(),
+                                    stateless=True,
+                                )
+                            except Exception:
+                                logger.exception("rehydrated session %s crashed", sid[:16])
+                            finally:
+                                self._server_instances.pop(sid, None)
+
+                    assert self._task_group is not None
+                    await self._task_group.start(run_server)
+                    await transport.handle_request(scope, receive, send)
+
+        return ResumableSessionManager

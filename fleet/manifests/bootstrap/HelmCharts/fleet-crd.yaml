@@ -1,0 +1,11 @@
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: fleet-crd
+  namespace: kube-system
+spec:
+  chart: fleet-crd
+  repo: https://rancher.github.io/fleet-helm-charts/
+  version: 0.15.1
+  targetNamespace: cattle-fleet-system
+  createNamespace: true
